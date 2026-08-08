@@ -564,13 +564,25 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+            expert_tier = self.routed_experts.expert_tier
+            try:
+                if expert_tier is not None:
+                    # On-demand tiered expert residency: pin the routed
+                    # experts into the layer's GPU slot pools before the
+                    # kernel runs (the kernel sees slot_of as expert_map),
+                    # and unpin after its work is enqueued. Must run
+                    # outside cudagraph capture (config forces eager).
+                    expert_tier.ensure(topk_ids)
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
+            finally:
+                if expert_tier is not None:
+                    expert_tier.release()
 
         self._maybe_apply_shared_experts(
             shared_experts_input,

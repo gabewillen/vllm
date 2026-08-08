@@ -77,6 +77,45 @@ class PrefetchOffloadConfig:
 
 
 @config
+class ExpertTierOffloadConfig:
+    """Configuration for tiered MoE routed-expert weight offloading.
+
+    Routed-expert weights are served from a tiered cache (GPU slot pools
+    <- pinned RAM <- mmap'd cold files on NVMe) instead of resident VRAM.
+    Requires a per-rank cold cache produced by the expert cache converter
+    (post-processed kernel-format tensors + manifest.json). Forces eager
+    execution: expert residency is established on the host each step and
+    cannot run inside cudagraph capture.
+    """
+
+    enabled: bool = False
+    """Enable expert-tier offloading. Set implicitly by providing
+    `--expert-tier-cache-dir`."""
+
+    cache_dir: str | None = None
+    """Directory holding the converted expert cache, with one
+    `rank{r}/manifest.json` (plus raw tensor files) per rank."""
+
+    gpu_gb: float = Field(default=1.0, gt=0)
+    """Per-rank GPU byte budget (GiB) for the expert slot pools,
+    translated into a uniform slots-per-layer count."""
+
+    pinned_gb: float = Field(default=2.0, gt=0)
+    """Per-rank pinned-host-memory budget (GiB) for the middle tier."""
+
+    io_threads: int = Field(default=4, ge=1)
+    """Worker threads for cold-file reads into pinned memory."""
+
+    @model_validator(mode="after")
+    def validate_expert_tier(self) -> "ExpertTierOffloadConfig":
+        if self.enabled and self.cache_dir is None:
+            raise ValueError(
+                "expert-tier offloading requires cache_dir (--expert-tier-cache-dir)"
+            )
+        return self
+
+
+@config
 class OffloadConfig:
     """Configuration for model weight offloading to reduce GPU memory usage."""
 
@@ -93,6 +132,12 @@ class OffloadConfig:
 
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
+
+    expert_tier: ExpertTierOffloadConfig = Field(
+        default_factory=ExpertTierOffloadConfig
+    )
+    """Parameters for tiered MoE routed-expert weight offloading. Operates
+    independently of `offload_backend` (which offloads whole parameters)."""
 
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":

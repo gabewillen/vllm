@@ -16,6 +16,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
 )
+from vllm.model_executor.layers.fused_moe.expert_tier_binding import (
+    maybe_init_expert_tier,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -165,6 +168,12 @@ class RoutedExperts(PluggableLayer):
                 self.moe_config.intermediate_size
             )
 
+        # When expert-tier offloading is enabled, bind this layer to the
+        # tier cache before create_weights so the quant method registers
+        # the cache's GPU slot pools instead of allocating resident
+        # expert weights. None when the mode is off.
+        self.expert_tier = maybe_init_expert_tier(self)
+
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
     # TODO(bnell): Temporary hack. Get rid of this.
@@ -218,6 +227,10 @@ class RoutedExperts(PluggableLayer):
 
     @property
     def expert_map(self) -> torch.Tensor | None:
+        if self.expert_tier is not None:
+            # Live global-id -> GPU-slot map maintained by the tier
+            # cache; the kernel computes routed experts from their slots.
+            return self.expert_tier.slot_of
         return (
             self._expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask
         )
@@ -577,6 +590,11 @@ class RoutedExperts(PluggableLayer):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        if self.expert_tier is not None:
+            # Expert weights are served from the tier cache's cold files;
+            # checkpoint expert tensors are not loaded.
+            return True if return_success else None
+
         quant_config_name = self.quant_config and self.quant_config.get_name()
         if quant_config_name == "gpt_oss_mxfp4":
             # (FIXME) for gpt-oss all experts are combined

@@ -41,6 +41,7 @@ from vllm.config import (
     DiffusionConfig,
     ECTransferConfig,
     EPLBConfig,
+    ExpertTierOffloadConfig,
     KernelConfig,
     KVEventsConfig,
     KVTransferConfig,
@@ -518,6 +519,10 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
+    expert_tier_cache_dir: str | None = ExpertTierOffloadConfig.cache_dir
+    expert_tier_gpu_gb: float = ExpertTierOffloadConfig.gpu_gb
+    expert_tier_pinned_gb: float = ExpertTierOffloadConfig.pinned_gb
+    expert_tier_io_threads: int = ExpertTierOffloadConfig.io_threads
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1205,6 +1210,23 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--offload-params", **prefetch_kwargs["offload_params"]
+        )
+        expert_tier_kwargs = get_kwargs(ExpertTierOffloadConfig)
+        offload_group.add_argument(
+            "--expert-tier-cache-dir",
+            **expert_tier_kwargs["cache_dir"],
+        )
+        offload_group.add_argument(
+            "--expert-tier-gpu-gb",
+            **expert_tier_kwargs["gpu_gb"],
+        )
+        offload_group.add_argument(
+            "--expert-tier-pinned-gb",
+            **expert_tier_kwargs["pinned_gb"],
+        )
+        offload_group.add_argument(
+            "--expert-tier-io-threads",
+            **expert_tier_kwargs["io_threads"],
         )
 
         # Multimodal related configs
@@ -2249,6 +2271,13 @@ class EngineArgs:
                 offload_num_in_group=self.offload_num_in_group,
                 offload_prefetch_step=self.offload_prefetch_step,
                 offload_params=self.offload_params,
+            ),
+            expert_tier=ExpertTierOffloadConfig(
+                enabled=self.expert_tier_cache_dir is not None,
+                cache_dir=self.expert_tier_cache_dir,
+                gpu_gb=self.expert_tier_gpu_gb,
+                pinned_gb=self.expert_tier_pinned_gb,
+                io_threads=self.expert_tier_io_threads,
             ),
         )
 

@@ -1058,6 +1058,27 @@ class VllmConfig:
                 "precision for chunked prefill triton kernels."
             )
 
+        if self.offload_config is not None and self.offload_config.expert_tier.enabled:
+            if self.model_config is not None and not self.model_config.enforce_eager:
+                logger.warning(
+                    "Expert-tier offloading establishes expert residency on "
+                    "the host each step, which cannot run inside cudagraph "
+                    "capture. Forcing enforce_eager=True."
+                )
+                self.model_config.enforce_eager = True
+            moe_backend = self.kernel_config.moe_backend
+            if moe_backend == "auto":
+                logger.info(
+                    "Expert-tier offloading: setting moe_backend='marlin' "
+                    "(the expert cache holds Marlin-format tensors)."
+                )
+                self.kernel_config.moe_backend = "marlin"
+            elif moe_backend != "marlin":
+                raise ValueError(
+                    "Expert-tier offloading requires moe_backend='marlin', "
+                    f"got {moe_backend!r}"
+                )
+
         if self.model_config is not None and self.model_config.enforce_eager:
             logger.warning(
                 "Enforce eager set, disabling torch.compile and CUDAGraphs. "
