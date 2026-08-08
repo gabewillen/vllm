@@ -170,6 +170,11 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
+        if Bs.dtype == torch.float8_e8m0fnu:
+            # Triton cannot take e8m0-typed pointers; the conversion is exact
+            # (e8m0 is a pure power of two). DeepGEMM consumes e8m0 natively,
+            # so only this fallback path needs it.
+            Bs = Bs.to(torch.float32)
         return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
             A,
             B,
