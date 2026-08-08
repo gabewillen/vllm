@@ -106,11 +106,38 @@ class ExpertTierOffloadConfig:
     io_threads: int = Field(default=4, ge=1)
     """Worker threads for cold-file reads into pinned memory."""
 
+    prefetch_predictors: str = "hash"
+    """Comma-separated predictive-prefetch predictors: any of "temporal"
+    (previous-step experts for upcoming layers), "popular" (per-layer EMA
+    popularity top-k), "hash" (exact next-step prefetch for DeepSeek-V4
+    hash-routed layers from sampled token ids), "gate" (next layer's
+    router gate applied to the current hidden state). "off" (or empty)
+    disables prediction; experts are then fetched purely on demand."""
+
+    prefetch_lookahead: int = Field(default=4, ge=1)
+    """How many layers ahead the temporal/popular predictors prefetch."""
+
+    prefetch_popular: int = Field(default=8, ge=0)
+    """Top-k popularity experts prefetched per lookahead layer."""
+
+    @property
+    def predictor_set(self) -> frozenset[str]:
+        """Enabled predictor names parsed from `prefetch_predictors`."""
+        tokens = {t.strip() for t in self.prefetch_predictors.split(",") if t.strip()}
+        return frozenset(tokens - {"off"})
+
     @model_validator(mode="after")
     def validate_expert_tier(self) -> "ExpertTierOffloadConfig":
         if self.enabled and self.cache_dir is None:
             raise ValueError(
                 "expert-tier offloading requires cache_dir (--expert-tier-cache-dir)"
+            )
+        allowed = {"temporal", "popular", "hash", "gate"}
+        unknown = self.predictor_set - allowed
+        if unknown:
+            raise ValueError(
+                f"unknown expert-tier prefetch predictors {sorted(unknown)}; "
+                f"choose from {sorted(allowed)} or 'off'"
             )
         return self
 

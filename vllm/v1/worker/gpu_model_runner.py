@@ -58,6 +58,9 @@ from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe.expert_tier_binding import (
+    notify_sampled_token_ids,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
@@ -4461,6 +4464,9 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        # Expert-tier hash predictor: next-step token ids are known now,
+        # one step ahead of the next forward (async D2H, no host sync).
+        notify_sampled_token_ids(sampler_output.sampled_token_ids)
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,

@@ -523,6 +523,9 @@ class EngineArgs:
     expert_tier_gpu_gb: float = ExpertTierOffloadConfig.gpu_gb
     expert_tier_pinned_gb: float = ExpertTierOffloadConfig.pinned_gb
     expert_tier_io_threads: int = ExpertTierOffloadConfig.io_threads
+    expert_tier_prefetch_predictors: str = ExpertTierOffloadConfig.prefetch_predictors
+    expert_tier_prefetch_lookahead: int = ExpertTierOffloadConfig.prefetch_lookahead
+    expert_tier_prefetch_popular: int = ExpertTierOffloadConfig.prefetch_popular
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1227,6 +1230,18 @@ class EngineArgs:
         offload_group.add_argument(
             "--expert-tier-io-threads",
             **expert_tier_kwargs["io_threads"],
+        )
+        offload_group.add_argument(
+            "--expert-tier-prefetch-predictors",
+            **expert_tier_kwargs["prefetch_predictors"],
+        )
+        offload_group.add_argument(
+            "--expert-tier-prefetch-lookahead",
+            **expert_tier_kwargs["prefetch_lookahead"],
+        )
+        offload_group.add_argument(
+            "--expert-tier-prefetch-popular",
+            **expert_tier_kwargs["prefetch_popular"],
         )
 
         # Multimodal related configs
@@ -2278,6 +2293,9 @@ class EngineArgs:
                 gpu_gb=self.expert_tier_gpu_gb,
                 pinned_gb=self.expert_tier_pinned_gb,
                 io_threads=self.expert_tier_io_threads,
+                prefetch_predictors=self.expert_tier_prefetch_predictors,
+                prefetch_lookahead=self.expert_tier_prefetch_lookahead,
+                prefetch_popular=self.expert_tier_prefetch_popular,
             ),
         )
 
