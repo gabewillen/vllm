@@ -287,6 +287,13 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
+        expert_tier = routed_experts.expert_tier
+        if expert_tier is not None:
+            expert_tier.register_predictor_sources(
+                hash_table=getattr(router, "_hash_indices_table", None),
+                gate=gate,
+            )
+
         self._forward_entry = self._select_forward()
 
         # For smuggling this layer into the fused moe custom op
@@ -567,6 +574,11 @@ class MoERunner(MoERunnerInterface):
             expert_tier = self.routed_experts.expert_tier
             try:
                 if expert_tier is not None:
+                    # Gate lookahead (no-op unless enabled): predict the
+                    # next layer's experts from this layer's MoE input
+                    # before blocking below, so the async prefetch
+                    # overlaps this layer's ensure() stall.
+                    expert_tier.observe_hidden(hidden_states)
                     # On-demand tiered expert residency: pin the routed
                     # experts into the layer's GPU slot pools before the
                     # kernel runs (the kernel sees slot_of as expert_map),

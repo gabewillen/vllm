@@ -23,6 +23,7 @@ Baseline mode is on-demand: ensure() per layer per step, no prediction.
 It must run outside cudagraph capture; config validation forces eager.
 """
 
+import atexit
 import json
 import os
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.offloader.expert_prefetch import ExpertPrefetcher
 from vllm.model_executor.offloader.expert_tier import (
     _STAGED_H2D_MAX_ROW_BYTES,
     ExpertTensorSpec,
@@ -218,11 +220,13 @@ class ExpertTierLayerBinding:
         layer_id: int,
         num_experts: int,
         specs: list[ExpertTensorSpec],
+        prefetcher: ExpertPrefetcher | None = None,
     ):
         self.cache = cache
         self.layer_id = layer_id
         self.num_experts = num_experts
         self.specs = specs
+        self.prefetcher = prefetcher
         # An empty ensure() exposes the layer's stable pool tensors and
         # live slot_of view without any IO or pinning.
         result = cache.ensure(layer_id, [])
@@ -271,15 +275,36 @@ class ExpertTierLayerBinding:
     def ensure(self, topk_ids: torch.Tensor) -> None:
         """Make the routed experts resident (on-demand, blocking on ids).
 
-        Ids are moved to the CPU first: the baseline has no prediction,
-        so the host sync on the routed ids is inherent to this mode.
+        Ids are moved to the CPU first (the host sync on the routed ids
+        is inherent to the on-demand tier mode); the same CPU ids feed
+        the predictive prefetcher's bookkeeping at zero extra sync cost.
         """
         if topk_ids.device.type != "cpu":
             topk_ids = topk_ids.cpu()
         self.cache.ensure(self.layer_id, topk_ids)
+        if self.prefetcher is not None:
+            self.prefetcher.observe(self.layer_id, topk_ids)
 
     def release(self) -> None:
         self.cache.release(self.layer_id)
+
+    def register_predictor_sources(
+        self,
+        hash_table: torch.Tensor | None,
+        gate: torch.nn.Module | None,
+    ) -> None:
+        """Give the prefetcher this layer's hash table / router gate."""
+        if self.prefetcher is None:
+            return
+        if hash_table is not None:
+            self.prefetcher.note_hash_table(self.layer_id, hash_table)
+        if gate is not None:
+            self.prefetcher.note_gate(self.layer_id, gate)
+
+    def observe_hidden(self, hidden_states: torch.Tensor) -> None:
+        """Feed the gate-lookahead predictor (no-op unless enabled)."""
+        if self.prefetcher is not None:
+            self.prefetcher.observe_hidden(self.layer_id, hidden_states)
 
 
 class ExpertTierState:
@@ -345,6 +370,42 @@ class ExpertTierState:
                 cold=MmapColdBacking(self.manifest.files),
                 io_threads=config.io_threads,
             )
+        self.prefetcher: ExpertPrefetcher | None = None
+        predictors = config.predictor_set
+        if predictors:
+            self.prefetcher = ExpertPrefetcher(
+                cache=self.cache,
+                layer_ids=sorted(self.manifest.layer_specs),
+                num_experts=self.manifest.num_experts,
+                predictors=predictors,
+                lookahead=config.prefetch_lookahead,
+                popular_k=config.prefetch_popular,
+                stats_fn=lambda: self.cache.stats()["total"],
+                stats_interval_s=20.0,
+                name=f"-rank{rank}",
+            )
+            logger.info(
+                "expert-tier prefetch: rank %d, predictors %s, lookahead "
+                "%d, popular top-%d",
+                rank,
+                sorted(predictors),
+                config.prefetch_lookahead,
+                config.prefetch_popular,
+            )
+        atexit.register(self._log_final_stats)
+
+    def _log_final_stats(self) -> None:
+        try:
+            stats = json.dumps(self.cache.stats()["total"])
+            prefetch = json.dumps(self.prefetcher.stats()) if self.prefetcher else "{}"
+            logger.info(
+                "expert-tier final stats: rank %d cache=%s prefetch=%s",
+                self.rank,
+                stats,
+                prefetch,
+            )
+        except Exception:
+            pass
 
     def bind_layer(self, layer_id: int) -> ExpertTierLayerBinding:
         if layer_id not in self.manifest.layer_specs:
@@ -357,6 +418,7 @@ class ExpertTierState:
             layer_id=layer_id,
             num_experts=self.manifest.num_experts,
             specs=self.manifest.layer_specs[layer_id],
+            prefetcher=self.prefetcher,
         )
 
 
@@ -367,8 +429,22 @@ def reset_expert_tier_state() -> None:
     """Drop the process-wide cache state (tests only)."""
     global _state
     if _state is not None:
+        if _state.prefetcher is not None:
+            _state.prefetcher.close()
         _state.cache.close()
     _state = None
+
+
+def notify_sampled_token_ids(token_ids: torch.Tensor) -> None:
+    """Feed next-step token ids to the hash predictor, if active.
+
+    Called from the model runner right after sampling; the ids may still
+    be on the GPU (async D2H is handled by the prefetcher). No-op when
+    expert-tier offloading or the hash predictor is disabled.
+    """
+    state = _state
+    if state is not None and state.prefetcher is not None:
+        state.prefetcher.observe_sampled_tokens(token_ids)
 
 
 def _get_or_create_state(

@@ -1,0 +1,26 @@
+# DeepSeek-V4-Flash-0731 on 4x L4 — tiered experts + predictive prefetch.
+# Serve: .venv-omni/bin/vllm serve --config serve-configs/dsv4_flash_4xl4_tier0.yaml
+# gpu 14 GiB tier -> ~102 slots/layer/rank; max_num_batched_tokens 8 keeps the
+# per-layer distinct-expert working set (<=48+shared) under the slot count.
+# Prefetch predictors pinned to "hash" (exact next-step prefetch for the 3
+# hash-routed layers): best measured decode (3.52 tok/s vs 3.38 off,
+# bench_prefetch.jsonl). temporal/popular measured net-negative here (they
+# re-request LRU-resident experts); gate lookahead measured negative.
+model: deepseek-ai/DeepSeek-V4-Flash-0731
+tensor-parallel-size: 4
+block-size: 256
+kv-cache-dtype: fp8
+max-model-len: 8192
+max-num-batched-tokens: 8
+max-num-seqs: 1
+gpu-memory-utilization: 0.92
+enforce-eager: true
+expert-tier-cache-dir: /shared/vllm/vllm-cache/dsv4-marlin-tp4
+expert-tier-gpu-gb: 14
+expert-tier-pinned-gb: 15
+expert-tier-prefetch-predictors: "hash"
+tokenizer-mode: deepseek_v4
+tool-call-parser: deepseek_v4
+reasoning-parser: deepseek_v4
+trust-remote-code: true
+port: 8010
