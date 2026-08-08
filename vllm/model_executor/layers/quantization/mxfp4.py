@@ -543,6 +543,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
 
+        if getattr(layer, "expert_tier", None) is not None:
+            # Expert-tier offloading: register the tier cache's GPU slot
+            # pools (already in Marlin kernel format) as this layer's
+            # weight parameters instead of allocating resident tensors.
+            names = ["w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"]
+            if self.moe.has_bias:
+                names += ["w13_bias", "w2_bias"]
+            layer.expert_tier.register_pool_parameters(layer, names, extra_weight_attrs)
+            return
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
@@ -617,6 +627,27 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
+
+    def _setup_kernel_for_expert_tier(self, layer: RoutedExperts) -> None:
+        """Build the quant config and kernel over the tier cache's pools.
+
+        The cold cache holds tensors already converted by
+        `prepare_moe_mxfp4_layer_for_marlin`, so weight conversion is
+        skipped and the pool tensors bound in create_weights are used
+        as-is (the pool slot dimension replaces the expert dimension;
+        the cache's slot_of tensor is served as the expert_map).
+        """
+        assert self.mxfp4_backend == Mxfp4MoeBackend.MARLIN
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        if self.moe_quant_config is not None and self.experts_cls is not None:
+            self.moe_kernel = make_mxfp4_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                mxfp4_backend=self.mxfp4_backend,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._expert_routing_tables(),
+                layer=layer,
+            )
 
     def _setup_kernel(
         self,
@@ -722,6 +753,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
     def process_weights_after_loading(self, layer):
+        if getattr(layer, "expert_tier", None) is not None:
+            self._setup_kernel_for_expert_tier(layer)
+            return
+
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         w13_scale = layer.w13_weight_scale
