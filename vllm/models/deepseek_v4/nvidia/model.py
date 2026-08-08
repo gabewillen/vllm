@@ -16,6 +16,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
@@ -63,8 +64,14 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.nvidia.triton_sparse import (
+    DeepseekV4TritonSparseAttention,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.ops.flashmla import is_flashmla_sparse_supported
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -727,14 +734,22 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """Pick the CUDA sparse-MLA attention class for the configured backend.
 
     An explicit ``--attention-backend FLASHINFER_MLA_SPARSE_DSV4`` selects the
-    FlashInfer TRTLLM-gen path; otherwise the FlashMLA path is used.
+    FlashInfer TRTLLM-gen path; otherwise the FlashMLA path is used when its
+    kernels support this GPU, with the arch-generic Triton sparse backend as
+    the fallback (e.g. SM 8.9, where FlashMLA ships no cubins).
     """
     if (
         vllm_config.attention_config.backend
         == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4
     ):
         return DeepseekV4FlashInferMLAAttention
-    return DeepseekV4FlashMLAAttention
+    if is_flashmla_sparse_supported()[0]:
+        return DeepseekV4FlashMLAAttention
+    logger.info_once(
+        "FlashMLA sparse is not supported on this GPU; using the Triton "
+        "sparse-MLA backend for DeepseekV4."
+    )
+    return DeepseekV4TritonSparseAttention
 
 
 class DeepseekV4DecoderLayer(nn.Module):
