@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import functools
+
 import torch
 
 import vllm.envs as envs
@@ -11,11 +13,15 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.sparse_attn_indexer_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
+    is_deep_gemm_supported,
 )
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -35,6 +41,13 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+@functools.cache
+def _use_triton_indexer_logits() -> bool:
+    """Use the Triton MQA logits fallback when DeepGEMM cannot run (e.g.
+    on CUDA architectures other than SM90/SM100)."""
+    return current_platform.is_cuda() and not is_deep_gemm_supported()
 
 
 def _gather_workspace_shapes(
@@ -229,6 +242,17 @@ def sparse_attn_indexer(
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                 )
+            elif _use_triton_indexer_logits():
+                assert q_scale_slice is None, "FP4 Q requires DeepGEMM"
+                logits = fp8_mqa_logits_triton(
+                    q_slice_cast,
+                    k_quant_cast,
+                    k_scale_cast,
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
             else:
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
@@ -319,6 +343,17 @@ def sparse_attn_indexer(
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
                 max_model_len,
+            )
+        elif _use_triton_indexer_logits():
+            assert padded_q_scale is None, "FP4 Q requires DeepGEMM"
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len,
+                clean_logits=False,
             )
         else:
             logits = fp8_fp4_paged_mqa_logits(
@@ -440,10 +475,15 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+        if _use_triton_indexer_logits():
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "The FP4 indexer cache requires DeepGEMM support in "
+                    "the current vLLM environment."
+                )
+            logger.info_once(
+                "DeepGEMM is unsupported on this platform; using Triton "
+                "sparse attention indexer logits kernels."
             )
 
     def forward_native(
