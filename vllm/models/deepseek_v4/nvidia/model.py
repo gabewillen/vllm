@@ -994,6 +994,22 @@ class DeepseekV4Model(nn.Module):
             )
         else:
             self._mtp_hidden_buffer = None
+        # DSpark (Flash) MTP conditions the draft on the concatenation of
+        # the dspark_target_layer_ids hidden states (mean over hc streams)
+        # instead of the final pre-hc_head residual; stash those instead
+        # when drafting is active.
+        self._dspark_target_layers: list[int] | None = None
+        if (
+            vllm_config.speculative_config is not None
+            and getattr(config, "dspark_target_layer_ids", None)
+            and get_pp_group().is_last_rank
+        ):
+            if get_pp_group().world_size > 1:
+                raise NotImplementedError(
+                    "DSpark MTP target-hidden stash requires pipeline parallel size 1"
+                )
+            self._dspark_target_layers = list(config.dspark_target_layer_ids)
+            assert len(self._dspark_target_layers) * config.hidden_size <= self.hc_dim
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1039,7 +1055,11 @@ class DeepseekV4Model(nn.Module):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        dspark_hiddens: list[torch.Tensor] = []
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1048,6 +1068,15 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+            if (
+                self._dspark_target_layers is not None
+                and idx in self._dspark_target_layers
+            ):
+                dspark_hiddens.append(
+                    mhc_post_tilelang(hidden_states, residual, post_mix, res_mix).mean(
+                        1
+                    )
+                )
         if layer is not None:
             hidden_states = mhc_post_tilelang(
                 hidden_states, residual, post_mix, res_mix
@@ -1056,9 +1085,15 @@ class DeepseekV4Model(nn.Module):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        # Stash pre-hc_head residual for the MTP draft (captured copy_).
+        # Stash the MTP draft's target hidden states (captured copy_):
+        # DSpark target-layer concat when Flash drafting is active, else
+        # the pre-hc_head residual.
         num_tokens = hidden_states.shape[0]
-        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        if self._dspark_target_layers is not None:
+            dspark = torch.cat(dspark_hiddens, dim=-1)
+            self._mtp_hidden_buffer[:num_tokens, : dspark.shape[-1]].copy_(dspark)
+        else:
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         hidden_states = hc_head_fused_kernel_tilelang(
             hidden_states,

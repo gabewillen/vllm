@@ -262,6 +262,15 @@ class DeepSeekV4MTP(nn.Module):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
+        if getattr(self.config, "dspark_target_layer_ids", None):
+            # Flash checkpoints replace the e_proj/h_proj MTP module with
+            # the DSpark stack; see mtp_flash.py.
+            from .mtp_flash import DeepSeekV4FlashMultiTokenPredictor
+
+            self.model: nn.Module = DeepSeekV4FlashMultiTokenPredictor(
+                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            )
+            return
         self.model = DeepSeekV4MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -291,6 +300,13 @@ class DeepSeekV4MTP(nn.Module):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from .mtp_flash import (
+            DeepSeekV4FlashMultiTokenPredictor,
+            load_flash_mtp_weights,
+        )
+
+        if isinstance(self.model, DeepSeekV4FlashMultiTokenPredictor):
+            return load_flash_mtp_weights(self, weights)
         # Weight name remapping for checkpoint compatibility.
         # Maps checkpoint weight paths to model parameter paths.
         WEIGHT_NAME_REMAPPING: dict[str, str] = {

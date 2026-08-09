@@ -14,11 +14,24 @@ real ``RoutedExperts`` module with ``Mxfp4MoEMethod`` in a faked TP-rank
 context, loading checkpoint tensors through the module's own
 ``weight_loader``, and running ``process_weights_after_loading``.
 
+MTP (DSpark) draft layers: the checkpoint stores draft-block experts under
+``mtp.{i}.ffn.experts.*`` with the same per-expert format as the main
+layers. ``--mtp`` converts them as cache layers ``num_hidden_layers + i``
+(43-45 for Flash-0731) into the same per-rank manifest, and records their
+ids in ``meta.mtp_layer_ids`` so the serve-time binding can skip them when
+speculative decoding is off. Existing main-layer files are never rewritten.
+
 Example:
     python tools/dsv4_expert_cache_convert.py \\
         --checkpoint-dir <snapshot_dir> \\
         --out-dir /shared/vllm/vllm-cache/dsv4-marlin-tp4 \\
         --tp-size 4 --ranks 0,1,2,3 --layers 0-42
+
+    # Append the MTP draft-block experts to an existing cache:
+    python tools/dsv4_expert_cache_convert.py \\
+        --checkpoint-dir <snapshot_dir> \\
+        --out-dir /shared/vllm/vllm-cache/dsv4-marlin-tp4 \\
+        --tp-size 4 --ranks 0,1,2,3 --mtp
 """
 
 from __future__ import annotations
@@ -211,8 +224,14 @@ def update_manifest(
     num_experts: int,
     layer_id: int,
     layer_entries: dict[str, Any],
+    num_hidden_layers: int | None = None,
 ) -> None:
-    """Merge one layer's entries into the rank manifest atomically."""
+    """Merge one layer's entries into the rank manifest atomically.
+
+    When ``num_hidden_layers`` is given, manifest layers at or above it
+    are MTP draft layers and get recorded in ``meta.mtp_layer_ids``; the
+    key is omitted while no such layers are present.
+    """
     manifest: dict[str, Any] = {
         "meta": meta,
         "num_experts": num_experts,
@@ -228,6 +247,12 @@ def update_manifest(
         k: manifest["layers"][k]
         for k in sorted(manifest["layers"], key=int)
     }
+    if num_hidden_layers is not None:
+        mtp_ids = sorted(
+            int(k) for k in manifest["layers"] if int(k) >= num_hidden_layers
+        )
+        if mtp_ids:
+            manifest["meta"]["mtp_layer_ids"] = mtp_ids
     tmp = manifest_path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(manifest, f, indent=1)
@@ -297,6 +322,45 @@ def _log(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
+def resolve_layers(
+    layers_spec: str | None,
+    mtp: bool,
+    num_hidden_layers: int,
+    mtp_ids: list[int],
+) -> list[int]:
+    """Layer ids selected by ``--layers`` / ``--mtp``.
+
+    Without ``--layers``, the base set is all main layers, or empty when
+    ``--mtp`` alone is given (append-to-existing-cache mode).
+
+    Raises:
+        ValueError: ``--mtp`` requested but the checkpoint has no MTP
+            experts.
+    """
+    if layers_spec is not None:
+        layers = parse_int_list(layers_spec)
+    elif mtp:
+        layers = []
+    else:
+        layers = list(range(num_hidden_layers))
+    if mtp:
+        if not mtp_ids:
+            raise ValueError("--mtp given but checkpoint has no mtp.* experts")
+        layers = sorted(set(layers) | set(mtp_ids))
+    return layers
+
+
+def ckpt_layer_prefix(layer_id: int, num_hidden_layers: int) -> str:
+    """Checkpoint tensor prefix for a cache layer id.
+
+    Main layers live under ``layers.{id}``; MTP (DSpark) draft layers are
+    assigned cache ids after the main layers and live under ``mtp.{i}``.
+    """
+    if layer_id < num_hidden_layers:
+        return f"layers.{layer_id}"
+    return f"mtp.{layer_id - num_hidden_layers}"
+
+
 class LayerTensorLoader:
     """Loads one MoE layer's expert tensors from safetensors shards.
 
@@ -305,12 +369,13 @@ class LayerTensorLoader:
     the MoE weight_loader).
     """
 
-    def __init__(self, snapshot: str, num_experts: int):
+    def __init__(self, snapshot: str, num_experts: int, num_hidden_layers: int):
         from safetensors import safe_open
 
         self._safe_open = safe_open
         self.snapshot = snapshot
         self.num_experts = num_experts
+        self.num_hidden_layers = num_hidden_layers
         with open(os.path.join(snapshot, "model.safetensors.index.json")) as f:
             self.weight_map: dict[str, str] = json.load(f)["weight_map"]
         self._handles: dict[str, Any] = {}
@@ -319,7 +384,17 @@ class LayerTensorLoader:
         return sorted(set(self.weight_map.values()))
 
     def has_layer(self, layer_id: int) -> bool:
-        return f"layers.{layer_id}.ffn.experts.0.w1.weight" in self.weight_map
+        prefix = ckpt_layer_prefix(layer_id, self.num_hidden_layers)
+        return f"{prefix}.ffn.experts.0.w1.weight" in self.weight_map
+
+    def mtp_layer_ids(self) -> list[int]:
+        """Cache layer ids of MTP draft blocks present in the checkpoint."""
+        ids = []
+        i = 0
+        while f"mtp.{i}.ffn.experts.0.w1.weight" in self.weight_map:
+            ids.append(self.num_hidden_layers + i)
+            i += 1
+        return ids
 
     def _get(self, name: str) -> torch.Tensor:
         shard = self.weight_map[name]
@@ -345,10 +420,11 @@ class LayerTensorLoader:
             "weight" or "scale".
         """
         expert_ids = range(self.num_experts) if experts is None else experts
+        prefix = ckpt_layer_prefix(layer_id, self.num_hidden_layers)
         out: dict[tuple[int, str, str], torch.Tensor] = {}
         for e in expert_ids:
             for w in ("w1", "w2", "w3"):
-                base = f"layers.{layer_id}.ffn.experts.{e}.{w}"
+                base = f"{prefix}.ffn.experts.{e}.{w}"
                 weight = self._get(f"{base}.weight")
                 scale = self._get(f"{base}.scale")
                 if scale.dtype == torch.float8_e8m0fnu:
@@ -599,14 +675,17 @@ def convert(args: argparse.Namespace) -> None:
     snapshot = resolve_snapshot(args.checkpoint_dir)
     hf_config = _hf_config(snapshot)
     num_experts = hf_config["n_routed_experts"]
-    layers = parse_int_list(args.layers)
+    num_hidden_layers = hf_config["num_hidden_layers"]
     ranks = parse_int_list(args.ranks)
     specs = expected_marlin_specs(
         args.tp_size,
         hf_config["hidden_size"],
         hf_config["moe_intermediate_size"],
     )
-    loader = LayerTensorLoader(snapshot, num_experts)
+    loader = LayerTensorLoader(snapshot, num_experts, num_hidden_layers)
+    layers = resolve_layers(
+        args.layers, args.mtp, num_hidden_layers, loader.mtp_layer_ids()
+    )
     for layer_id in layers:
         if not loader.has_layer(layer_id):
             raise ValueError(f"layer {layer_id} has no routed experts")
@@ -725,6 +804,7 @@ def _finish_rank_layer(
         hf_config["n_routed_experts"],
         layer_id,
         layer_entries,
+        num_hidden_layers=hf_config["num_hidden_layers"],
     )
 
 
@@ -735,12 +815,16 @@ def verify(args: argparse.Namespace) -> None:
     snapshot = resolve_snapshot(args.checkpoint_dir)
     hf_config = _hf_config(snapshot)
     num_experts = hf_config["n_routed_experts"]
-    layers = parse_int_list(args.layers)
+    num_hidden_layers = hf_config["num_hidden_layers"]
     ranks = parse_int_list(args.ranks)
     specs = expected_marlin_specs(
         args.tp_size,
         hf_config["hidden_size"],
         hf_config["moe_intermediate_size"],
+    )
+    loader = LayerTensorLoader(snapshot, num_experts, num_hidden_layers)
+    layers = resolve_layers(
+        args.layers, args.mtp, num_hidden_layers, loader.mtp_layer_ids()
     )
     rng = random.Random(args.seed)
     samples = [
@@ -749,8 +833,6 @@ def verify(args: argparse.Namespace) -> None:
     by_layer: dict[int, list[int]] = {}
     for layer_id, e in samples:
         by_layer.setdefault(layer_id, []).append(e)
-
-    loader = LayerTensorLoader(snapshot, num_experts)
     failures = 0
     checked = 0
     with set_current_vllm_config(VllmConfig()):
@@ -804,7 +886,18 @@ def main() -> None:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--tp-size", type=int, default=4)
     parser.add_argument("--ranks", default="0,1,2,3")
-    parser.add_argument("--layers", default="0-42")
+    parser.add_argument(
+        "--layers",
+        default=None,
+        help="layer ids to convert; default: all main layers, or only the "
+        "MTP layers when --mtp is given alone",
+    )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="also convert the MTP (DSpark) draft-block experts as cache "
+        "layers num_hidden_layers+i",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--verify",
