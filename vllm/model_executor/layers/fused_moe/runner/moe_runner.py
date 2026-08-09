@@ -607,10 +607,11 @@ class MoERunner(MoERunnerInterface):
         the kernel runs (the kernel sees slot_of as expert_map) and
         unpins after its work is enqueued. When the batch routes more
         distinct experts than the slot pool holds (large prefill
-        chunks), the token batch is split into contiguous sub-batches
-        that each fit, applied ensure -> kernel -> release apiece and
-        concatenated. Must run outside cudagraph capture (config forces
-        eager).
+        chunks), tokens are clustered by routed-expert overlap and
+        split into sub-batches that each fit, applied ensure -> kernel
+        -> release apiece on the permuted tensors, then the output is
+        inverse-permuted. Must run outside cudagraph capture (config
+        forces eager).
         """
         expert_tier = self.routed_experts.expert_tier
         assert expert_tier is not None
@@ -619,8 +620,8 @@ class MoERunner(MoERunnerInterface):
         # below, so the async prefetch overlaps this layer's ensure()
         # stall.
         expert_tier.observe_hidden(hidden_states)
-        sub_batches = expert_tier.plan_sub_batches(topk_ids)
-        if sub_batches is None:
+        plan = expert_tier.plan_sub_batches(topk_ids)
+        if plan is None:
             try:
                 expert_tier.ensure(topk_ids)
                 return self.routed_experts.forward_modular(
@@ -632,18 +633,24 @@ class MoERunner(MoERunnerInterface):
                 )
             finally:
                 expert_tier.release()
+        perm, sub_batches = plan
+        perm_dev = perm.to(hidden_states.device, non_blocking=True)
+        hs = hidden_states[perm_dev]
+        weights = topk_weights[perm_dev]
+        ids = topk_ids[perm_dev]
         outputs = []
         for index, (start, end) in enumerate(sub_batches):
             try:
-                expert_tier.ensure(topk_ids[start:end])
+                expert_tier.ensure(ids[start:end])
                 # SharedExperts runs exactly once per forward (its
                 # output slot asserts a single fill), always on the
-                # full input: pass it with the first sub-batch only.
+                # full unpermuted input: pass it with the first
+                # sub-batch only.
                 outputs.append(
                     self.routed_experts.forward_modular(
-                        x=hidden_states[start:end],
-                        topk_weights=topk_weights[start:end],
-                        topk_ids=topk_ids[start:end],
+                        x=hs[start:end],
+                        topk_weights=weights[start:end],
+                        topk_ids=ids[start:end],
                         shared_experts=self._shared_experts if index == 0 else None,
                         shared_experts_input=(
                             shared_experts_input if index == 0 else None
@@ -652,7 +659,10 @@ class MoERunner(MoERunnerInterface):
                 )
             finally:
                 expert_tier.release()
-        return torch.cat(outputs, dim=0)
+        permuted_out = torch.cat(outputs, dim=0)
+        fused_out = torch.empty_like(permuted_out)
+        fused_out[perm_dev] = permuted_out
+        return fused_out
 
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token

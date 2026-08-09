@@ -23,6 +23,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.fused_moe import expert_tier_binding as binding
 from vllm.model_executor.layers.fused_moe.expert_tier_binding import (
     ExpertTierLayerBinding,
+    cluster_tokens_by_experts,
     compute_slot_counts,
     load_manifest,
     plan_expert_sub_batches,
@@ -197,6 +198,24 @@ def test_plan_expert_sub_batches():
     # A single token over the bound still gets its own sub-batch.
     topk = torch.tensor([[0, 1, 2], [3, 4, 5]])
     assert plan_expert_sub_batches(topk, 2) == [(0, 1), (1, 2)]
+
+
+def test_cluster_tokens_by_experts_groups_interleaved_sets():
+    # Tokens alternate between two disjoint expert sets: request order
+    # saturates a set-sized bound at every token, clustered order packs
+    # each set's tokens into a single range.
+    a, b = [0, 1, 2], [3, 4, 5]
+    topk = torch.tensor([a if i % 2 == 0 else b for i in range(20)])
+    assert len(plan_expert_sub_batches(topk, 3)) == 20
+
+    perm = cluster_tokens_by_experts(topk)
+    assert sorted(perm.tolist()) == list(range(20))
+    assert plan_expert_sub_batches(topk[perm], 3) == [(0, 10), (10, 20)]
+
+    # Stable within equal sets: original order preserved per cluster.
+    assert perm.tolist() == [i for i in range(20) if i % 2 == 0] + [
+        i for i in range(20) if i % 2 == 1
+    ]
 
     # Random routing: ranges partition the batch and each range's
     # distinct-expert count stays within the bound.

@@ -34,6 +34,7 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -95,6 +96,23 @@ def plan_expert_sub_batches(
             seen |= new
     bounds.append((start, num_tokens))
     return bounds
+
+
+def cluster_tokens_by_experts(topk_ids: torch.Tensor) -> torch.Tensor:
+    """Permutation grouping tokens with overlapping routed-expert sets.
+
+    Lexicographic sort over each token's ascending expert ids places
+    tokens that share experts adjacently, so the greedy contiguous
+    planner packs many more tokens per sub-batch than request order
+    allows (request order interleaves expert sets, saturating the
+    distinct-expert bound after a handful of tokens).
+
+    Returns:
+        int64 permutation over ``[0, num_tokens)``.
+    """
+    keys = topk_ids.sort(dim=1).values.numpy()
+    perm = np.lexsort(tuple(keys[:, i] for i in range(keys.shape[1] - 1, -1, -1)))
+    return torch.from_numpy(np.ascontiguousarray(perm)).to(torch.int64)
 
 
 @dataclass(frozen=True)
@@ -347,13 +365,18 @@ class ExpertTierLayerBinding:
             layer.register_parameter(name, param)
             set_weight_attrs(param, extra_weight_attrs)
 
-    def plan_sub_batches(self, topk_ids: torch.Tensor) -> list[tuple[int, int]] | None:
-        """Contiguous token sub-batches whose distinct-expert count fits
-        the layer's GPU slot pool; None when the whole batch fits and no
-        split is needed. Split pieces target ``gpu_slots`` minus a small
-        margin so the pool keeps eviction headroom across sub-batches.
-        Each returned range is served by its own ensure -> apply ->
-        release cycle in the runner.
+    def plan_sub_batches(
+        self, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, list[tuple[int, int]]] | None:
+        """Token permutation + sub-batch ranges fitting the GPU slot pool.
+
+        None when the whole batch fits and no split is needed. Otherwise
+        tokens are clustered by routed-expert overlap (lexicographic
+        sort of expert sets) and the clustered order is split into
+        contiguous ranges whose distinct-expert count targets
+        ``gpu_slots`` minus a small eviction-headroom margin. The runner
+        applies each range on the permuted tensors (ensure -> apply ->
+        release apiece) and inverse-permutes the concatenated output.
         """
         if topk_ids.shape[0] <= 1:
             return None
@@ -362,7 +385,11 @@ class ExpertTierLayerBinding:
         if int(torch.unique(topk_ids).numel()) <= self.gpu_slots:
             return None
         bound = max(topk_ids.shape[-1], self.gpu_slots - SUB_BATCH_SLOT_MARGIN)
-        return plan_expert_sub_batches(topk_ids, bound)
+        perm = cluster_tokens_by_experts(topk_ids)
+        bounds = plan_expert_sub_batches(topk_ids[perm], bound)
+        if bounds is None:
+            return None
+        return perm, bounds
 
     def ensure(self, topk_ids: torch.Tensor) -> None:
         """Make the routed experts resident (on-demand, blocking on ids).
