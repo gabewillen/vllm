@@ -217,6 +217,47 @@ def test_cluster_tokens_by_experts_groups_interleaved_sets():
         i for i in range(20) if i % 2 == 1
     ]
 
+
+class _StubEnsureResult:
+    gpu_tensors: dict = {}
+    slot_of = None
+
+
+class _StubCache:
+    def ensure(self, layer_id, ids):
+        return _StubEnsureResult()
+
+    def release(self, layer_id):
+        pass
+
+
+def test_activation_histogram_counts_per_token():
+    hist: dict = {}
+    binding = ExpertTierLayerBinding(
+        cache=_StubCache(),
+        layer_id=7,
+        num_experts=8,
+        specs=[],
+        gpu_slots=4,
+        activation_hist=hist,
+    )
+    binding.ensure(torch.tensor([[0, 1], [1, 2]], dtype=torch.int32))
+    # Out-of-range ids are filtered, duplicates count per token.
+    binding.ensure(torch.tensor([[7, -1], [8, 1]], dtype=torch.int32))
+    assert hist[7].tolist() == [1, 3, 1, 0, 0, 0, 0, 1]
+
+    # Disabled: no accumulation.
+    off = ExpertTierLayerBinding(
+        cache=_StubCache(),
+        layer_id=1,
+        num_experts=8,
+        specs=[],
+        gpu_slots=4,
+        activation_hist=None,
+    )
+    off.ensure(torch.tensor([[0, 1]], dtype=torch.int32))
+    assert 1 not in hist
+
     # Random routing: ranges partition the batch and each range's
     # distinct-expert count stays within the bound.
     torch.manual_seed(3)
