@@ -16,12 +16,15 @@ import torch
 
 from tools.dsv4_expert_cache_convert import (
     CACHE_TENSOR_NAMES,
+    LayerTensorLoader,
     build_layer_manifest,
     cache_file_name,
+    ckpt_layer_prefix,
     ckpt_shard_slice,
     expected_marlin_specs,
     file_complete,
     parse_int_list,
+    resolve_layers,
     safetensors_expected_size,
     update_manifest,
 )
@@ -149,6 +152,102 @@ class TestResumeLogic:
         assert cache_file_name(42, "w2_weight_scale") == (
             "layer042.w2_weight_scale.raw"
         )
+
+
+class TestMtpLayers:
+    NUM_HIDDEN = 43
+
+    def test_ckpt_layer_prefix(self):
+        assert ckpt_layer_prefix(0, self.NUM_HIDDEN) == "layers.0"
+        assert ckpt_layer_prefix(42, self.NUM_HIDDEN) == "layers.42"
+        assert ckpt_layer_prefix(43, self.NUM_HIDDEN) == "mtp.0"
+        assert ckpt_layer_prefix(45, self.NUM_HIDDEN) == "mtp.2"
+
+    def test_resolve_layers(self):
+        mtp_ids = [43, 44, 45]
+        # Default: all main layers, no MTP.
+        assert resolve_layers(None, False, 4, mtp_ids) == [0, 1, 2, 3]
+        # --mtp alone: only the MTP layers (append mode).
+        assert resolve_layers(None, True, 4, mtp_ids) == mtp_ids
+        # Explicit --layers plus --mtp: union.
+        assert resolve_layers("0-1", True, 4, mtp_ids) == [0, 1, 43, 44, 45]
+        # Explicit --layers may name MTP ids directly.
+        assert resolve_layers("44", False, 4, mtp_ids) == [44]
+        with pytest.raises(ValueError, match="no mtp"):
+            resolve_layers(None, True, 4, [])
+
+    def test_update_manifest_records_mtp_layer_ids(self, tmp_path):
+        path = str(tmp_path / "manifest.json")
+        specs = expected_marlin_specs(4)
+        meta = {"tp_rank": 0}
+        # Main layers only: no mtp_layer_ids key (byte-compatible schema).
+        update_manifest(
+            path,
+            dict(meta),
+            256,
+            0,
+            build_layer_manifest(0, specs, 256),
+            num_hidden_layers=self.NUM_HIDDEN,
+        )
+        with open(path) as f:
+            manifest = json.load(f)
+        assert "mtp_layer_ids" not in manifest["meta"]
+        layer0_before = json.dumps(manifest["layers"]["0"])
+
+        # Adding MTP layers records their ids and keeps layer 0 intact.
+        for layer_id in (44, 43):
+            update_manifest(
+                path,
+                dict(meta),
+                256,
+                layer_id,
+                build_layer_manifest(layer_id, specs, 256),
+                num_hidden_layers=self.NUM_HIDDEN,
+            )
+        with open(path) as f:
+            manifest = json.load(f)
+        assert manifest["meta"]["mtp_layer_ids"] == [43, 44]
+        assert list(manifest["layers"]) == ["0", "43", "44"]
+        assert json.dumps(manifest["layers"]["0"]) == layer0_before
+        assert manifest["layers"]["43"]["w13_weight"]["file"] == (
+            "layer043.w13_weight.raw"
+        )
+
+    def _write_snapshot(self, tmp_path, num_experts=2):
+        from safetensors.torch import save_file
+
+        tensors = {}
+        for prefix in ("layers.0", "mtp.0", "mtp.1"):
+            for e in range(num_experts):
+                for w in ("w1", "w2", "w3"):
+                    base = f"{prefix}.ffn.experts.{e}.{w}"
+                    tensors[f"{base}.weight"] = torch.zeros(4, 2, dtype=torch.int8)
+                    tensors[f"{base}.scale"] = torch.zeros(
+                        4, 1, dtype=torch.float8_e8m0fnu
+                    )
+        shard = "model-00001-of-00001.safetensors"
+        save_file(tensors, str(tmp_path / shard))
+        index = {"weight_map": {name: shard for name in tensors}}
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+        return tmp_path
+
+    def test_loader_mtp_prefix(self, tmp_path):
+        snapshot = self._write_snapshot(tmp_path)
+        loader = LayerTensorLoader(str(snapshot), 2, self.NUM_HIDDEN)
+        assert loader.mtp_layer_ids() == [43, 44]
+        assert loader.has_layer(0)
+        assert loader.has_layer(43)
+        assert loader.has_layer(44)
+        assert not loader.has_layer(1)
+        assert not loader.has_layer(45)
+
+        tensors = loader.load_layer(44, experts=[1])
+        assert set(tensors) == {
+            (1, w, kind) for w in ("w1", "w2", "w3") for kind in ("weight", "scale")
+        }
+        assert tensors[(1, "w1", "weight")].dtype == torch.int8
+        # E8M0 scales come back as raw uint8 views.
+        assert tensors[(1, "w1", "scale")].dtype == torch.uint8
 
 
 class TestSafetensorsExpectedSize:

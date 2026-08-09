@@ -184,6 +184,32 @@ def _small_row_bytes(specs: list[ExpertTensorSpec]) -> int:
     return sum(s.row_bytes for s in specs if s.row_bytes <= _STAGED_H2D_MAX_ROW_BYTES)
 
 
+def drop_mtp_layers(manifest: ExpertTierManifest) -> ExpertTierManifest:
+    """Manifest without the MTP draft layers listed in ``meta.mtp_layer_ids``.
+
+    The converter records MTP (DSpark) draft-block experts as extra cache
+    layers; without speculative decoding they are never bound, so they are
+    dropped before pool sizing to keep slot counts identical to a cache
+    converted without ``--mtp``.
+    """
+    mtp_ids = set(manifest.meta.get("mtp_layer_ids", []))
+    if not mtp_ids:
+        return manifest
+    return ExpertTierManifest(
+        path=manifest.path,
+        num_experts=manifest.num_experts,
+        layer_specs={
+            layer_id: specs
+            for layer_id, specs in manifest.layer_specs.items()
+            if layer_id not in mtp_ids
+        },
+        files={
+            key: path for key, path in manifest.files.items() if key[0] not in mtp_ids
+        },
+        meta=manifest.meta,
+    )
+
+
 def _byte_specs(
     layer_specs: dict[int, list[ExpertTensorSpec]],
 ) -> dict[int, list[ExpertTensorSpec]]:
@@ -382,12 +408,15 @@ class ExpertTierState:
         device: torch.device,
         rank: int,
         max_routed_experts: int | None,
+        include_mtp_layers: bool = False,
     ):
         assert config.cache_dir is not None
         self.config = config
         self.device = device
         self.rank = rank
         self.manifest = load_manifest(config.cache_dir, rank)
+        if not include_mtp_layers:
+            self.manifest = drop_mtp_layers(self.manifest)
         meta_backend = self.manifest.meta.get("mxfp4_backend")
         if meta_backend is not None and meta_backend != "MARLIN":
             raise ValueError(
@@ -519,10 +548,13 @@ def _get_or_create_state(
     device: torch.device,
     rank: int,
     max_routed_experts: int | None,
+    include_mtp_layers: bool = False,
 ) -> ExpertTierState:
     global _state
     if _state is None:
-        _state = ExpertTierState(config, device, rank, max_routed_experts)
+        _state = ExpertTierState(
+            config, device, rank, max_routed_experts, include_mtp_layers
+        )
     elif _state.config != config or _state.rank != rank:
         raise ValueError(
             "expert-tier cache already initialized with a different "
@@ -594,6 +626,7 @@ def maybe_init_expert_tier(
         device=torch.get_default_device(),
         rank=layer.moe_config.tp_rank,
         max_routed_experts=max_routed,
+        include_mtp_layers=vllm_config.speculative_config is not None,
     )
     if state.manifest.num_experts != layer.global_num_experts:
         raise ValueError(
