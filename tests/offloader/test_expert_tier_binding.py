@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.expert_tier_binding import (
     ExpertTierLayerBinding,
     compute_slot_counts,
     load_manifest,
+    plan_expert_sub_batches,
 )
 from vllm.model_executor.offloader.expert_tier import ExpertTensorSpec
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -174,6 +175,41 @@ def test_compute_slot_counts():
     # GPU budget below one slot per layer fails.
     with pytest.raises(ValueError, match="cannot hold one GPU slot"):
         compute_slot_counts(manifest, gpu_bytes=gpu_cost - 1, pinned_bytes=2**30)
+
+
+#
+# Sub-batch planning
+#
+
+
+def test_plan_expert_sub_batches():
+    # Whole batch within the bound: no split.
+    topk = torch.tensor([[0, 1], [0, 1], [2, 3]])
+    assert plan_expert_sub_batches(topk, 4) is None
+    # Single token never splits.
+    assert plan_expert_sub_batches(torch.tensor([[0, 1, 2]]), 2) is None
+
+    # Greedy contiguous split at the distinct-expert bound.
+    assert plan_expert_sub_batches(topk, 2) == [(0, 2), (2, 3)]
+    topk = torch.tensor([[0, 1], [0, 1], [2, 3], [2, 3], [0, 3]])
+    assert plan_expert_sub_batches(topk, 2) == [(0, 2), (2, 4), (4, 5)]
+
+    # A single token over the bound still gets its own sub-batch.
+    topk = torch.tensor([[0, 1, 2], [3, 4, 5]])
+    assert plan_expert_sub_batches(topk, 2) == [(0, 1), (1, 2)]
+
+    # Random routing: ranges partition the batch and each range's
+    # distinct-expert count stays within the bound.
+    torch.manual_seed(3)
+    topk = torch.randint(0, 64, (200, 8))
+    bound = 24
+    bounds = plan_expert_sub_batches(topk, bound)
+    assert bounds is not None
+    assert bounds[0][0] == 0 and bounds[-1][1] == 200
+    for (_, prev_end), (start, _) in zip(bounds, bounds[1:]):
+        assert prev_end == start
+    for start, end in bounds:
+        assert int(torch.unique(topk[start:end]).numel()) <= bound
 
 
 #
@@ -428,6 +464,72 @@ def test_tier_layer_matches_resident_layer(
         assert stats["cold_misses"] >= min(gpu_slots, NUM_EXPERTS)
         if gpu_slots < NUM_EXPERTS:
             assert stats["gpu_evictions"] > 0
+        assert stats["io_errors"] == 0
+    finally:
+        torch.set_default_device("cpu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_tier_sub_batched_forward_matches_resident_layer(
+    tmp_path, dist_init, workspace_init, tier_state_reset, monkeypatch
+):
+    """A batch routing more distinct experts than the GPU slot pool is
+    applied in contiguous token sub-batches and must match the resident
+    layer's unsplit forward."""
+    torch.set_default_device("cuda")
+    try:
+        set_random_seed(11)
+        cfg_ref, ref, tensors = _build_reference_and_cache(tmp_path)
+
+        gpu_slots = 2  # batch below routes 4 distinct experts: must split
+        gpu_gb, pinned_gb = _tier_budgets(
+            tensors, gpu_slots=gpu_slots, pinned_slots=NUM_EXPERTS
+        )
+        cfg_tier = _make_vllm_config(
+            ExpertTierOffloadConfig(
+                enabled=True,
+                cache_dir=str(tmp_path),
+                gpu_gb=gpu_gb,
+                pinned_gb=pinned_gb,
+                io_threads=2,
+            )
+        )
+        tier = _make_moe_layer(cfg_tier, prefix="model.layers.0.mlp.tier")
+        tier_binding = tier.routed_experts.expert_tier
+        assert tier_binding is not None
+        assert tier_binding.gpu_slots == gpu_slots
+        with set_current_vllm_config(cfg_tier):
+            tier.routed_experts.quant_method.process_weights_after_loading(
+                tier.routed_experts
+            )
+
+        ensure_calls = []
+        real_ensure = ExpertTierLayerBinding.ensure
+
+        def counting_ensure(self, topk_ids):
+            ensure_calls.append(topk_ids.shape[0])
+            return real_ensure(self, topk_ids)
+
+        monkeypatch.setattr(ExpertTierLayerBinding, "ensure", counting_ensure)
+
+        # Tokens 0..7 route to experts (0, 1), tokens 8..15 to (2, 3):
+        # 4 distinct experts vs a 2-slot pool forces the split [0:8][8:16].
+        num_tokens = 16
+        hidden = torch.randn(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16) / 10
+        logits = torch.full((num_tokens, NUM_EXPERTS), -20.0, dtype=torch.float32)
+        logits[:8, [0, 1]] = 20.0
+        logits[8:, [2, 3]] = 20.0
+
+        out_ref = _forward(ref, cfg_ref, hidden, logits)
+        out_tier = _forward(tier, cfg_tier, hidden, logits)
+        assert ensure_calls == [8, 8]  # one ensure per sub-batch
+
+        torch.testing.assert_close(out_tier, out_ref, atol=0.0, rtol=0.0)
+
+        state = binding._state
+        assert state is not None
+        stats = state.cache.stats()["per_layer"][0]
+        assert stats["ensure_calls"] == 3  # bind-time + 2 sub-batches
         assert stats["io_errors"] == 0
     finally:
         torch.set_default_device("cpu")
