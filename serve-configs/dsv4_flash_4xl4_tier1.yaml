@@ -1,0 +1,26 @@
+# DeepSeek-V4-Flash-0731 on 4x L4 — tier0 plus long-context sub-batched prefill.
+# Serve: .venv-omni/bin/vllm serve --config serve-configs/dsv4_flash_4xl4_tier1.yaml
+# Same tiered-expert + hash-prefetch setup as dsv4_flash_4xl4_tier0.yaml, but
+# max-model-len 32768 and max-num-batched-tokens 512: prefill chunks whose
+# distinct routed experts per layer exceed the ~102 GPU slots/layer are split
+# by the expert-tier binding into contiguous token sub-batches that fit the
+# pool (ensure -> apply -> release each), so large chunks no longer require
+# max-num-batched-tokens 8. tier0 is kept untouched for reproducibility.
+model: deepseek-ai/DeepSeek-V4-Flash-0731
+tensor-parallel-size: 4
+block-size: 256
+kv-cache-dtype: fp8
+max-model-len: 32768
+max-num-batched-tokens: 512
+max-num-seqs: 1
+gpu-memory-utilization: 0.92
+enforce-eager: true
+expert-tier-cache-dir: /shared/vllm/vllm-cache/dsv4-marlin-tp4
+expert-tier-gpu-gb: 14
+expert-tier-pinned-gb: 15
+expert-tier-prefetch-predictors: "hash"
+tokenizer-mode: deepseek_v4
+tool-call-parser: deepseek_v4
+reasoning-parser: deepseek_v4
+trust-remote-code: true
+port: 8010

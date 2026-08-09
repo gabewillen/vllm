@@ -103,7 +103,7 @@ class ExpertTierOffloadConfig:
     pinned_gb: float = Field(default=2.0, gt=0)
     """Per-rank pinned-host-memory budget (GiB) for the middle tier."""
 
-    io_threads: int = Field(default=4, ge=1)
+    io_threads: int = Field(default=8, ge=1)
     """Worker threads for cold-file reads into pinned memory."""
 
     prefetch_predictors: str = "hash"

@@ -4,6 +4,7 @@
 
 import random
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -291,6 +292,116 @@ def test_concurrent_prefetch_stress(device, make_cache):
     )
     assert served == ensured
     assert total["bytes_cold_to_pinned"] >= total["cold_misses"] * BYTES_PER_EXPERT
+
+
+def test_cold_misses_load_concurrently(device, make_cache, manifest):
+    """All cold misses of one ensure() run concurrently on the IO pool:
+    N slow reads complete in ~max(single), not ~sum."""
+    delay = 0.15
+
+    class SlowBacking:
+        def __init__(self):
+            self.inner = MmapColdBacking(manifest)
+
+        def read_into(self, layer_id, expert_id, name, dst):
+            if name == "w_a":  # one sleep per expert load
+                time.sleep(delay)
+            self.inner.read_into(layer_id, expert_id, name, dst)
+
+    cache = make_cache(
+        device,
+        gpu_slots={layer_id: 8 for layer_id in LAYERS},
+        pinned_slots={layer_id: 8 for layer_id in LAYERS},
+        cold=SlowBacking(),
+        io_threads=8,
+    )
+    ids = list(range(8))
+    t0 = time.perf_counter()
+    result = cache.ensure(0, ids)
+    elapsed = time.perf_counter() - t0
+    verify_resident(result, 0, ids)
+    cache.release(0)
+    assert cache.stats()["per_layer"][0]["cold_misses"] == 8
+    # Serial would take >= 8 * delay.
+    assert elapsed < 4 * delay, f"cold misses served serially: {elapsed:.3f}s"
+
+
+def test_ensure_cold_wait_does_not_block_other_layers(device, make_cache, manifest):
+    """One layer's cold-read wait must not serialize other layers."""
+    delay = 0.4
+
+    class LayerZeroSlowBacking:
+        def __init__(self):
+            self.inner = MmapColdBacking(manifest)
+
+        def read_into(self, layer_id, expert_id, name, dst):
+            if layer_id == 0 and name == "w_a":
+                time.sleep(delay)
+            self.inner.read_into(layer_id, expert_id, name, dst)
+
+    cache = make_cache(device, cold=LayerZeroSlowBacking(), io_threads=8)
+    started = threading.Event()
+
+    def slow_ensure():
+        started.set()
+        result = cache.ensure(0, [0, 1])
+        verify_resident(result, 0, [0, 1])
+        cache.release(0)
+
+    thread = threading.Thread(target=slow_ensure)
+    thread.start()
+    started.wait()
+    time.sleep(delay / 8)  # let the slow ensure enter its cold wait
+    t0 = time.perf_counter()
+    result = cache.ensure(1, [3, 4])
+    elapsed = time.perf_counter() - t0
+    verify_resident(result, 1, [3, 4])
+    cache.release(1)
+    thread.join()
+    assert elapsed < delay / 2, (
+        f"layer 1 ensure blocked behind layer 0 cold wait: {elapsed:.3f}s"
+    )
+
+
+def test_prefetch_not_blocked_by_ensure_cold_wait(device, make_cache, manifest):
+    """Prefetch dispatch for a layer stays unblocked while that layer's
+    ensure() waits out a cold read (the lock is dropped for the wait)."""
+    delay = 0.4
+
+    class SlowBacking:
+        def __init__(self):
+            self.inner = MmapColdBacking(manifest)
+
+        def read_into(self, layer_id, expert_id, name, dst):
+            if name == "w_a":
+                time.sleep(delay)
+            self.inner.read_into(layer_id, expert_id, name, dst)
+
+    cache = make_cache(device, cold=SlowBacking(), io_threads=8)
+    started = threading.Event()
+
+    def slow_ensure():
+        started.set()
+        result = cache.ensure(0, [0])
+        verify_resident(result, 0, [0])
+        cache.release(0)
+
+    thread = threading.Thread(target=slow_ensure)
+    thread.start()
+    started.wait()
+    time.sleep(delay / 8)  # let the slow ensure enter its cold wait
+    t0 = time.perf_counter()
+    cache.prefetch(0, [5], to_gpu=False)
+    elapsed = time.perf_counter() - t0
+    thread.join()
+    assert elapsed < delay / 2, (
+        f"prefetch blocked behind same-layer cold wait: {elapsed:.3f}s"
+    )
+    cache.wait_io()
+    result = cache.ensure(0, [5])  # served from the prefetched load
+    verify_resident(result, 0, [5])
+    cache.release(0)
+    assert cache.stats()["per_layer"][0]["cold_misses"] == 1  # expert 0 only
 
 
 def test_stats_accounting(device, make_cache):

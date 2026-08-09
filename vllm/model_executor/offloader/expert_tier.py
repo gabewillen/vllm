@@ -312,6 +312,9 @@ class _LayerState:
         self.release_recorded = False
         self.compute_stream: torch.cuda.Stream | None = None
         self.stats: dict[str, int] = dict.fromkeys(_STAT_KEYS, 0)
+        # Guards all mutable state above; never held across cold-read
+        # waits in ensure() (see ExpertTierCache concurrency contract).
+        self.lock = threading.Lock()
 
 
 class ExpertTierCache:
@@ -323,9 +326,13 @@ class ExpertTierCache:
     evicted from the GPU tier, and their pinned-tier entries are also
     protected.
 
-    Concurrency contract: every public method is thread-safe behind one
-    internal lock. IO threads never issue CUDA calls; all H2D copies go
-    on the single copy stream owned by the cache.
+    Concurrency contract: every public method is thread-safe. Each layer
+    has its own lock, so operations on different layers never serialize;
+    ensure() additionally drops the layer lock while waiting out cold
+    reads, so same-layer prefetch() calls stay unblocked too. IO threads
+    never issue CUDA calls; all H2D copies go on the single copy stream
+    owned by the cache, with cross-layer enqueues serialized by a stream
+    lock.
 
     Caller preconditions:
         - ``gpu_slots_per_layer[l]`` must be >= the maximum concurrent
@@ -354,7 +361,7 @@ class ExpertTierCache:
         layer_specs: dict[int, list[ExpertTensorSpec]],
         num_experts: int,
         cold: ColdBacking,
-        io_threads: int = 4,
+        io_threads: int = 8,
     ):
         if num_experts < 1:
             raise ValueError(f"num_experts must be >= 1, got {num_experts}")
@@ -370,7 +377,9 @@ class ExpertTierCache:
         self._is_cuda = self._device.type == "cuda"
         self._num_experts = num_experts
         self._cold = cold
-        self._lock = threading.Lock()
+        # Serializes copy-stream enqueue+event-record sections across
+        # layers (per-layer state is guarded by each layer's own lock).
+        self._stream_lock = threading.Lock()
         self._copy_stream = (
             torch.cuda.Stream(device=self._device) if self._is_cuda else None
         )
@@ -421,8 +430,8 @@ class ExpertTierCache:
             Exception: Propagated cold-read failure.
         """
         ids = self._normalize_ids(expert_ids)
-        with self._lock:
-            st = self._get_layer(layer_id)
+        st = self._get_layer(layer_id)
+        with st.lock:
             st.stats["preload_calls"] += 1
             self._sweep_ready(st)
             protected = st.pins | set(ids)
@@ -471,8 +480,11 @@ class ExpertTierCache:
         calls before release() pin the union. All requested experts are
         guaranteed resident once ``compute_stream`` passes the recorded
         copy event (waited via ``event.wait(compute_stream)``, no host
-        block). The only host block is waiting out a cold->pinned read
-        that is still in flight (counted in stats).
+        block). The only host block is waiting out cold->pinned reads:
+        all of a call's missing loads are dispatched to the IO pool up
+        front and awaited with the layer lock released, so they proceed
+        concurrently (bounded by ``io_threads``) and never stall other
+        layers' operations or same-layer prefetch dispatch.
 
         Args:
             layer_id: Layer whose pools to fill.
@@ -491,8 +503,8 @@ class ExpertTierCache:
             Exception: Propagated cold-read failure.
         """
         ids = self._normalize_ids(expert_ids)
-        with self._lock:
-            st = self._get_layer(layer_id)
+        st = self._get_layer(layer_id)
+        with st.lock:
             st.stats["ensure_calls"] += 1
             self._sweep_ready(st)
             new_pins = [e for e in ids if e not in st.pins]
@@ -509,49 +521,72 @@ class ExpertTierCache:
                     compute_stream = torch.cuda.current_stream(self._device)
                 st.compute_stream = compute_stream
 
-            gpu_miss: list[int] = []
-            for expert_id in ids:
-                if st.gpu.get(expert_id) is not None:
-                    st.gpu.touch(expert_id)
-                    if st.pinned.get(expert_id) is not None:
-                        st.pinned.touch(expert_id)
-                    st.stats["gpu_hits"] += 1
-                else:
-                    gpu_miss.append(expert_id)
-
-            cold_started: set[int] = set()
-            for expert_id in gpu_miss:
-                if expert_id in st.loading or (st.pinned.get(expert_id) is not None):
-                    continue
-                slot = self._take_pinned_slot_blocking(st, protected=st.pins)
-                if slot is None:
-                    raise RuntimeError(
-                        f"layer {layer_id}: pinned pool "
-                        f"({st.pinned.num_slots} slots) cannot hold the cold "
-                        f"working set of this ensure() call"
-                    )
-                self._start_load(st, expert_id, slot, wants_gpu=False)
-                cold_started.add(expert_id)
-                st.stats["cold_misses"] += 1
-
-            moves: list[tuple[int, int, int]] = []
-            for expert_id in gpu_miss:
-                job = st.loading.get(expert_id)
-                if job is not None:
-                    if expert_id in cold_started:
-                        pass  # already counted as cold_misses
-                    elif all(f.done() for f in job.futures):
+            # Each pass: classify, dispatch every missing load, promote
+            # what is ready, then wait out still-running loads with the
+            # layer lock released (they run concurrently on the IO pool)
+            # and re-classify. Concurrent sweeps may publish, promote,
+            # or (on failure) drop our experts during the unlocked wait;
+            # the re-classification handles all three.
+            remaining = ids
+            counted: set[int] = set()
+            while remaining:
+                pending: list[Future] = []
+                waiting: list[int] = []
+                moves: list[tuple[int, int, int]] = []
+                for expert_id in remaining:
+                    if st.gpu.get(expert_id) is not None:
+                        st.gpu.touch(expert_id)
+                        if st.pinned.get(expert_id) is not None:
+                            st.pinned.touch(expert_id)
+                        if expert_id not in counted:
+                            counted.add(expert_id)
+                            st.stats["gpu_hits"] += 1
+                        continue
+                    job = st.loading.get(expert_id)
+                    if job is None and st.pinned.get(expert_id) is None:
+                        slot = self._take_pinned_slot_blocking(st, protected=st.pins)
+                        if slot is None:
+                            raise RuntimeError(
+                                f"layer {layer_id}: pinned pool "
+                                f"({st.pinned.num_slots} slots) cannot hold "
+                                "the cold working set of this ensure() call"
+                            )
+                        job = self._start_load(st, expert_id, slot, wants_gpu=False)
+                        if expert_id not in counted:
+                            counted.add(expert_id)
+                            st.stats["cold_misses"] += 1
+                    if job is not None:
+                        if not all(f.done() for f in job.futures):
+                            if expert_id not in counted:
+                                counted.add(expert_id)
+                                st.stats["inflight_waits"] += 1
+                            pending.extend(job.futures)
+                            waiting.append(expert_id)
+                            continue
+                        self._finish_load(st, expert_id, job)
+                    if expert_id not in counted:
+                        counted.add(expert_id)
                         st.stats["pinned_hits"] += 1
-                    else:
-                        st.stats["inflight_waits"] += 1
-                    self._finish_load(st, expert_id, job)
-                else:
-                    st.stats["pinned_hits"] += 1
-                st.pinned.touch(expert_id)
-                dst = self._take_gpu_slot(st)
-                st.gpu.insert(expert_id, dst)
-                moves.append((expert_id, st.pinned.map[expert_id], dst))
-            self._h2d_batch(st, moves)
+                    st.pinned.touch(expert_id)
+                    dst = self._take_gpu_slot(st)
+                    st.gpu.insert(expert_id, dst)
+                    moves.append((expert_id, st.pinned.map[expert_id], dst))
+                self._h2d_batch(st, moves)
+                remaining = waiting
+                if pending:
+                    st.lock.release()
+                    try:
+                        _futures_wait(pending)
+                    finally:
+                        st.lock.acquire()
+
+            # Promotion order across the passes above depends on IO
+            # completion timing; re-touch in id order so LRU recency for
+            # the call's working set is deterministic.
+            for expert_id in ids:
+                st.gpu.touch(expert_id)
+                if st.pinned.get(expert_id) is not None:
+                    st.pinned.touch(expert_id)
 
             event = None
             if self._is_cuda and st.fill_recorded:
@@ -569,8 +604,8 @@ class ExpertTierCache:
         stream; slot reuse is fenced against that stream via an event
         recorded here (no host block).
         """
-        with self._lock:
-            st = self._get_layer(layer_id)
+        st = self._get_layer(layer_id)
+        with st.lock:
             st.pins.clear()
             if self._is_cuda and st.compute_stream is not None:
                 assert st.release_event is not None
@@ -598,8 +633,8 @@ class ExpertTierCache:
             ValueError: If an expert id is out of range.
         """
         ids = self._normalize_ids(expert_ids)
-        with self._lock:
-            st = self._get_layer(layer_id)
+        st = self._get_layer(layer_id)
+        with st.lock:
             st.stats["prefetch_calls"] += 1
             self._sweep_ready(st)
             moves: list[tuple[int, int, int]] = []
@@ -631,10 +666,10 @@ class ExpertTierCache:
 
     def stats(self) -> dict:
         """Per-layer and total counters (hits, misses, bytes, evictions)."""
-        with self._lock:
-            per_layer = {
-                layer_id: dict(st.stats) for layer_id, st in self._layers.items()
-            }
+        per_layer = {}
+        for layer_id, st in self._layers.items():
+            with st.lock:
+                per_layer[layer_id] = dict(st.stats)
         total = {
             key: sum(layer[key] for layer in per_layer.values()) for key in _STAT_KEYS
         }
@@ -646,13 +681,12 @@ class ExpertTierCache:
         Loaded entries are promoted lazily by the next ensure/prefetch/
         preload call for their layer.
         """
-        with self._lock:
-            futures = [
-                future
-                for st in self._layers.values()
-                for job in st.loading.values()
-                for future in job.futures
-            ]
+        futures: list[Future] = []
+        for st in self._layers.values():
+            with st.lock:
+                futures.extend(
+                    future for job in st.loading.values() for future in job.futures
+                )
         _futures_wait(futures, timeout=timeout)
 
     def close(self) -> None:
@@ -685,11 +719,11 @@ class ExpertTierCache:
 
     def _start_load(
         self, st: _LayerState, expert_id: int, slot: int, wants_gpu: bool
-    ) -> None:
+    ) -> _LoadJob:
         future = self._io.submit(self._read_expert, st, expert_id, slot)
-        st.loading[expert_id] = _LoadJob(
-            slot=slot, futures=[future], wants_gpu=wants_gpu
-        )
+        job = _LoadJob(slot=slot, futures=[future], wants_gpu=wants_gpu)
+        st.loading[expert_id] = job
+        return job
 
     def _read_expert(self, st: _LayerState, expert_id: int, slot: int) -> None:
         """Fill one pinned slot from cold storage (runs on an IO thread)."""
@@ -698,7 +732,8 @@ class ExpertTierCache:
             self._cold.read_into(st.layer_id, expert_id, spec.name, dst)
 
     def _finish_load(self, st: _LayerState, expert_id: int, job: _LoadJob) -> None:
-        """Wait out a load and publish it to the pinned tier (lock held)."""
+        """Wait out a load and publish it to the pinned tier (layer lock
+        held)."""
         try:
             for future in job.futures:
                 future.result()
@@ -808,7 +843,9 @@ class ExpertTierCache:
         Large tensors use one non_blocking DMA per row straight from the
         pinned pool; small tensors are gathered into a pinned staging
         buffer, copied H2D once, and scattered with index_copy_. Records
-        the layer fill event after the last copy. Lock held.
+        the layer fill event after the last copy. Layer lock held; the
+        stream lock keeps each batch's [release-wait, copies, record]
+        enqueue atomic against other layers' batches.
         """
         if not moves:
             return
@@ -842,26 +879,29 @@ class ExpertTierCache:
             st.idx_pin[:num] = torch.tensor(dst, dtype=torch.int64)
             st.stage_busy = True
         copy_stream = self._copy_stream
-        if st.release_recorded:
-            assert st.release_event is not None
-            copy_stream.wait_event(st.release_event)
-        with torch.cuda.stream(copy_stream):
-            for name in st.large_names:
-                gpu_pool = st.gpu_pool[name]
-                pinned_pool = st.pinned_pool[name]
-                for src_slot, dst_slot in zip(src, dst):
-                    gpu_pool[dst_slot].copy_(pinned_pool[src_slot], non_blocking=True)
-            if st.small_names:
-                assert st.idx_pin is not None and st.idx_dev is not None
-                st.idx_dev[:num].copy_(st.idx_pin[:num], non_blocking=True)
-                for name in st.small_names:
-                    st.stage_dev[name][:num].copy_(
-                        st.stage_pin[name][:num], non_blocking=True
-                    )
-                    st.gpu_pool[name].index_copy_(
-                        0, st.idx_dev[:num], st.stage_dev[name][:num]
-                    )
-            st.slot_of_dev.copy_(st.slot_of_cpu, non_blocking=True)
+        with self._stream_lock:
+            if st.release_recorded:
+                assert st.release_event is not None
+                copy_stream.wait_event(st.release_event)
+            with torch.cuda.stream(copy_stream):
+                for name in st.large_names:
+                    gpu_pool = st.gpu_pool[name]
+                    pinned_pool = st.pinned_pool[name]
+                    for src_slot, dst_slot in zip(src, dst):
+                        gpu_pool[dst_slot].copy_(
+                            pinned_pool[src_slot], non_blocking=True
+                        )
+                if st.small_names:
+                    assert st.idx_pin is not None and st.idx_dev is not None
+                    st.idx_dev[:num].copy_(st.idx_pin[:num], non_blocking=True)
+                    for name in st.small_names:
+                        st.stage_dev[name][:num].copy_(
+                            st.stage_pin[name][:num], non_blocking=True
+                        )
+                        st.gpu_pool[name].index_copy_(
+                            0, st.idx_dev[:num], st.stage_dev[name][:num]
+                        )
+                st.slot_of_dev.copy_(st.slot_of_cpu, non_blocking=True)
+            st.fill_event.record(copy_stream)
         st.pinned_srcs.update(src)
-        st.fill_event.record(copy_stream)
         st.fill_recorded = True

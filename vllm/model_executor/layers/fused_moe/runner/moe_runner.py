@@ -571,20 +571,11 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            expert_tier = self.routed_experts.expert_tier
-            try:
-                if expert_tier is not None:
-                    # Gate lookahead (no-op unless enabled): predict the
-                    # next layer's experts from this layer's MoE input
-                    # before blocking below, so the async prefetch
-                    # overlaps this layer's ensure() stall.
-                    expert_tier.observe_hidden(hidden_states)
-                    # On-demand tiered expert residency: pin the routed
-                    # experts into the layer's GPU slot pools before the
-                    # kernel runs (the kernel sees slot_of as expert_map),
-                    # and unpin after its work is enqueued. Must run
-                    # outside cudagraph capture (config forces eager).
-                    expert_tier.ensure(topk_ids)
+            if self.routed_experts.expert_tier is not None:
+                fused_out = self._forward_expert_tier(
+                    hidden_states, topk_weights, topk_ids, shared_experts_input
+                )
+            else:
                 fused_out = self.routed_experts.forward_modular(
                     x=hidden_states,
                     topk_weights=topk_weights,
@@ -592,9 +583,6 @@ class MoERunner(MoERunnerInterface):
                     shared_experts=self._shared_experts,
                     shared_experts_input=shared_experts_input,
                 )
-            finally:
-                if expert_tier is not None:
-                    expert_tier.release()
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -605,6 +593,66 @@ class MoERunner(MoERunnerInterface):
             self._shared_experts.output if self._shared_experts is not None else None,
             fused_out,
         )
+
+    def _forward_expert_tier(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run the fused MoE kernel with tiered expert residency.
+
+        Pins the routed experts into the layer's GPU slot pools before
+        the kernel runs (the kernel sees slot_of as expert_map) and
+        unpins after its work is enqueued. When the batch routes more
+        distinct experts than the slot pool holds (large prefill
+        chunks), the token batch is split into contiguous sub-batches
+        that each fit, applied ensure -> kernel -> release apiece and
+        concatenated. Must run outside cudagraph capture (config forces
+        eager).
+        """
+        expert_tier = self.routed_experts.expert_tier
+        assert expert_tier is not None
+        # Gate lookahead (no-op unless enabled): predict the next
+        # layer's experts from this layer's MoE input before blocking
+        # below, so the async prefetch overlaps this layer's ensure()
+        # stall.
+        expert_tier.observe_hidden(hidden_states)
+        sub_batches = expert_tier.plan_sub_batches(topk_ids)
+        if sub_batches is None:
+            try:
+                expert_tier.ensure(topk_ids)
+                return self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
+            finally:
+                expert_tier.release()
+        outputs = []
+        for index, (start, end) in enumerate(sub_batches):
+            try:
+                expert_tier.ensure(topk_ids[start:end])
+                # SharedExperts runs exactly once per forward (its
+                # output slot asserts a single fill), always on the
+                # full input: pass it with the first sub-batch only.
+                outputs.append(
+                    self.routed_experts.forward_modular(
+                        x=hidden_states[start:end],
+                        topk_weights=topk_weights[start:end],
+                        topk_ids=topk_ids[start:end],
+                        shared_experts=self._shared_experts if index == 0 else None,
+                        shared_experts_input=(
+                            shared_experts_input if index == 0 else None
+                        ),
+                    )
+                )
+            finally:
+                expert_tier.release()
+        return torch.cat(outputs, dim=0)
 
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token

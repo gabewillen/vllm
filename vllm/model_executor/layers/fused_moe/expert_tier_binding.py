@@ -21,6 +21,11 @@ of resident VRAM:
 
 Baseline mode is on-demand: ensure() per layer per step, no prediction.
 It must run outside cudagraph capture; config validation forces eager.
+
+Large prefill chunks can route more distinct experts per layer than the
+GPU slot pool holds; :meth:`ExpertTierLayerBinding.plan_sub_batches`
+splits such token batches into contiguous sub-batches that each fit, and
+the runner applies the kernel per sub-batch (ensure -> apply -> release).
 """
 
 import atexit
@@ -48,6 +53,48 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 MANIFEST_FILENAME = "manifest.json"
+
+# GPU slots kept out of a sub-batch's distinct-expert bound: headroom so
+# ensure() never runs the pool to exactly zero evictable slots and hot
+# LRU entries can survive across sub-batches.
+SUB_BATCH_SLOT_MARGIN = 4
+
+
+def plan_expert_sub_batches(
+    topk_ids: torch.Tensor, max_distinct: int
+) -> list[tuple[int, int]] | None:
+    """Split a token batch into contiguous sub-batches by distinct experts.
+
+    Greedy scan over the routing ``topk_ids`` ``[num_tokens, top_k]``:
+    tokens are appended to the current sub-batch until adding the next
+    token would push its distinct-expert count past ``max_distinct``.
+
+    Returns:
+        ``[start, end)`` row ranges partitioning ``[0, num_tokens)``, or
+        None when the whole batch already fits ``max_distinct``. A single
+        token routing more than ``max_distinct`` experts still gets its
+        own sub-batch (the cache's ensure() enforces the hard limit).
+    """
+    num_tokens = topk_ids.shape[0]
+    if num_tokens <= 1:
+        return None
+    if topk_ids.device.type != "cpu":
+        topk_ids = topk_ids.cpu()
+    if int(torch.unique(topk_ids).numel()) <= max_distinct:
+        return None
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    seen: set[int] = set()
+    for i, row in enumerate(topk_ids.tolist()):
+        new = set(row) - seen
+        if i > start and len(seen) + len(new) > max_distinct:
+            bounds.append((start, i))
+            start = i
+            seen = set(row)
+        else:
+            seen |= new
+    bounds.append((start, num_tokens))
+    return bounds
 
 
 @dataclass(frozen=True)
@@ -220,12 +267,14 @@ class ExpertTierLayerBinding:
         layer_id: int,
         num_experts: int,
         specs: list[ExpertTensorSpec],
+        gpu_slots: int,
         prefetcher: ExpertPrefetcher | None = None,
     ):
         self.cache = cache
         self.layer_id = layer_id
         self.num_experts = num_experts
         self.specs = specs
+        self.gpu_slots = gpu_slots
         self.prefetcher = prefetcher
         # An empty ensure() exposes the layer's stable pool tensors and
         # live slot_of view without any IO or pinning.
@@ -271,6 +320,23 @@ class ExpertTierLayerBinding:
             assert param.data_ptr() == pool.data_ptr()
             layer.register_parameter(name, param)
             set_weight_attrs(param, extra_weight_attrs)
+
+    def plan_sub_batches(self, topk_ids: torch.Tensor) -> list[tuple[int, int]] | None:
+        """Contiguous token sub-batches whose distinct-expert count fits
+        the layer's GPU slot pool; None when the whole batch fits and no
+        split is needed. Split pieces target ``gpu_slots`` minus a small
+        margin so the pool keeps eviction headroom across sub-batches.
+        Each returned range is served by its own ensure -> apply ->
+        release cycle in the runner.
+        """
+        if topk_ids.shape[0] <= 1:
+            return None
+        if topk_ids.device.type != "cpu":
+            topk_ids = topk_ids.cpu()
+        if int(torch.unique(topk_ids).numel()) <= self.gpu_slots:
+            return None
+        bound = max(topk_ids.shape[-1], self.gpu_slots - SUB_BATCH_SLOT_MARGIN)
+        return plan_expert_sub_batches(topk_ids, bound)
 
     def ensure(self, topk_ids: torch.Tensor) -> None:
         """Make the routed experts resident (on-demand, blocking on ids).
@@ -339,11 +405,11 @@ class ExpertTierState:
         if max_routed_experts is not None:
             worst_case = min(self.manifest.num_experts, max_routed_experts)
             if slots < worst_case:
-                logger.warning(
+                logger.info(
                     "expert-tier GPU pools hold %d slots/layer but a batch "
-                    "can route up to %d distinct experts per layer; "
-                    "ensure() will fail if a batch exceeds the pool. Raise "
-                    "--expert-tier-gpu-gb or lower max_num_batched_tokens.",
+                    "can route up to %d distinct experts per layer; such "
+                    "batches are applied in contiguous token sub-batches "
+                    "that fit the pool.",
                     slots,
                     worst_case,
                 )
@@ -418,6 +484,7 @@ class ExpertTierState:
             layer_id=layer_id,
             num_experts=self.manifest.num_experts,
             specs=self.manifest.layer_specs[layer_id],
+            gpu_slots=self.gpu_slots_per_layer[layer_id],
             prefetcher=self.prefetcher,
         )
 
