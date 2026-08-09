@@ -120,6 +120,12 @@ class ExpertTierOffloadConfig:
     prefetch_popular: int = Field(default=8, ge=0)
     """Top-k popularity experts prefetched per lookahead layer."""
 
+    activation_hist_path: str | None = None
+    """When set, per-layer per-expert routed-activation counts are
+    accumulated over the server's lifetime and dumped to
+    `<path>.rank{r}.json` at shutdown (exact per-token counts; used for
+    routing-skew / expert-pruning analysis)."""
+
     @property
     def predictor_set(self) -> frozenset[str]:
         """Enabled predictor names parsed from `prefetch_predictors`."""

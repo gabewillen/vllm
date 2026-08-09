@@ -313,6 +313,7 @@ class ExpertTierLayerBinding:
         specs: list[ExpertTensorSpec],
         gpu_slots: int,
         prefetcher: ExpertPrefetcher | None = None,
+        activation_hist: dict[int, "np.ndarray"] | None = None,
     ):
         self.cache = cache
         self.layer_id = layer_id
@@ -320,6 +321,7 @@ class ExpertTierLayerBinding:
         self.specs = specs
         self.gpu_slots = gpu_slots
         self.prefetcher = prefetcher
+        self.activation_hist = activation_hist
         # An empty ensure() exposes the layer's stable pool tensors and
         # live slot_of view without any IO or pinning.
         result = cache.ensure(layer_id, [])
@@ -401,6 +403,14 @@ class ExpertTierLayerBinding:
         if topk_ids.device.type != "cpu":
             topk_ids = topk_ids.cpu()
         self.cache.ensure(self.layer_id, topk_ids)
+        if self.activation_hist is not None:
+            flat = topk_ids.reshape(-1).numpy()
+            flat = flat[(flat >= 0) & (flat < self.num_experts)]
+            row = self.activation_hist.get(self.layer_id)
+            if row is None:
+                row = np.zeros(self.num_experts, dtype=np.int64)
+                self.activation_hist[self.layer_id] = row
+            row += np.bincount(flat, minlength=self.num_experts)
         if self.prefetcher is not None:
             self.prefetcher.observe(self.layer_id, topk_ids)
 
@@ -492,6 +502,9 @@ class ExpertTierState:
                 cold=MmapColdBacking(self.manifest.files),
                 io_threads=config.io_threads,
             )
+        self.activation_hist: dict[int, np.ndarray] | None = (
+            {} if config.activation_hist_path else None
+        )
         self.prefetcher: ExpertPrefetcher | None = None
         predictors = config.predictor_set
         if predictors:
@@ -528,6 +541,26 @@ class ExpertTierState:
             )
         except Exception:
             pass
+        self._dump_activation_hist()
+
+    def _dump_activation_hist(self) -> None:
+        if self.activation_hist is None or self.config.activation_hist_path is None:
+            return
+        try:
+            path = f"{self.config.activation_hist_path}.rank{self.rank}.json"
+            payload = {
+                "num_experts": self.manifest.num_experts,
+                "rank": self.rank,
+                "layers": {
+                    str(layer_id): row.tolist()
+                    for layer_id, row in sorted(self.activation_hist.items())
+                },
+            }
+            with open(path, "w") as f:
+                json.dump(payload, f)
+            logger.info("expert-tier activation histogram written to %s", path)
+        except Exception:
+            logger.warning("activation histogram dump failed", exc_info=True)
 
     def bind_layer(self, layer_id: int) -> ExpertTierLayerBinding:
         if layer_id not in self.manifest.layer_specs:
@@ -542,6 +575,7 @@ class ExpertTierState:
             specs=self.manifest.layer_specs[layer_id],
             gpu_slots=self.gpu_slots_per_layer[layer_id],
             prefetcher=self.prefetcher,
+            activation_hist=self.activation_hist,
         )
 
 

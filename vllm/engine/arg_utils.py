@@ -526,6 +526,9 @@ class EngineArgs:
     expert_tier_prefetch_predictors: str = ExpertTierOffloadConfig.prefetch_predictors
     expert_tier_prefetch_lookahead: int = ExpertTierOffloadConfig.prefetch_lookahead
     expert_tier_prefetch_popular: int = ExpertTierOffloadConfig.prefetch_popular
+    expert_tier_activation_hist_path: str | None = (
+        ExpertTierOffloadConfig.activation_hist_path
+    )
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1242,6 +1245,10 @@ class EngineArgs:
         offload_group.add_argument(
             "--expert-tier-prefetch-popular",
             **expert_tier_kwargs["prefetch_popular"],
+        )
+        offload_group.add_argument(
+            "--expert-tier-activation-hist-path",
+            **expert_tier_kwargs["activation_hist_path"],
         )
 
         # Multimodal related configs
@@ -2296,6 +2303,7 @@ class EngineArgs:
                 prefetch_predictors=self.expert_tier_prefetch_predictors,
                 prefetch_lookahead=self.expert_tier_prefetch_lookahead,
                 prefetch_popular=self.expert_tier_prefetch_popular,
+                activation_hist_path=self.expert_tier_activation_hist_path,
             ),
         )
 
