@@ -24,6 +24,12 @@ from collections import OrderedDict
 from collections.abc import Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
 from concurrent.futures import wait as _futures_wait
+
+# Ceiling on any single blocking wait for cold-read futures inside
+# ensure(). A healthy read takes milliseconds; hitting this means the IO
+# pool or cold backing is wedged, and a loud error (which kills the
+# request with diagnostics) beats an engine-wide silent hang.
+_ENSURE_WAIT_TIMEOUT_S = 120.0
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -576,7 +582,18 @@ class ExpertTierCache:
                 if pending:
                     st.lock.release()
                     try:
-                        _futures_wait(pending)
+                        done, not_done = _futures_wait(
+                            pending, timeout=_ENSURE_WAIT_TIMEOUT_S
+                        )
+                        if not_done:
+                            raise RuntimeError(
+                                f"layer {layer_id}: {len(not_done)} cold "
+                                f"expert loads still pending after "
+                                f"{_ENSURE_WAIT_TIMEOUT_S}s (waiting on "
+                                f"{waiting}, {len(st.loading)} loads in "
+                                "flight); IO pool wedged or cold backing "
+                                "stalled"
+                            )
                     finally:
                         st.lock.acquire()
 
@@ -815,7 +832,17 @@ class ExpertTierCache:
                 return None
             st.stats["pinned_stalls"] += 1
             futures = [f for job in st.loading.values() for f in job.futures]
-            _futures_wait(futures, return_when=FIRST_COMPLETED)
+            done, not_done = _futures_wait(
+                futures,
+                timeout=_ENSURE_WAIT_TIMEOUT_S,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done and not_done:
+                raise RuntimeError(
+                    f"layer {st.layer_id}: no pinned slot freed in "
+                    f"{_ENSURE_WAIT_TIMEOUT_S}s ({len(not_done)} loads in "
+                    "flight); IO pool wedged or cold backing stalled"
+                )
             self._sweep_ready(st)
 
     def _try_take_gpu_slot(self, st: _LayerState, protected: set[int]) -> int | None:
