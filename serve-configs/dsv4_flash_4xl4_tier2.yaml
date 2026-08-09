@@ -1,0 +1,27 @@
+# DeepSeek-V4-Flash-0731 on 4x L4 — 256k context bring-up.
+# Serve: HF_HOME=/shared/vllm/huggingface HF_HUB_OFFLINE=1 TORCHDYNAMO_DISABLE=1 \
+#   .venv-omni/bin/vllm serve --config serve-configs/dsv4_flash_4xl4_tier2.yaml
+# vs tier1: max-model-len 262144 (KV ~3.85 KB/token amortized across the
+# window/pooled/indexer layer mix -> ~1 GiB at 256k, fits after shrinking the
+# expert GPU tier 14 -> 13 GiB), max-num-batched-tokens 2048 (larger prefill
+# chunks amortize the per-chunk expert stream; sub-batching splits any chunk
+# whose distinct routed experts exceed the ~95 slots/layer pool).
+model: deepseek-ai/DeepSeek-V4-Flash-0731
+tensor-parallel-size: 4
+block-size: 256
+kv-cache-dtype: fp8
+max-model-len: 262144
+max-num-batched-tokens: 2048
+max-num-seqs: 1
+gpu-memory-utilization: 0.92
+enforce-eager: true
+expert-tier-cache-dir: /shared/vllm/vllm-cache/dsv4-marlin-tp4
+expert-tier-gpu-gb: 13
+expert-tier-pinned-gb: 15
+expert-tier-io-threads: 12
+expert-tier-prefetch-predictors: "hash"
+tokenizer-mode: deepseek_v4
+tool-call-parser: deepseek_v4
+reasoning-parser: deepseek_v4
+trust-remote-code: true
+port: 8010
