@@ -808,6 +808,11 @@ class WorkerProc:
         """Worker initialization and execution loops.
         This runs a background process"""
 
+        if os.environ.get("VLLM_WORKER_DUMP_STACKS_ON_USR1"):
+            import faulthandler
+
+            faulthandler.register(signal.SIGUSR1, all_threads=True)
+
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
         # processes to terminate without error
