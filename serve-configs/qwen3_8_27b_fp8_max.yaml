@@ -34,6 +34,16 @@ enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
 port: 8012
+# Tiered KV offload (native TieringOffloadingSpec): 24 GiB pinned-RAM staging
+# tier + content-addressed fs tier on the NVMe RAID0. Long chats evicted from
+# the ~1.39M-token GPU pool restore from RAM or disk instead of a ~155 s cold
+# prefill; the disk tier persists across service restarts. Requires the local
+# pin_mmap_region patch in .venv-qwen38 (flock-serialized, row-aligned chunked
+# cudaHostRegister) — stock nightly deadlocks startup on large regions and
+# fails cuMemcpyBatchAsync on unaligned chunks. Disk usage under
+# /data/kv-offload/qwen38 is unbounded by config; prune the directory to
+# reclaim space.
+kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
 # --- Not enabled, by measurement or by design ---
 # speculative-config MTP: untested in the throughput loop — at 96-way
 # batching draft overhead almost certainly hurts aggregate tok/s on
