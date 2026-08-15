@@ -1,0 +1,43 @@
+# Qwen3.8-27B-FP8 on 4x L4 23 GiB — max-throughput config, full 262k context.
+#
+# Serve (dedicated venv, vLLM >= 0.27.2 nightly — NOT the repo .venv/.venv-ling):
+#   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 \
+#     /shared/vllm/.venv-qwen38/bin/vllm serve \
+#     --config /shared/vllm/serve-configs/qwen3_8_27b_fp8_max.yaml
+#
+# Result of the 2026-08-15 optimization run (goal run 20260815T021827Z-475a50cd):
+# 474.6 output tok/s aggregate on 128x 1k-in/1k-out (vllm bench serve),
+# mean TPOT 143 ms, 200k-token needle probe passing. History:
+#   TP2 eager seqs4 42.6 -> +graphs 55.4 -> TP2x2 replicas 109.4
+#   -> TP4 seqs16 246.8 -> seqs32 367.7 -> seqs48 419.6 -> seqs64 464.2
+#   -> seqs96 474.6 (kept) -> batch16k 474.1 (reverted; plateau, loop stopped).
+# Nightly pinned because the MTP+GDN spec-decode fix (#51812) and GDN
+# grid-overflow guard (#52030) are not in 0.27.1 (both verified in wheel).
+model: Qwen/Qwen3.8-27B-FP8
+# TP4 (not TP2x2 replicas): per-rank weights 7.4 GiB and halved GDN state
+# unlock 96-way decode batching, which dominates PCIe all-reduce cost on
+# this dense hybrid (48 GDN linear + 16 full-attn layers).
+tensor-parallel-size: 4
+# Full native context; a 262144-token request needs ~2.1 GiB/rank KV (fp8)
+# against an ~11 GiB pool (5.3x full-length concurrency at seqs96).
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.95
+# Concurrency saturates ~seqs96 on L4 (seqs64->96 was +2.2%); GDN fp32
+# recurrent state per seq is the cost that scales here, not KV.
+max-num-seqs: 96
+# 16384 measured -0.1%: not worth it. Keep the 8192 chunk.
+max-num-batched-tokens: 8192
+compilation-config: '{"max_cudagraph_capture_size": 96}'
+reasoning-parser: qwen3
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+port: 8012
+# --- Not enabled, by measurement or by design ---
+# speculative-config MTP: untested in the throughput loop — at 96-way
+# batching draft overhead almost certainly hurts aggregate tok/s on
+# compute-weak L4s; revisit as a LATENCY config (low concurrency) where the
+# same head gives ~1.85-2x per-stream in the llama.cpp precedent.
+# Sampling per model card: thinking T=1.0/top_p 0.95/top_k 20;
+# instruct T=0.7/top_p 0.80/presence 1.5 (client-side).
