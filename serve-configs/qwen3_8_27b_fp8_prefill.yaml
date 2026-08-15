@@ -1,0 +1,44 @@
+# Qwen3.8-27B-FP8 on 4x L4 — PREFILL-optimized profile (TP1 x PP4).
+#
+# Serve (same venv as qwen3_8_27b_fp8_max.yaml):
+#   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 \
+#     /shared/vllm/.venv-qwen38/bin/vllm serve \
+#     --config /shared/vllm/serve-configs/qwen3_8_27b_fp8_prefill.yaml
+#
+# Result of the 2026-08-15 prefill goal run (20260815T202705Z-097700e2):
+# profiling showed prefill on this box is PCIe-communication-bound — NCCL
+# all-reduce was 65.8% of GPU time on every rank at TP4. Pipeline parallelism
+# eliminates the all-reduce entirely (3x ~42 MB point-to-point hops per 4096-token chunk
+# instead of one ring all-reduce per layer), and 4096-token chunks keep the
+# 4-stage pipeline full:
+#   32k prompt: 20.1 s -> 10.4 s (-48.3%, ~3080 tok/s prefill)
+#   200k prompt: 155 s -> 90.4 s (-41.7%, ~2210 tok/s prefill)
+# THE TRADEOFF: decode throughput halves vs the TP4 profile
+# (233 tok/s / TPOT 295 ms vs 474.6 tok/s / 143 ms on 128x 1k/1k).
+# Use this profile when cold long-prompt latency dominates (batch document
+# ingestion, first-pass summarization); use qwen3_8_27b_fp8_max.yaml (TP4)
+# for interactive/decode-heavy serving. Measured levers that did NOT help:
+# L4-tuned Triton block-FP8 configs (-5%) and 16k chunks (bubbles);
+# enable_sp is UNTESTABLE here (vLLM's SP threshold heuristic silently
+# disables it for this hidden_size; force via pass_config.sp_min_token_num
+# if ever revisited). 32k probes carry ~15% restart-to-restart noise;
+# the speedups above dwarf it (worst-case floor -40.4% at 32k).
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 1
+pipeline-parallel-size: 4
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.95
+max-num-seqs: 96
+# 4096-token chunks: at PP4 the microbatch count is what hides the pipeline
+# bubble (32k/4096 = 8 microbatches -> ~27% bubble vs 43% at 8192).
+max-num-batched-tokens: 4096
+compilation-config: '{"max_cudagraph_capture_size": 96}'
+reasoning-parser: qwen3
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+port: 8012
+# Tiered KV offload deliberately omitted: the offload connector has a known
+# open issue with PP block accounting (vllm-project/vllm#50653); revisit
+# after upstream fix if this profile becomes the default.
