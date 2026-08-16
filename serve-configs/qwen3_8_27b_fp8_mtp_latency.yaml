@@ -1,0 +1,39 @@
+# Qwen3.8-27B-FP8 on 4x L4 — LATENCY profile: MTP speculative decoding.
+#
+# Serve (same venv as qwen3_8_27b_fp8_max.yaml):
+#   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 \
+#     /shared/vllm/.venv-qwen38/bin/vllm serve \
+#     --config /shared/vllm/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml
+#
+# Measured 2026-08-16: the FP8 checkpoint ships a 1-layer MTP draft head;
+# with K=2 speculation, single-stream decode goes 26.7 -> 39.4 tok/s prose
+# (+47%) and 49.8 tok/s code (+87%); acceptance 81%/59% at draft pos 0/1
+# (~2.4 tokens per engine step). Warm TTFT unchanged.
+#
+# The num_speculative_tokens_per_batch_size schedule adapts K to live batch
+# size (K=2 <=8 seqs, K=1 to 32, off above). Verified working: draft counters
+# freeze at high batch. BUT the spec-decode machinery has a fixed cost even
+# at K=0: 128x1k/1k aggregate measured 310 tok/s vs 476.7 on the TP4 default
+# (-35%), so this profile is for LOW-CONCURRENCY use, not a free lunch.
+#
+# Tiered KV offload OMITTED — incompatible with MTP in this nightly: the
+# offloading connector classifies all 4 KV-cache groups as EAGLE/MTP-volatile,
+# and its restore lookup never converges (verified: fs tier hits 31/31 blocks,
+# promotes 1.7 GB off disk, then the request full-recomputes anyway; same on
+# the eviction path via /reset_prefix_cache). Stores/hashes are fine and
+# deterministic; only restore consumption is broken. Correctness unaffected.
+# Long-context resume on THIS profile pays full re-prefill (~20 s per 32k).
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 4
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.95
+max-num-seqs: 96
+max-num-batched-tokens: 8192
+compilation-config: '{"max_cudagraph_capture_size": 96}'
+speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 2, "num_speculative_tokens_per_batch_size": [[1, 8, 2], [9, 32, 1], [33, 96, 0]]}'
+reasoning-parser: qwen3
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+port: 8012
