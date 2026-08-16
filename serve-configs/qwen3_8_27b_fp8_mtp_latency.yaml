@@ -1,28 +1,35 @@
-# Qwen3.8-27B-FP8 on 4x L4 — LATENCY profile: MTP speculative decoding.
+# Qwen3.8-27B-FP8 on 4x L4 — MTP speculative-decoding profile (latency-first,
+# but batch-safe): +47-87% single-stream decode, -11% aggregate at max batch.
 #
 # Serve (same venv as qwen3_8_27b_fp8_max.yaml):
-#   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 \
+#   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 PYTHONHASHSEED=8012 \
 #     /shared/vllm/.venv-qwen38/bin/vllm serve \
 #     --config /shared/vllm/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml
 #
-# Measured 2026-08-16: the FP8 checkpoint ships a 1-layer MTP draft head;
-# with K=2 speculation, single-stream decode goes 26.7 -> 39.4 tok/s prose
-# (+47%) and 49.8 tok/s code (+87%); acceptance 81%/59% at draft pos 0/1
-# (~2.4 tokens per engine step). Warm TTFT unchanged.
+# Measured 2026-08-16 (128x1k/1k aggregate; single-stream 512-tok greedy):
+#   single-stream: 26.7 -> 39.4 tok/s prose (+47%), 49.8 code (+87%);
+#     draft acceptance 81%/59% at pos 0/1 (~2.4 tok/engine step)
+#   aggregate: 476.7 tok/s (TP4 no-MTP control) -> 424.7 (-11%)
+# How the aggregate cost got from -35% to -11%: profiling showed the 1-layer
+# draft head at TP4 added ~4k extra NCCL all-reduces (~10.7 ms each on PCIe)
+# per prefill window. draft_tensor_parallel_size=1 runs the head unsharded on
+# every rank (no draft all-reduce); use_local_argmax_reduction drops the
+# vocab all-gather. The remaining -11% is the draft prefill forward, which
+# vLLM deliberately runs even at K=0 to keep the draft KV in sync — a design
+# floor, not a bug.
+# num_speculative_tokens_per_batch_size adapts K to live batch size (K=2 up
+# to 8 seqs, K=1 to 32, off above); verified: draft counters freeze at high
+# batch, so heavy batches pay only the K=0 floor above.
 #
-# The num_speculative_tokens_per_batch_size schedule adapts K to live batch
-# size (K=2 <=8 seqs, K=1 to 32, off above). Verified working: draft counters
-# freeze at high batch. BUT the spec-decode machinery has a fixed cost even
-# at K=0: 128x1k/1k aggregate measured 310 tok/s vs 476.7 on the TP4 default
-# (-35%), so this profile is for LOW-CONCURRENCY use, not a free lunch.
-#
-# Tiered KV offload OMITTED — incompatible with MTP in this nightly: the
-# offloading connector classifies all 4 KV-cache groups as EAGLE/MTP-volatile,
-# and its restore lookup never converges (verified: fs tier hits 31/31 blocks,
-# promotes 1.7 GB off disk, then the request full-recomputes anyway; same on
-# the eviction path via /reset_prefix_cache). Stores/hashes are fine and
-# deterministic; only restore consumption is broken. Correctness unaffected.
-# Long-context resume on THIS profile pays full re-prefill (~20 s per 32k).
+# Tiered KV offload ENABLED — requires the venv-local patch
+# artifacts/offload-debug/mtp-eagle-group-detection.patch (offloading
+# connector scheduler.py): stock nightly marks ALL KV groups EAGLE-volatile
+# when MTP is on (no group carries is_eagle_group), so restore lookups never
+# converge and every resume full-recomputes. Patch detects the draft tower by
+# its "mtp" layer prefix (group [3] only). Verified on this config: 32k resume
+# after eviction 20.6 s -> 2.1 s, after service restart (disk tier) -> 3.1 s,
+# output byte-identical to cold. A venv rebuild loses this AND the two
+# pin_mmap_region patches (see qwen3_8_27b_fp8_max.yaml).
 model: Qwen/Qwen3.8-27B-FP8
 tensor-parallel-size: 4
 max-model-len: 262144
@@ -31,7 +38,8 @@ gpu-memory-utilization: 0.95
 max-num-seqs: 96
 max-num-batched-tokens: 8192
 compilation-config: '{"max_cudagraph_capture_size": 96}'
-speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 2, "num_speculative_tokens_per_batch_size": [[1, 8, 2], [9, 32, 1], [33, 96, 0]]}'
+speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 2, "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "num_speculative_tokens_per_batch_size": [[1, 8, 2], [9, 32, 1], [33, 96, 0]]}'
+kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
 reasoning-parser: qwen3
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
