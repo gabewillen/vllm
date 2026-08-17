@@ -1,0 +1,12 @@
+tunnel: 2684162e-f788-43d7-baed-5566ff7b411d
+credentials-file: <redacted>
+
+ingress:
+  - hostname: vllm.willen.dev
+    service: http://localhost:8012
+    originRequest:
+      # Long-context prefill can exceed default 30s origin timeout.
+      connectTimeout: 30s
+      # Disable buffering-unfriendly timeouts for streaming completions.
+      noTLSVerify: false
+  - service: http_status:404
