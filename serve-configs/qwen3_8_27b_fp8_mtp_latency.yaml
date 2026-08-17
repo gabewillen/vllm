@@ -30,6 +30,14 @@
 # after eviction 20.6 s -> 2.1 s, after service restart (disk tier) -> 3.1 s,
 # output byte-identical to cold. A venv rebuild loses this AND the two
 # pin_mmap_region patches (see qwen3_8_27b_fp8_max.yaml).
+#
+# Keep-alive middleware (serve-configs/middleware/vllm_keepalive.py, needs that
+# dir on PYTHONPATH): Cloudflare returns 524 when the origin sends no response
+# BYTES for 100 s, streaming or not (verified through the tunnel: 524 at 125 s
+# on a streaming request with a 130 s TTFT). A ~200k-token uncached prompt
+# takes 130-150 s to prefill on 4x L4, so agent compaction calls died at the
+# edge and were retried in loops. The middleware emits SSE comments / JSON
+# leading whitespace while the engine works; every client parser ignores them.
 model: Qwen/Qwen3.8-27B-FP8
 tensor-parallel-size: 4
 max-model-len: 262144
@@ -45,3 +53,4 @@ enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
 port: 8012
+middleware: ["vllm_keepalive.KeepAliveMiddleware"]
