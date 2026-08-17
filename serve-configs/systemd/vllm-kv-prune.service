@@ -1,0 +1,9 @@
+[Unit]
+Description=Prune vLLM KV offload disk tier (24h rolling TTL from last access)
+
+[Service]
+Type=oneshot
+User=gwillen
+ExecStart=/usr/local/bin/vllm-kv-prune /data/kv-offload/qwen38 24
+Nice=10
+IOSchedulingClass=idle
