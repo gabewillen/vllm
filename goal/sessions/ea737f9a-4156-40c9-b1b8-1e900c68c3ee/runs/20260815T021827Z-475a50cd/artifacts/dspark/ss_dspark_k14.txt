@@ -1,0 +1,3 @@
+prose      ttft= 0.34s  decode=  22.3 tok/s  (768 tok)  accept= 6.2%  tok/pass=1.86
+code-write ttft= 0.11s  decode=  45.9 tok/s  (768 tok)  accept=18.5%  tok/pass=3.59
+code-edit  ttft= 1.31s  decode=  86.8 tok/s  (768 tok)  accept=42.0%  tok/pass=6.88

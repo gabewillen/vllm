@@ -1,0 +1,40 @@
+# Qwen3.8-27B-FP8 on 4x L4 — DSpark speculative-decoding profile (OPT-IN,
+# code-agent single-stream first). Measured 2026-08-17 vs the MTP production
+# profile (qwen3_8_27b_fp8_mtp_latency.yaml), 768-token greedy generations:
+#   code-edit  55 -> 93-110 tok/s (7.1 tok/pass, 87% acceptance)
+#   code-write 48-52 -> 63          reasoning 45.7 -> 46.4 (tie)
+#   prose      39-42 -> 27-28       (drafter accepts only ~11% on prose)
+#   KV pool    1.39M -> 652k tokens (2.5x 262k ctx)   aggregate 425 -> 187
+# Why the capacity loss: drafter weights ~1.1 GiB/rank (embeddings shared),
+# its own 5-layer KV in the pool (+~5.6 KB/token, 25% padding waste), and
+# gpu-memory-utilization must drop to 0.88 — vLLM's memory profile misses the
+# drafter's runtime peak; 0.92 OOMs under a 128-request burst even with 4096
+# batched tokens. k=14 was slower on L4 everywhere (verify cost);
+# enable_adaptive_verification is rejected by the GDN attention backend;
+# dspark_draft_topk changed nothing; draft TP1 vs TP4 identical.
+# Drafter: RadixArk/Qwen3.8-27B-DSpark (bf16). Two local fix-ups needed:
+#  1. the checkpoint declares architectures ["DSparkDraftModel"], which vLLM
+#     maps to the DeepSeek-V4 class -> local copy at
+#     /data/huggingface/local/Qwen3.8-27B-DSpark with "Qwen3DSparkModel"
+#     (weights symlinked to the HF cache blob).
+#  2. quantizing the drafter ("quantization":"fp8") is NOT possible: the
+#     DFlash precompute path reads raw qkv_proj.weight and breaks on the
+#     Marlin-repacked fp8 layout (patch 0004 only fixes the earlier crash).
+# Serve on the prod port by swapping the unit's --config; keep the keepalive
+# middleware and PYTHONHASHSEED (fs tier root is separate below).
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 4
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.88
+max-num-seqs: 96
+max-num-batched-tokens: 8192
+compilation-config: '{"max_cudagraph_capture_size": 96}'
+speculative-config: '{"method": "dspark", "model": "/data/huggingface/local/Qwen3.8-27B-DSpark", "num_speculative_tokens": 7, "draft_tensor_parallel_size": 4, "draft_sample_method": "probabilistic", "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 3], [33, 96, 0]]}'
+kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38-dspark"}]}}'
+reasoning-parser: qwen3
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+port: 8012
+middleware: ["vllm_keepalive.KeepAliveMiddleware"]
