@@ -24,6 +24,7 @@ Environment=HOME=/home/gwillen
 # Fixed hash seed: block hashes (and thus fs-tier filenames) must be stable
 # across restarts or the disk tier can never hit after a service restart.
 Environment=PYTHONHASHSEED=8012
+Environment=PYTHONPATH=/shared/vllm/serve-configs/middleware
 
 [Install]
 WantedBy=multi-user.target
