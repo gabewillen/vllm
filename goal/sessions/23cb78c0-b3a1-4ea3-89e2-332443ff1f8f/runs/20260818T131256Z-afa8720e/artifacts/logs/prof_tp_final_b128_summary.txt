@@ -1,0 +1,34 @@
+gpu window ms 31269.179373046874 kernels 377221
+ 10344.0 ms  31.4%  n= 66816  elementwise/other:_w8a8_triton_block_scaled_mm
+  9914.8 ms  30.1%  n= 33926  nccl
+  9460.5 ms  28.7%  n= 30096  gdn/fla
+   829.0 ms   2.5%  n= 12786  cutlass/gemm
+   330.2 ms   1.0%  n= 50112  elementwise/other:void per_token_group_quant_8bit_kernel<c10::BFloat
+   308.6 ms   0.9%  n= 38389  elementwise/other:void at::native::elementwise_kernel<128, 4, at::na
+   290.3 ms   0.9%  n=  4176  attention
+   265.6 ms   0.8%  n= 16704  elementwise/other:void vllm::silu_and_mul_per_block_quant_kernel<c10
+   211.3 ms   0.6%  n=  2767  elementwise/other:void at::native::unrolled_elementwise_kernel<at::n
+   208.1 ms   0.6%  n= 20880  elementwise/other:triton_red_fused__to_copy_add_fused_add_rms_norm_p
+   174.8 ms   0.5%  n= 12691  argmax/topk/softmax
+   102.6 ms   0.3%  n=  8352  elementwise/other:triton_red_fused__to_copy_add_fused_add_rms_norm_1
+    65.5 ms   0.2%  n= 12528  elementwise/other:layer_norm_fwd_kernel
+    51.1 ms   0.2%  n=  4176  elementwise/other:triton_red_fused__to_copy_add_fused_add_rms_norm_2
+    43.6 ms   0.1%  n=   709  elementwise/other:void at::native::vectorized_gather_kernel<16, long
+    35.4 ms   0.1%  n=   647  elementwise/other:void at::native::index_elementwise_kernel<128, 4, 
+    34.4 ms   0.1%  n=   144  elementwise/other:fused_sigmoid_gating_delta_rule_update_kernel
+    31.7 ms   0.1%  n=  7120  memcpy/memset
+    30.8 ms   0.1%  n=  4080  elementwise/other:reduce_segments
+    26.4 ms   0.1%  n=   288  elementwise/other:merge_16x16_to_64x64_inverse_kernel
+    23.0 ms   0.1%  n=  1084  elementwise/other:void at::native::elementwise_kernel<128, 2, at::na
+window 31269.2 ms, idle 176.1 ms (0.6%), gaps 328661
+  <20us     170.1 ms
+  <50us       1.9 ms
+  <100us      1.1 ms
+  <300us      2.2 ms
+  <1ms        0.8 ms
+  >=1ms       0.0 ms
+kernels after gaps>=50us (count, total gap ms):
+      1.4 ms n=    8 Memcpy HtoD (Pinned -> Device)
+      0.6 ms n=    4 void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc
+      0.4 ms n=    1 triton_poi_fused_add_bitwise_and_bitwise_not_bitwise_or_ge_lt_mul_sub_
+      0.3 ms n=    3 void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc

@@ -1,0 +1,4 @@
+{"event":"goal_started","ts":"2026-08-15T02:19:04Z","goal_mdscript":"goal/sessions/ea737f9a-4156-40c9-b1b8-1e900c68c3ee/runs/20260815T021827Z-475a50cd/goal.mdscript.md","loop_driver":"self-hooks","skip_hooks":false}
+{"event":"goal_completed","ts":"2026-08-15T06:07:33Z","run_id":"20260815T021827Z-475a50cd","verdict":"Proven for","best_tok_s":474.61}
+{"event":"goal_started","ts":"2026-08-15T20:27:40Z","goal_mdscript":"/shared/vllm/goal/sessions/ea737f9a-4156-40c9-b1b8-1e900c68c3ee/runs/20260815T202705Z-097700e2/goal.mdscript.md","loop_driver":"harness-goal"}
+{"event":"goal_completed","ts":"2026-08-15T22:32:00Z","run_id":"20260815T202705Z-097700e2","verdict":"Proven for"}

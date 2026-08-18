@@ -1,0 +1,8 @@
+PROBE_START
+PROBE_EXIT=0
+BENCH_START
+BENCH_EXIT=0
+Benchmark duration (s):                  356.49    
+Output token throughput (tok/s):         367.67    
+Mean TPOT (ms):                          79.21     
+MEASURE_DONE

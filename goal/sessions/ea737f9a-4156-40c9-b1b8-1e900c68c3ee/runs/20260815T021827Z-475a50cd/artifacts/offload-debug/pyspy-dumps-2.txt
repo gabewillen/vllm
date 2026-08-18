@@ -1,0 +1,57 @@
+=== PID 2504175 ===
+Process 2504175: VLLM::Worker_TP1
+Python v3.12.3 (/usr/bin/python3.12)
+
+Thread 2504175 (idle): "MainThread"
+    poll (zmq/sugar/poll.py:106)
+    wait (vllm/distributed/device_communicators/shm_broadcast.py:206)
+    acquire_read (vllm/distributed/device_communicators/shm_broadcast.py:794)
+    __enter__ (contextlib.py:137)
+    dequeue (vllm/distributed/device_communicators/shm_broadcast.py:889)
+    worker_busy_loop (vllm/v1/executor/multiproc_executor.py:1016)
+    worker_main (vllm/v1/executor/multiproc_executor.py:918)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+Thread 2505102 (idle): "tqdm_monitor"
+    wait (threading.py:359)
+=== PID 2504176 ===
+Process 2504176: VLLM::Worker_TP2
+Python v3.12.3 (/usr/bin/python3.12)
+
+Thread 2504176 (idle): "MainThread"
+    poll (zmq/sugar/poll.py:106)
+    wait (vllm/distributed/device_communicators/shm_broadcast.py:206)
+    acquire_read (vllm/distributed/device_communicators/shm_broadcast.py:794)
+    __enter__ (contextlib.py:137)
+    dequeue (vllm/distributed/device_communicators/shm_broadcast.py:889)
+    worker_busy_loop (vllm/v1/executor/multiproc_executor.py:1016)
+    worker_main (vllm/v1/executor/multiproc_executor.py:918)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+Thread 2505114 (idle): "tqdm_monitor"
+    wait (threading.py:359)
+=== PID 2504177 ===
+Process 2504177: VLLM::Worker_TP3
+Python v3.12.3 (/usr/bin/python3.12)
+
+Thread 2504177 (idle): "MainThread"
+    poll (zmq/sugar/poll.py:106)
+    wait (vllm/distributed/device_communicators/shm_broadcast.py:206)
+    acquire_read (vllm/distributed/device_communicators/shm_broadcast.py:794)
+    __enter__ (contextlib.py:137)
+    dequeue (vllm/distributed/device_communicators/shm_broadcast.py:889)
+    worker_busy_loop (vllm/v1/executor/multiproc_executor.py:1016)
+    worker_main (vllm/v1/executor/multiproc_executor.py:918)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+Thread 2505115 (idle): "tqdm_monitor"
+    wait (threading.py:359)

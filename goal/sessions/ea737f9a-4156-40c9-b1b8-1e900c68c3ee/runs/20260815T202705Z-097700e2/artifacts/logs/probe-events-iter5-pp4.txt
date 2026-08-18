@@ -1,0 +1,5 @@
+PP4 UP
+PP4_32K_a: latency: 13.4s
+PP4_32K_b: latency: 13.5s
+PP4_200K: latency: 95.2s retrieved: True 
+PP4_DONE
