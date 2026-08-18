@@ -37,8 +37,14 @@ def test_split_request_keeps_full_state_seq_len():
     assert first.state_seq_lens.tolist() == [400]
     assert second.state_seq_lens.tolist() == [400, 120]
     # the continuation has computed the first slice's tokens
-    assert second.num_computed_tokens_cpu.tolist() == [300, 20]
     assert second.compute_num_computed_tokens().tolist() == [300, 20]
+    assert second._num_computed_tokens_cpu.tolist() == [300, 20]
+
+
+def test_unpadded_keeps_state_seq_lens():
+    md = _metadata()
+    md.mamba_state_seq_lens = torch.tensor([400, 120], dtype=torch.int32)
+    assert md.unpadded(300, 1).mamba_state_seq_lens.tolist() == [400]
 
 
 def test_state_seq_lens_defaults_to_seq_lens():

@@ -23,8 +23,11 @@ def test_adaptive_requires_at_least_two_tokens():
 
 def test_adaptive_min_tokens_bounded_by_k():
     with pytest.raises(ValueError, match="must not exceed"):
-        _cfg(num_speculative_tokens=4, adaptive_draft_length=True,
-             adaptive_draft_min_tokens=5)
+        _cfg(
+            num_speculative_tokens=4,
+            adaptive_draft_length=True,
+            adaptive_draft_min_tokens=5,
+        )
 
 
 def test_adaptive_defaults_accept():
@@ -58,8 +61,10 @@ def test_adaptive_num_spec_tokens(emas, expected):
 
 
 def test_adaptive_num_spec_tokens_respects_min():
-    assert adaptive_num_spec_tokens(emas=[0.0], max_tokens=7, min_tokens=3,
-                                    margin=0.0) == 3
+    assert (
+        adaptive_num_spec_tokens(emas=[0.0], max_tokens=7, min_tokens=3, margin=0.0)
+        == 3
+    )
 
 
 def test_update_accepted_ema_seeds_then_smooths():
@@ -69,8 +74,11 @@ def test_update_accepted_ema_seeds_then_smooths():
 
 
 def test_capture_lengths_follow_schedule_and_adaptive_ranges():
-    cfg = _cfg(num_speculative_tokens=7, adaptive_draft_length=True,
-               num_speculative_tokens_per_batch_size=SCHEDULE)
+    cfg = _cfg(
+        num_speculative_tokens=7,
+        adaptive_draft_length=True,
+        num_speculative_tokens_per_batch_size=SCHEDULE,
+    )
     lens, ranged = decode_query_lens_for_spec(
         speculative_config=cfg, decode_query_len=8, max_num_reqs=96
     )
@@ -79,21 +87,33 @@ def test_capture_lengths_follow_schedule_and_adaptive_ranges():
     schedule_lens = set(lens) - {q for _, _, qs in ranged for q in qs}
     assert schedule_lens == {1}
     # adaptive length only for batch sizes inside its range
-    assert decode_query_len_allowed(query_len=5, num_reqs=4,
-                                    schedule_query_lens=schedule_lens,
-                                    ranged_query_lens=ranged)
-    assert not decode_query_len_allowed(query_len=5, num_reqs=12,
-                                        schedule_query_lens=schedule_lens,
-                                        ranged_query_lens=ranged)
+    assert decode_query_len_allowed(
+        query_len=5,
+        num_reqs=4,
+        schedule_query_lens=schedule_lens,
+        ranged_query_lens=ranged,
+    )
+    assert not decode_query_len_allowed(
+        query_len=5,
+        num_reqs=12,
+        schedule_query_lens=schedule_lens,
+        ranged_query_lens=ranged,
+    )
     # schedule-derived length stays unrestricted
-    assert decode_query_len_allowed(query_len=1, num_reqs=90,
-                                    schedule_query_lens=schedule_lens,
-                                    ranged_query_lens=ranged)
+    assert decode_query_len_allowed(
+        query_len=1,
+        num_reqs=90,
+        schedule_query_lens=schedule_lens,
+        ranged_query_lens=ranged,
+    )
 
 
 def test_capture_lengths_draft_decode_manager_is_untouched():
-    cfg = _cfg(num_speculative_tokens=7, adaptive_draft_length=True,
-               num_speculative_tokens_per_batch_size=SCHEDULE)
+    cfg = _cfg(
+        num_speculative_tokens=7,
+        adaptive_draft_length=True,
+        num_speculative_tokens_per_batch_size=SCHEDULE,
+    )
     assert decode_query_lens_for_spec(
         speculative_config=cfg, decode_query_len=1, max_num_reqs=96
     ) == ([1], [])
