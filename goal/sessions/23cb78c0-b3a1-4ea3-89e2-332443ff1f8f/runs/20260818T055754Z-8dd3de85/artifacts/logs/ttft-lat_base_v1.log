@@ -1,0 +1,2 @@
+[lat_base_v1 37k seed61] prompt_tokens=37377 ttft=17.53s prefill_tok_s=2132
+[lat_base_v1 90k seed62] prompt_tokens=93594 ttft=56.95s prefill_tok_s=1643

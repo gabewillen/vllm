@@ -1,0 +1,8 @@
+reason     ttft= 0.70s  decode=  51.4 tok/s  (768 tok)  accept=50.7%  tok/pass=2.61
+prose      ttft= 0.08s  decode=  50.1 tok/s  (768 tok)  accept=48.6%  tok/pass=2.45
+code-write ttft= 0.11s  decode=  78.0 tok/s  (768 tok)  accept=69.2%  tok/pass=4.29
+code-edit  ttft= 0.84s  decode= 125.9 tok/s  (768 tok)  accept=97.8%  tok/pass=7.85
+reason     ttft= 0.11s  decode=  52.4 tok/s  (768 tok)  accept=50.7%  tok/pass=2.61
+prose      ttft= 0.08s  decode=  50.1 tok/s  (768 tok)  accept=48.6%  tok/pass=2.45
+code-write ttft= 0.11s  decode=  77.9 tok/s  (768 tok)  accept=69.2%  tok/pass=4.29
+code-edit  ttft= 0.84s  decode= 125.8 tok/s  (768 tok)  accept=97.8%  tok/pass=7.85

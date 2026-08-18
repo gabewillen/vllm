@@ -1,0 +1,82 @@
+{
+ "reason-math": {
+  "content": null,
+  "reasoning": "We need answer user: train problem and generalization. Need solve carefully. Let's analyze.\n\nProblem: Train leaves city A at 9:00 going 80 km/h; another leaves city B (300 km away) at 9:30 going 100 km/h toward A. When and where do they meet? Then generalize to symbolic speeds v1, v2, gap D, delay t.\n\nWe need likely assume they",
+  "usage": {
+   "prompt_tokens": 121,
+   "total_tokens": 217,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "reason-sys": {
+  "content": null,
+  "reasoning": "We need answer user: \"A ZFS pool on 2 NVMe drives shows 12 GiB ARC but the box has 120 GB RAM; explain what limits ARC, whether raising it helps a KV-cache file store of 55 MB files, and give a recommendation.\"\n\nNeed produce final. Need think through ZFS ARC limits. Need likely context: ZFS ARC default max? On Linux OpenZFS? ARC size controlled by zfs_arc",
+  "usage": {
+   "prompt_tokens": 106,
+   "total_tokens": 202,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "prose-essay": {
+  "content": "# The Box That Changed the World: A History of Container Shipping\n\nBefore the mid-20th century, global trade was a slow, labor-intensive, and often chaotic affair. Ships were loaded with individual items\u2014bales of cotton, barrels of oil, crates of fruit, and sacks of grain\u2014stacked haphazardly by stevedores (dockworkers) who worked by hand. This method, known as \"breakbulk\" shipping, was inefficient, prone",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 23,
+   "total_tokens": 119,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "prose-story": {
+  "content": "The fog in the North Atlantic didn\u2019t just obscure the world; it swallowed it. For Elias Thorne, the keeper of the Blackrock Lighthouse, the silence was a physical weight, pressing against the glass of the lantern room. He had spent thirty years in that tower, polishing brass, winding the clockwork, and watching the beam sweep across the churning black water. He knew the rhythm of the light better than his own heartbeat: *flash, flash, pause.*",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 32,
+   "total_tokens": 128,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "code-write": {
+  "content": "```python\n\"\"\"\nLRU Cache with TTL Expiry, Thread Safety, and Statistics.\n\nThis module provides a thread-safe LRU (Least Recently Used) cache that supports\ntime-to-live (TTL) expiry for individual entries. It also tracks basic statistics\nsuch as hits, misses, and evictions.\n\"\"\"\n\nimport threading\nimport time\nfrom collections import OrderedDict\nfrom typing import Any, Optional, Tuple\n\n\nclass LRUCache:\n    \"\"\"",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 40,
+   "total_tokens": 136,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "code-edit": {
+  "content": "```python\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\"\"\"\nAsyncLookupManager: per-tier async lookup manager for secondary tier\nexistence checks.\n\nEach secondary tier that wants non-blocking lookups composes its own\nAsyncLookupManager instance internally.  The manager maintains lookup\nstate and uses a background thread to execute batch_lookup() calls.\n\nLocking design\n--------------\nThere",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 2200,
+   "total_tokens": 2296,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "code-explain": {
+  "content": "### Function-by-Function Explanation\n\nThis code implements **U-Batching** (Uniform Batching) logic for the vLLM inference engine. U-Batching is a technique used to split a large batch of requests into smaller, uniform sub-batches (ubatches) to improve hardware utilization, particularly when mixing prefill and decode phases or when dealing with variable sequence lengths.\n\nHere is the breakdown of each function:\n\n1.  **`UBatchSlice` (Data",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 1545,
+   "total_tokens": 1641,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "json-extract": {
+  "content": "```json\n[\n  {\n    \"name\": \"Widget Pro\",\n    \"price\": 19.99,\n    \"qty\": 3\n  },\n  {\n    \"name\": \"Gizmo Mini\",\n    \"price\": 4.50,\n    \"qty\": 12\n  },\n  {\n    \"name\": \"Deluxe Stand\",\n    \"price\": 89.",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 102,
+   "total_tokens": 198,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ }
+}

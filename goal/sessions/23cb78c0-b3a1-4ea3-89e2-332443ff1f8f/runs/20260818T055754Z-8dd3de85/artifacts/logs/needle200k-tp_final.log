@@ -1,0 +1,4 @@
+prompt tokens: 199628
+latency: 158.0s  usage: {'prompt_tokens': 199628, 'total_tokens': 199636, 'completion_tokens': 8, 'prompt_tokens_details': None}
+completion: '\n\n736251'
+needle retrieved: True
