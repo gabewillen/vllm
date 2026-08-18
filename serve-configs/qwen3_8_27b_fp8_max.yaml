@@ -14,6 +14,15 @@
 #     memory-bound decode batch doubles the weight reads.
 #   attention-backend TRITON_ATTN: same speed as FlashInfer here and no
 #     workspace reservation, so a larger KV pool.
+#   mamba-ssm-cache-dtype float16: the checkpoint asks for a float32 GDN
+#     recurrent state; at 128 concurrent that state's read+write (786 KB per
+#     seq per layer, 48 layers) is ~9.7 GB per step - a third of the step, at
+#     HBM bandwidth. float16 halves it (also halves the mamba page, so the
+#     attention block shrinks 1568 -> 800 tokens: finer prefix caching, +2%
+#     KV pool). Checked: per-token logprob agreement with the fp32 config at
+#     vLLM's config-to-config noise floor (mean |dlogprob| 0.077, top-1 3.2%),
+#     250k needle retrieved, 2k-token generation coherent. bfloat16 (7-bit
+#     mantissa) is NOT acceptable: it garbles the 200k needle answer.
 # Serve (dedicated venv, vLLM >= 0.27.2 nightly — NOT the repo .venv/.venv-ling):
 #   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 \
 #     /shared/vllm/.venv-qwen38/bin/vllm serve \
@@ -42,6 +51,7 @@ gpu-memory-utilization: 0.95
 max-num-seqs: 128
 # 16384 measured -0.1%: not worth it. Keep the 8192 chunk.
 max-num-batched-tokens: 8192
+mamba-ssm-cache-dtype: float16
 compilation-config: '{"max_cudagraph_capture_size": 128}'
 attention-backend: TRITON_ATTN
 enable-dbo: true
