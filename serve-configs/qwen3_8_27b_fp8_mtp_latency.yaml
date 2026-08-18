@@ -79,6 +79,15 @@
 # a fused multi-step draft graph. The eager GDN op otherwise costs ~0.6 ms CPU
 # per call (48/step) and desyncs the TP ranks. V2's graphs take ~1.6 GiB, so
 # gpu-memory-utilization is 0.92 (0.94 OOMs on a 200k prefill).
+#   additional-config lm_head_dtype fp8 (venv patch 0008): the target verifies
+#     with a per-channel fp8 copy of its lm_head (CUTLASS W8A8, dynamic
+#     per-token activation scale). Per-token logprob agreement with the bf16
+#     head: mean |dlogprob| 0.035, top-1 2.5% - below the kernel-path noise
+#     floor (0.076 / 3.2%) - for -1 ms per verify step. int4 is not used for
+#     the target.
+#   in_proj_ba skinny GEMM (venv patch 0007): cuBLAS spends 27 us per layer on
+#     the bf16 [8 x 5120] x [5120 x 24] gate projection at decode; a split-K
+#     Triton kernel takes 5.5 us (48 layers -> -1 ms/step).
 # Observability: draft length is visible as spec_decode_num_draft_tokens_total
 # / spec_decode_num_drafts_total (mean K) and the per-position acceptance
 # counters vLLM already exports.
@@ -99,5 +108,6 @@ enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
 attention-backend: TRITON_ATTN
+additional-config: '{"lm_head_dtype": "fp8"}'
 port: 8012
 middleware: ["vllm_keepalive.KeepAliveMiddleware"]
