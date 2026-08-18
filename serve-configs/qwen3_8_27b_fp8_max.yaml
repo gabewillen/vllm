@@ -1,5 +1,19 @@
 # Qwen3.8-27B-FP8 on 4x L4 23 GiB — max-throughput config, full 262k context.
 #
+# Throughput settings (2026-08-18; evidence in goal run
+# goal/sessions/23cb78c0-b3a1-4ea3-89e2-332443ff1f8f/runs/20260818T055754Z-8dd3de85):
+#   max-num-seqs 128: with NCCL P2P the decode step is no longer comm-bound,
+#     so 128 concurrent still scale (192 only raises TPOT).
+#   enable-dbo (venv patch serve-configs/patches/0006): dense-TP dual batch
+#     overlap. A prefill chunk is split in two micro-batches and every TP
+#     all-reduce of one half runs while the other half computes; NCCL was
+#     ~45% of prefill GPU time even with P2P. The unit sets
+#     NCCL_MAX_NCHANNELS=1 so the polling NCCL CTAs do not steal SMs from the
+#     overlapped GEMMs (also the fastest setting for 84 MB all-reduces).
+#   dbo-decode-token-threshold 1000000: never micro-batch decode; splitting a
+#     memory-bound decode batch doubles the weight reads.
+#   attention-backend TRITON_ATTN: same speed as FlashInfer here and no
+#     workspace reservation, so a larger KV pool.
 # Serve (dedicated venv, vLLM >= 0.27.2 nightly — NOT the repo .venv/.venv-ling):
 #   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 \
 #     /shared/vllm/.venv-qwen38/bin/vllm serve \
@@ -25,15 +39,19 @@ kv-cache-dtype: fp8
 gpu-memory-utilization: 0.95
 # Concurrency saturates ~seqs96 on L4 (seqs64->96 was +2.2%); GDN fp32
 # recurrent state per seq is the cost that scales here, not KV.
-max-num-seqs: 96
+max-num-seqs: 128
 # 16384 measured -0.1%: not worth it. Keep the 8192 chunk.
 max-num-batched-tokens: 8192
-compilation-config: '{"max_cudagraph_capture_size": 96}'
+compilation-config: '{"max_cudagraph_capture_size": 128}'
+attention-backend: TRITON_ATTN
+enable-dbo: true
+dbo-decode-token-threshold: 1000000
 reasoning-parser: qwen3
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
 port: 8012
+middleware: ["vllm_keepalive.KeepAliveMiddleware"]
 # Tiered KV offload (native TieringOffloadingSpec): 24 GiB pinned-RAM staging
 # tier + content-addressed fs tier on the NVMe RAID0. Long chats evicted from
 # the ~1.39M-token GPU pool restore from RAM or disk instead of a ~155 s cold

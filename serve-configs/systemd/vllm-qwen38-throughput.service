@@ -1,0 +1,36 @@
+[Unit]
+Description=vLLM Qwen3.8-27B-FP8 throughput profile (TP4, seqs128, DBO, 262k ctx) on 4x L4
+Conflicts=vllm-qwen38.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gwillen
+Group=gwillen
+# API key + HF cache settings; key is root-only (chmod 600).
+EnvironmentFile=/etc/vllm/qwen38.env
+ExecStartPre=/bin/sh -c "rm -f /dev/shm/vllm_offload_*.mmap"
+ExecStart=/shared/vllm/.venv-qwen38/bin/vllm serve --config /shared/vllm/serve-configs/qwen3_8_27b_fp8_max.yaml
+# Model load + inductor compile + graph capture can take several minutes.
+TimeoutStartSec=1800
+# Cgroup kill (default control-group) tears down all TP workers with the
+# parent, so no stale /dev/shm psm_* segments are left to wedge the next
+# start (manual SIGKILLs were the only source of those).
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=15
+# vLLM writes torch compile caches under HOME.
+Environment=HOME=/home/gwillen
+# Fixed hash seed: block hashes (and thus fs-tier filenames) must be stable
+# across restarts or the disk tier can never hit after a service restart.
+Environment=PYTHONHASHSEED=8012
+Environment=PYTHONPATH=/shared/vllm/serve-configs/middleware
+Environment=NCCL_P2P_LEVEL=SYS
+# Throughput profile: dense-TP dual batch overlap needs few NCCL channels so
+# the overlapped GEMMs keep their SMs (see qwen3_8_27b_fp8_max.yaml). Do not
+# set VLLM_USE_V2_MODEL_RUNNER here (V2 rejects --enable-dbo).
+Environment=NCCL_MAX_NCHANNELS=1
+
+[Install]
+WantedBy=multi-user.target
