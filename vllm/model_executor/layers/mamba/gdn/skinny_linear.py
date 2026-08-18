@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Skinny bf16 GEMM for the GDN ``in_proj_ba`` projection at decode.
+
+``in_proj_ba`` is unquantized bf16 with a tiny N (2 x num_v_heads / tp) and a
+large K. For 2 <= M <= 16 rows cuBLAS picks a poor kernel on Ada (~27 us for a
+1 MB weight, vs 4 us at M=1 or M=32); a split-K Triton kernel plus a reduce
+does it in ~5.5 us. Larger M and M == 1 keep the cuBLAS path.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+from vllm.utils.torch_utils import direct_register_custom_op
+
+# Row range where cuBLAS is slow for this shape (measured on L4).
+SKINNY_MIN_ROWS = 2
+SKINNY_MAX_ROWS = 16
+SKINNY_SPLIT_K = 16
+SKINNY_BLOCK_K = 128
+
+
+@triton.jit
+def _skinny_splitk_kernel(
+    x_ptr,
+    w_ptr,
+    part_ptr,
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_wn,
+    k_per,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_k = tl.program_id(0)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    k0 = pid_k * k_per
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, k_per, BLOCK_K):
+        offs_k = k0 + k + tl.arange(0, BLOCK_K)
+        km = offs_k < K
+        x = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :],
+            mask=(offs_m[:, None] < M) & km[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
+            mask=(offs_n[:, None] < N) & km[None, :],
+            other=0.0,
+        )
+        acc += tl.dot(x, tl.trans(w))
+    tl.store(
+        part_ptr + pid_k * M * N + offs_m[:, None] * N + offs_n[None, :],
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def _skinny_linear_triton(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    m, k = x.shape
+    n = weight.shape[0]
+    block_m = max(16, triton.next_power_of_2(m))
+    block_n = max(16, triton.next_power_of_2(n))
+    k_per = triton.cdiv(triton.cdiv(k, SKINNY_BLOCK_K), SKINNY_SPLIT_K) * SKINNY_BLOCK_K
+    part = torch.empty((SKINNY_SPLIT_K, m, n), dtype=torch.float32, device=x.device)
+    _skinny_splitk_kernel[(SKINNY_SPLIT_K,)](
+        x,
+        weight,
+        part,
+        m,
+        n,
+        k,
+        x.stride(0),
+        weight.stride(0),
+        k_per,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=SKINNY_BLOCK_K,
+        num_warps=4,
+    )
+    return part.sum(0).to(x.dtype)
+
+
+def skinny_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T`` for a bf16 [N, K] weight with small N; picks the fast
+    path per row count (opaque to torch.compile via the custom op below)."""
+    if (
+        SKINNY_MIN_ROWS <= x.shape[0] <= SKINNY_MAX_ROWS
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.shape[0] <= 64
+        and x.is_cuda
+    ):
+        return _skinny_linear_triton(x, weight)
+    return torch.nn.functional.linear(x, weight)
+
+
+def _skinny_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="gdn_skinny_linear",
+    op_func=skinny_linear,
+    fake_impl=_skinny_linear_fake,
+)
