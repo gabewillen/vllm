@@ -2,7 +2,7 @@
 start, verify the model retrieves it. Uses the server's /tokenize endpoint to
 hit the token target within tolerance.
 
-Usage: python long_ctx_probe.py [--port 8012] [--target-tokens 200000]
+Usage: /shared/vllm/.venv-qwen38/bin/python long_ctx_probe.py [--port 8012] [--target-tokens 200000]
 """
 
 import argparse
