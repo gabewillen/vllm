@@ -1998,6 +1998,7 @@ class Scheduler(SchedulerInterface):
                         effort_num_draft,
                         effort_num_accepted,
                         stopped,
+                        prompt_token_ids=request.prompt_token_ids,
                     )
 
             if new_token_ids and self.structured_output_manager.should_advance(

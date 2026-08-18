@@ -213,6 +213,7 @@ class ThinkTracker:
         self._scanned = 0
         self._last_start = -1
         self._last_end = -1
+        self._prompt_in_think = False
 
     @staticmethod
     def _last_index(tokens: Sequence[int], pattern: list[int], base: int) -> int:
@@ -221,6 +222,16 @@ class ThinkTracker:
             if list(tokens[i : i + n]) == pattern:
                 return base + i
         return -1
+
+    def seed_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
+        """Start in think mode when the prompt's tail opens a think block."""
+        if not self.enabled:
+            return
+        tail = list(prompt_token_ids[-max(64, self._overlap + 1) :])
+        s = self._last_index(tail, self.start_ids, 0)
+        e = self._last_index(tail, self.end_ids, 0)
+        if s > e:
+            self._prompt_in_think = True
 
     def update(self, token_ids: Sequence[int]) -> bool | None:
         """Scan tokens appended since the last call; return in-think state."""
@@ -238,6 +249,8 @@ class ThinkTracker:
         if e > self._last_end:
             self._last_end = e
         self._scanned = n
+        if self._last_start == -1 and self._last_end == -1:
+            return self._prompt_in_think
         return self._last_start > self._last_end
 
 
@@ -304,10 +317,15 @@ class EffortTelemetrySink:
         num_draft_tokens: int | None,
         num_accepted: int | None,
         finished: bool,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> None:
         tracker = self._trackers.get(req_id)
         if tracker is None:
             tracker = ThinkTracker(self._start_ids, self._end_ids)
+            if prompt_token_ids:
+                # Chat templates open the think block in the prompt
+                # (e.g. "<think>\n"), so seed the state from the prompt tail.
+                tracker.seed_from_prompt(prompt_token_ids)
             self._trackers[req_id] = tracker
         step = self._steps.get(req_id, 0) + 1
         self._steps[req_id] = step
