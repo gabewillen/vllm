@@ -1,0 +1,312 @@
+# Ling-3.0-flash-fp4 (inclusionAI, official MXFP4-expert/FP8-dense quant)
+# on 4x L4 23 GiB — 64k smoke config.
+#
+# Serve (uses the vllm-ling-v3 fork venv, NOT the repo .venv):
+#   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 \
+#     /shared/vllm/.venv-ling/bin/vllm serve \
+#     --config /shared/vllm/serve-configs/ling3_flash_fp4_4xl4.yaml
+#
+# Fork: https://github.com/inclusionAI/vllm-ling-v3 branch ling_3_0
+# (installed editable from /data/src/vllm-ling-v3 into /shared/vllm/.venv-ling).
+# Model card's reference serve flags (141 GB-class GPUs) adapted for L4:
+# card uses --gpu-memory-utilization 0.85 + MTP spec decode; we tighten/omit
+# those because weights alone are ~17.6 GB/GPU here (70.4 GB checkpoint / TP4).
+model: inclusionAI/Ling-3.0-flash-fp4
+# Custom BailingMoeV3 config/modeling files live in the checkpoint repo.
+trust-remote-code: true
+# REQUIRED for this checkpoint on the vLLM fork: the fp4 card only documents
+# SGLang; the fork's Fp8Config routes routed experts to Mxfp4MoEMethod only
+# when quantization_config.store_dtype == "mxfp4" (fp8.py get_quant_method),
+# but this checkpoint spells it "routed_experts_quant_method": "mxfp4"
+# instead, which nothing in the fork reads. Without this override the fp8
+# MoE loader hits e2m1-packed uint8 expert tensors and fails.
+# Dict-valued hf-overrides REPLACE the attr wholesale (_apply_dict_overrides
+# only recurses into nested PretrainedConfig, and quantization_config is a
+# plain dict), so the full original dict is reproduced here verbatim from
+# the checkpoint config.json with only store_dtype added.
+hf-overrides:
+  quantization_config:
+    activation_scheme: dynamic
+    fmt: e4m3
+    quant_method: fp8
+    scale_fmt: ue8m0
+    weight_block_size: [128, 128]
+    store_dtype: mxfp4            # <- the one added key
+    routed_experts_quant_method: mxfp4
+    routed_experts_group_size: 32
+    routed_experts_scale_dtype: e8m0
+    routed_experts_weight_dtype: e2m1
+    routed_experts_source_quant_method: fp8_block_128x128
+    # Full module prefixes generated from the checkpoint tensor
+    # inventory (fork matches exact prefixes, not substrings; the
+    # vendor list used SGLang-style bare names that never match).
+    # 35 KDA qkvb+convs, 7 MLA fused_qkv_a/g/kv_b, 40 router
+    # gates, lm_head = 202 entries.
+    modules_to_not_convert:
+      - lm_head
+      - model.layers.0.self_attn.k_conv1d
+      - model.layers.0.self_attn.q_conv1d
+      - model.layers.0.self_attn.qkvb_proj
+      - model.layers.0.self_attn.v_conv1d
+      - model.layers.1.self_attn.k_conv1d
+      - model.layers.1.self_attn.q_conv1d
+      - model.layers.1.self_attn.qkvb_proj
+      - model.layers.1.self_attn.v_conv1d
+      - model.layers.10.mlp.gate
+      - model.layers.10.self_attn.k_conv1d
+      - model.layers.10.self_attn.q_conv1d
+      - model.layers.10.self_attn.qkvb_proj
+      - model.layers.10.self_attn.v_conv1d
+      - model.layers.11.mlp.gate
+      - model.layers.11.self_attn.fused_qkv_a_proj
+      - model.layers.11.self_attn.g_proj
+      - model.layers.11.self_attn.kv_b_proj
+      - model.layers.12.mlp.gate
+      - model.layers.12.self_attn.k_conv1d
+      - model.layers.12.self_attn.q_conv1d
+      - model.layers.12.self_attn.qkvb_proj
+      - model.layers.12.self_attn.v_conv1d
+      - model.layers.13.mlp.gate
+      - model.layers.13.self_attn.k_conv1d
+      - model.layers.13.self_attn.q_conv1d
+      - model.layers.13.self_attn.qkvb_proj
+      - model.layers.13.self_attn.v_conv1d
+      - model.layers.14.mlp.gate
+      - model.layers.14.self_attn.k_conv1d
+      - model.layers.14.self_attn.q_conv1d
+      - model.layers.14.self_attn.qkvb_proj
+      - model.layers.14.self_attn.v_conv1d
+      - model.layers.15.mlp.gate
+      - model.layers.15.self_attn.k_conv1d
+      - model.layers.15.self_attn.q_conv1d
+      - model.layers.15.self_attn.qkvb_proj
+      - model.layers.15.self_attn.v_conv1d
+      - model.layers.16.mlp.gate
+      - model.layers.16.self_attn.k_conv1d
+      - model.layers.16.self_attn.q_conv1d
+      - model.layers.16.self_attn.qkvb_proj
+      - model.layers.16.self_attn.v_conv1d
+      - model.layers.17.mlp.gate
+      - model.layers.17.self_attn.fused_qkv_a_proj
+      - model.layers.17.self_attn.g_proj
+      - model.layers.17.self_attn.kv_b_proj
+      - model.layers.18.mlp.gate
+      - model.layers.18.self_attn.k_conv1d
+      - model.layers.18.self_attn.q_conv1d
+      - model.layers.18.self_attn.qkvb_proj
+      - model.layers.18.self_attn.v_conv1d
+      - model.layers.19.mlp.gate
+      - model.layers.19.self_attn.k_conv1d
+      - model.layers.19.self_attn.q_conv1d
+      - model.layers.19.self_attn.qkvb_proj
+      - model.layers.19.self_attn.v_conv1d
+      - model.layers.2.mlp.gate
+      - model.layers.2.self_attn.k_conv1d
+      - model.layers.2.self_attn.q_conv1d
+      - model.layers.2.self_attn.qkvb_proj
+      - model.layers.2.self_attn.v_conv1d
+      - model.layers.20.mlp.gate
+      - model.layers.20.self_attn.k_conv1d
+      - model.layers.20.self_attn.q_conv1d
+      - model.layers.20.self_attn.qkvb_proj
+      - model.layers.20.self_attn.v_conv1d
+      - model.layers.21.mlp.gate
+      - model.layers.21.self_attn.k_conv1d
+      - model.layers.21.self_attn.q_conv1d
+      - model.layers.21.self_attn.qkvb_proj
+      - model.layers.21.self_attn.v_conv1d
+      - model.layers.22.mlp.gate
+      - model.layers.22.self_attn.k_conv1d
+      - model.layers.22.self_attn.q_conv1d
+      - model.layers.22.self_attn.qkvb_proj
+      - model.layers.22.self_attn.v_conv1d
+      - model.layers.23.mlp.gate
+      - model.layers.23.self_attn.fused_qkv_a_proj
+      - model.layers.23.self_attn.g_proj
+      - model.layers.23.self_attn.kv_b_proj
+      - model.layers.24.mlp.gate
+      - model.layers.24.self_attn.k_conv1d
+      - model.layers.24.self_attn.q_conv1d
+      - model.layers.24.self_attn.qkvb_proj
+      - model.layers.24.self_attn.v_conv1d
+      - model.layers.25.mlp.gate
+      - model.layers.25.self_attn.k_conv1d
+      - model.layers.25.self_attn.q_conv1d
+      - model.layers.25.self_attn.qkvb_proj
+      - model.layers.25.self_attn.v_conv1d
+      - model.layers.26.mlp.gate
+      - model.layers.26.self_attn.k_conv1d
+      - model.layers.26.self_attn.q_conv1d
+      - model.layers.26.self_attn.qkvb_proj
+      - model.layers.26.self_attn.v_conv1d
+      - model.layers.27.mlp.gate
+      - model.layers.27.self_attn.k_conv1d
+      - model.layers.27.self_attn.q_conv1d
+      - model.layers.27.self_attn.qkvb_proj
+      - model.layers.27.self_attn.v_conv1d
+      - model.layers.28.mlp.gate
+      - model.layers.28.self_attn.k_conv1d
+      - model.layers.28.self_attn.q_conv1d
+      - model.layers.28.self_attn.qkvb_proj
+      - model.layers.28.self_attn.v_conv1d
+      - model.layers.29.mlp.gate
+      - model.layers.29.self_attn.fused_qkv_a_proj
+      - model.layers.29.self_attn.g_proj
+      - model.layers.29.self_attn.kv_b_proj
+      - model.layers.3.mlp.gate
+      - model.layers.3.self_attn.k_conv1d
+      - model.layers.3.self_attn.q_conv1d
+      - model.layers.3.self_attn.qkvb_proj
+      - model.layers.3.self_attn.v_conv1d
+      - model.layers.30.mlp.gate
+      - model.layers.30.self_attn.k_conv1d
+      - model.layers.30.self_attn.q_conv1d
+      - model.layers.30.self_attn.qkvb_proj
+      - model.layers.30.self_attn.v_conv1d
+      - model.layers.31.mlp.gate
+      - model.layers.31.self_attn.k_conv1d
+      - model.layers.31.self_attn.q_conv1d
+      - model.layers.31.self_attn.qkvb_proj
+      - model.layers.31.self_attn.v_conv1d
+      - model.layers.32.mlp.gate
+      - model.layers.32.self_attn.k_conv1d
+      - model.layers.32.self_attn.q_conv1d
+      - model.layers.32.self_attn.qkvb_proj
+      - model.layers.32.self_attn.v_conv1d
+      - model.layers.33.mlp.gate
+      - model.layers.33.self_attn.k_conv1d
+      - model.layers.33.self_attn.q_conv1d
+      - model.layers.33.self_attn.qkvb_proj
+      - model.layers.33.self_attn.v_conv1d
+      - model.layers.34.mlp.gate
+      - model.layers.34.self_attn.k_conv1d
+      - model.layers.34.self_attn.q_conv1d
+      - model.layers.34.self_attn.qkvb_proj
+      - model.layers.34.self_attn.v_conv1d
+      - model.layers.35.mlp.gate
+      - model.layers.35.self_attn.fused_qkv_a_proj
+      - model.layers.35.self_attn.g_proj
+      - model.layers.35.self_attn.kv_b_proj
+      - model.layers.36.mlp.gate
+      - model.layers.36.self_attn.k_conv1d
+      - model.layers.36.self_attn.q_conv1d
+      - model.layers.36.self_attn.qkvb_proj
+      - model.layers.36.self_attn.v_conv1d
+      - model.layers.37.mlp.gate
+      - model.layers.37.self_attn.k_conv1d
+      - model.layers.37.self_attn.q_conv1d
+      - model.layers.37.self_attn.qkvb_proj
+      - model.layers.37.self_attn.v_conv1d
+      - model.layers.38.mlp.gate
+      - model.layers.38.self_attn.k_conv1d
+      - model.layers.38.self_attn.q_conv1d
+      - model.layers.38.self_attn.qkvb_proj
+      - model.layers.38.self_attn.v_conv1d
+      - model.layers.39.mlp.gate
+      - model.layers.39.self_attn.k_conv1d
+      - model.layers.39.self_attn.q_conv1d
+      - model.layers.39.self_attn.qkvb_proj
+      - model.layers.39.self_attn.v_conv1d
+      - model.layers.4.mlp.gate
+      - model.layers.4.self_attn.k_conv1d
+      - model.layers.4.self_attn.q_conv1d
+      - model.layers.4.self_attn.qkvb_proj
+      - model.layers.4.self_attn.v_conv1d
+      - model.layers.40.mlp.gate
+      - model.layers.40.self_attn.k_conv1d
+      - model.layers.40.self_attn.q_conv1d
+      - model.layers.40.self_attn.qkvb_proj
+      - model.layers.40.self_attn.v_conv1d
+      - model.layers.41.mlp.gate
+      - model.layers.41.self_attn.fused_qkv_a_proj
+      - model.layers.41.self_attn.g_proj
+      - model.layers.41.self_attn.kv_b_proj
+      - model.layers.5.mlp.gate
+      - model.layers.5.self_attn.fused_qkv_a_proj
+      - model.layers.5.self_attn.g_proj
+      - model.layers.5.self_attn.kv_b_proj
+      - model.layers.6.mlp.gate
+      - model.layers.6.self_attn.k_conv1d
+      - model.layers.6.self_attn.q_conv1d
+      - model.layers.6.self_attn.qkvb_proj
+      - model.layers.6.self_attn.v_conv1d
+      - model.layers.7.mlp.gate
+      - model.layers.7.self_attn.k_conv1d
+      - model.layers.7.self_attn.q_conv1d
+      - model.layers.7.self_attn.qkvb_proj
+      - model.layers.7.self_attn.v_conv1d
+      - model.layers.8.mlp.gate
+      - model.layers.8.self_attn.k_conv1d
+      - model.layers.8.self_attn.q_conv1d
+      - model.layers.8.self_attn.qkvb_proj
+      - model.layers.8.self_attn.v_conv1d
+      - model.layers.9.mlp.gate
+      - model.layers.9.self_attn.k_conv1d
+      - model.layers.9.self_attn.q_conv1d
+      - model.layers.9.self_attn.qkvb_proj
+      - model.layers.9.self_attn.v_conv1d
+# TP4 is impossible for this checkpoint: the shared-expert MLP (768 wide,
+# fp8 128x128 block quant) shards to 192/rank at TP4, indivisible by the
+# 128 block (vendor reference deploy is TP2 on Blackwell for this reason).
+# TP2 x PP2 uses all 4 GPUs with legal 384-wide shards.
+tensor-parallel-size: 2
+pipeline-parallel-size: 2
+# REQUIRED on L4: without EP, TP4 shards moe_intermediate_size 768 -> 192
+# per rank, and the Marlin mxfp4 backend rounds that up to 256
+# (oracle/mxfp4.py mxfp4_round_up_hidden_size_and_intermediate_size,
+# 128-multiple), inflating the ~16 GB/GPU routed-expert weights by 33%
+# -> guaranteed OOM on 22.5 GiB cards. With EP the experts are split by
+# count (512/4 = 128 per rank) at full intermediate 768 (already
+# 128-aligned) and hidden 2560 (256-aligned): zero padding. Comm falls
+# back to the naive all2all on L4 (no DeepEP/pplx) which is fine at this
+# scale. If the EP path misbehaves with this fork, the no-padding
+# alternative is dropping EP and pinning moe-backend: triton_unfused
+# (64-round-up keeps 192) — but that kernel is flagged buggy with MTP.
+enable-expert-parallel: true
+# 42 layers = 35 KDA + 7 gated MLA (5:1). Only the 7 MLA layers allocate
+# paged KV (latent kv_lora_rank 512 + 64 rope dims ~= 1.15 KB/layer/token
+# bf16, replicated per rank under MLA) -> ~8 KB/token, ~0.5 GiB at 64k.
+# KDA layers keep constant-size recurrent state per sequence (scales with
+# max-num-seqs, not context), so raising context is cheap KV-wise:
+# 65536 for the smoke; step 131072 -> 262144 (card max, rope native 262144)
+# once the smoke passes — at 256k paged KV is still only ~2 GiB/GPU.
+max-model-len: 65536
+# Weights ~17.6 GB/GPU of the L4's 22.5 GiB. 0.92 -> ~21.2 GB budget,
+# leaving ~3.5 GB for KV + KDA state pool + activations. The card's 0.85
+# would leave <3 GB and risks failing the KV-cache memory check.
+gpu-memory-utilization: 0.92
+# Bound the KDA/mamba-style state pool: state is per-sequence constant, so
+# max-num-seqs directly sizes that pool. 8 is plenty for the coding eval
+# (sequential requests); raise only after checking free KV memory at startup.
+max-num-seqs: 8
+# Chunked-prefill size; matches the vendor's 8192 chunk recipe. Lower to
+# 4096 if activation memory OOMs during long-prompt prefill.
+max-num-batched-tokens: 8192
+# First smoke run: skip CUDA graph capture — avoids capture-time OOM on the
+# ~3 GB headroom and any hybrid KDA+MLA capture bugs in the fork. Remove
+# (or set false) once stable; graphs matter for KDA decode throughput.
+enforce-eager: true
+# Card-recommended runtime flags (fork-specific):
+# mamba-cache-mode align — KDA state cache layout required by the fork.
+mamba-cache-mode: align
+enable-prefix-caching: true
+# ling3 parsers ship in the fork; thinking mode is on by default in the
+# chat template (disable per-request via chat_template_kwargs.enable_thinking).
+reasoning-parser: ling3
+enable-auto-tool-choice: true
+tool-call-parser: ling3
+served-model-name: Ling-3.0-flash-fp4
+port: 8011
+# MoE kernel: auto-selection on SM89 falls through TRTLLM/DeepGEMM (both
+# SM90/100-gated) to MARLIN, so no pin is needed; if selection misbehaves,
+# pin explicitly with:
+# moe-backend: marlin
+# --- Deliberately omitted for the smoke, restore later ---
+# speculative-config: '{"method":"mtp","num_speculative_tokens":3}'
+#   Card recommends MTP spec decode (model trained with MTP); costs extra
+#   weight+state memory per rank, so enable only after the smoke fits.
+# kv-cache-dtype: fp8
+#   Optional headroom lever for 256k; verify fp8 MLA KV path on SM89 first.
+#
+# Sampling defaults per model card: temperature 0.6, top_p 0.95, top_k 20
+# (client-side; see scripts/ling3_coding_eval.py).

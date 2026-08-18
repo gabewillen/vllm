@@ -1,0 +1,25 @@
+listen_host: 127.0.0.1
+listen_port: 8998
+workers:
+  - slot: hot-a
+    host: 127.0.0.1
+    port: 9000
+    gpu_uuid: GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca
+  - slot: hot-b
+    host: 127.0.0.1
+    port: 9001
+    gpu_uuid: GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb
+default_profile: qwen2_5_omni_awq
+preload_profiles:
+  hot-a: qwen2_5_omni_awq
+  hot-b: gemma4_12b_awq
+profiles:
+  - qwen2_5_omni_awq
+  - gemma4_12b_awq
+  - gemma4_e2b_awq
+  - gemma4_e4b_awq
+load_timeout_s: 1800
+request_timeout_s: 3600
+client_max_size: 1073741824
+cpu_ram_cache_max_bytes: 32GB
+state_path: /shared/eve/vllm-manager/swapper-state.json

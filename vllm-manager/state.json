@@ -1,0 +1,18 @@
+{
+  "active": {
+    "profile": "qwen2_5_omni_awq",
+    "unit": "vllm-managed@hot.service",
+    "port": 9000,
+    "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+    "managed": true,
+    "slot": "hot",
+    "served_model_name": "qwen2.5-omni-awq",
+    "aliases": [
+      "qwen2.5-omni-awq",
+      "qwen2.5-omni",
+      "qwen"
+    ],
+    "switched_at": "2026-06-22T04:36:41.102704+00:00"
+  },
+  "previous": null
+}
