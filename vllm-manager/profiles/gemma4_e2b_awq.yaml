@@ -1,0 +1,47 @@
+name: gemma4_e2b_awq
+description: Gemma 4 E2B W4A16 GPTQ multimodal model on vLLM
+executable: /shared/eve/vllm/.venv-omni/bin/vllm
+args:
+  - serve
+  - Vishva007/gemma-4-E2B-it-W4A16-AutoRound-GPTQ
+  - --max-model-len
+  - auto
+  - --gpu-memory-utilization
+  - "0.98"
+  - --max-num-seqs
+  - "8"
+  - --generation-config
+  - vllm
+  - --chat-template
+  - /shared/eve/vllm/examples/tool_chat_template_gemma4.jinja
+  - --enable-auto-tool-choice
+  - --tool-call-parser
+  - gemma4
+  - --reasoning-parser
+  - gemma4
+  - --structured-outputs-config
+  - '{"backend":"xgrammar","disable_any_whitespace":true}'
+  - --trust-remote-code
+served_model_name: gemma4-e2b-w4a16
+litellm_model: openai/gemma4-e2b-w4a16
+aliases:
+  - gemma4-e2b-w4a16
+  - gemma-4-e2b-w4a16
+  - gemma4-e2b-gptq
+  - gemma-4-e2b-gptq
+  - gemma4-e2b-awq
+  - gemma-4-e2b-awq
+  - gemma4-e2b
+  - gemma-4-e2b
+  - Vishva007/gemma-4-E2B-it-W4A16-AutoRound-GPTQ
+cache_paths:
+  - /shared/eve/huggingface/hub/models--Vishva007--gemma-4-E2B-it-W4A16-AutoRound-GPTQ
+env:
+  HF_HOME: /shared/eve/huggingface
+  HUGGINGFACE_HUB_CACHE: /shared/eve/huggingface/hub
+  HF_XET_CACHE: /shared/eve/huggingface/xet
+  VLLM_CACHE_ROOT: /shared/eve/vllm-cache
+  XDG_CACHE_HOME: /shared/eve/.cache
+  HF_XET_HIGH_PERFORMANCE: "1"
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  VLLM_ENFORCE_STRICT_TOOL_CALLING: "0"

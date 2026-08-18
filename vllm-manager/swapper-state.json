@@ -1,0 +1,210 @@
+{
+  "workers": {
+    "hot-a": {
+      "profile": "qwen2_5_omni_awq",
+      "unit": "vllm-managed@hot-a.service",
+      "slot": "hot-a",
+      "host": "127.0.0.1",
+      "port": 9000,
+      "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+      "served_model_name": "qwen2.5-omni-awq",
+      "loaded_at": "2026-07-02T13:46:04.823053+00:00",
+      "last_used": "2026-07-02T13:46:04.823053+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 12718584283,
+        "files": 20,
+        "seconds": 8.847
+      }
+    },
+    "hot-b": {
+      "profile": "gemma4_12b_awq",
+      "unit": "vllm-managed@hot-b.service",
+      "slot": "hot-b",
+      "host": "127.0.0.1",
+      "port": 9001,
+      "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+      "served_model_name": "gemma4-12b-awq",
+      "loaded_at": "2026-06-25T15:58:21.005862+00:00",
+      "last_used": "2026-07-01T20:30:42.570151+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 7814907770,
+        "files": 14,
+        "seconds": 5.249
+      }
+    }
+  },
+  "previous": [
+    {
+      "profile": "qwen2_5_omni_awq",
+      "unit": "vllm-managed@hot-a.service",
+      "slot": "hot-a",
+      "host": "127.0.0.1",
+      "port": 9000,
+      "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+      "served_model_name": "qwen2.5-omni-awq",
+      "loaded_at": "2026-07-01T20:03:33.692301+00:00",
+      "last_used": "2026-07-01T20:03:47.772867+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 12718584283,
+        "files": 20,
+        "seconds": 10.331
+      }
+    },
+    {
+      "profile": "qwen2_5_omni_awq",
+      "unit": "vllm-managed@hot-a.service",
+      "slot": "hot-a",
+      "host": "127.0.0.1",
+      "port": 9000,
+      "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+      "served_model_name": "qwen2.5-omni-awq",
+      "loaded_at": "2026-06-28T19:52:35.970947+00:00",
+      "last_used": "2026-06-28T19:52:35.970947+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 12718584283,
+        "files": 20,
+        "seconds": 11.087
+      }
+    },
+    {
+      "profile": "qwen2_5_omni_awq",
+      "unit": "vllm-managed@hot-a.service",
+      "slot": "hot-a",
+      "host": "127.0.0.1",
+      "port": 9000,
+      "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+      "served_model_name": "qwen2.5-omni-awq",
+      "loaded_at": "2026-06-25T15:50:20.425790+00:00",
+      "last_used": "2026-06-25T15:50:20.425790+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 12718584283,
+        "files": 20,
+        "seconds": 8.801
+      }
+    },
+    {
+      "profile": "qwen2_5_omni_awq",
+      "unit": "vllm-managed@hot-b.service",
+      "slot": "hot-b",
+      "host": "127.0.0.1",
+      "port": 9001,
+      "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+      "served_model_name": "qwen2.5-omni-awq",
+      "loaded_at": "2026-06-23T06:44:09.502622+00:00",
+      "last_used": "2026-06-23T13:24:54.494575+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 12718584283,
+        "files": 20,
+        "seconds": 11.275
+      }
+    },
+    {
+      "profile": "gemma4_12b_awq",
+      "unit": "vllm-managed@hot-a.service",
+      "slot": "hot-a",
+      "host": "127.0.0.1",
+      "port": 9000,
+      "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+      "served_model_name": "gemma4-12b-awq",
+      "loaded_at": "2026-06-23T06:26:04.233868+00:00",
+      "last_used": "2026-06-23T07:47:54.194721+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 7814907770,
+        "files": 14,
+        "seconds": 8.006
+      }
+    },
+    {
+      "profile": "gemma4_e4b_awq",
+      "unit": "vllm-managed@hot-b.service",
+      "slot": "hot-b",
+      "host": "127.0.0.1",
+      "port": 9001,
+      "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+      "served_model_name": "gemma4-e4b-w4a16",
+      "loaded_at": "2026-06-23T03:14:03.137265+00:00",
+      "last_used": "2026-06-23T03:14:03.137265+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 10107698232,
+        "files": 15,
+        "seconds": 3.325
+      }
+    },
+    {
+      "profile": "gemma4_e2b_awq",
+      "unit": "vllm-managed@hot-a.service",
+      "slot": "hot-a",
+      "host": "127.0.0.1",
+      "port": 9000,
+      "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+      "served_model_name": "gemma4-e2b-w4a16",
+      "loaded_at": "2026-06-23T03:11:19.521049+00:00",
+      "last_used": "2026-06-23T03:11:19.521049+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 7486043004,
+        "files": 16,
+        "seconds": 2.234
+      }
+    },
+    {
+      "profile": "gemma4_12b_awq",
+      "unit": "vllm-managed@hot-b.service",
+      "slot": "hot-b",
+      "host": "127.0.0.1",
+      "port": 9001,
+      "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+      "served_model_name": "gemma4-12b-awq",
+      "loaded_at": "2026-06-22T15:51:17.005761+00:00",
+      "last_used": "2026-06-22T15:51:17.005761+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 7814907770,
+        "files": 14,
+        "seconds": 5.952
+      }
+    },
+    {
+      "profile": "qwen2_5_omni_awq",
+      "unit": "vllm-managed@hot-a.service",
+      "slot": "hot-a",
+      "host": "127.0.0.1",
+      "port": 9000,
+      "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+      "served_model_name": "qwen2.5-omni-awq",
+      "loaded_at": "2026-06-22T15:49:01.261155+00:00",
+      "last_used": "2026-06-22T15:49:01.261155+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 12718584283,
+        "files": 20,
+        "seconds": 8.692
+      }
+    },
+    {
+      "profile": "gemma4_12b_awq",
+      "unit": "vllm-managed@hot-b.service",
+      "slot": "hot-b",
+      "host": "127.0.0.1",
+      "port": 9001,
+      "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+      "served_model_name": "gemma4-12b-awq",
+      "loaded_at": "2026-06-22T15:19:26.446236+00:00",
+      "last_used": "2026-06-22T15:40:22.567416+00:00",
+      "cache": {
+        "enabled": true,
+        "bytes": 7814907770,
+        "files": 14,
+        "seconds": 5.941
+      }
+    }
+  ]
+}

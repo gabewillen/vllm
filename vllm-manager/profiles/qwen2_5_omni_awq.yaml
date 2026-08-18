@@ -1,0 +1,35 @@
+name: qwen2_5_omni_awq
+description: Qwen2.5 Omni 7B AWQ on vLLM-Omni
+executable: /shared/eve/vllm/.venv-omni/bin/vllm-omni
+args:
+  - serve
+  - Qwen/Qwen2.5-Omni-7B-AWQ
+  - --omni
+  - --deploy-config
+  - /shared/eve/qwen2_5_omni_awq_single_l4.yaml
+  - --chat-template
+  - /shared/eve/qwen2_5_omni_tool_chat_template.jinja
+  - --enable-auto-tool-choice
+  - --tool-call-parser
+  - qwen3_coder
+  - --structured-outputs-config
+  - '{"backend":"xgrammar","disable_any_whitespace":true}'
+  - --trust-remote-code
+served_model_name: qwen2.5-omni-awq
+litellm_model: openai/qwen2.5-omni-awq
+aliases:
+  - qwen2.5-omni-awq
+  - qwen2.5-omni
+  - qwen
+cache_paths:
+  - /shared/eve/huggingface/hub/models--Qwen--Qwen2.5-Omni-7B-AWQ
+env:
+  HF_HOME: /shared/eve/huggingface
+  HUGGINGFACE_HUB_CACHE: /shared/eve/huggingface/hub
+  HF_XET_CACHE: /shared/eve/huggingface/xet
+  VLLM_CACHE_ROOT: /shared/eve/vllm-cache
+  XDG_CACHE_HOME: /shared/eve/.cache
+  HF_XET_HIGH_PERFORMANCE: "1"
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  VLLM_ENFORCE_STRICT_TOOL_CALLING: "0"
+smoke_test: qwen_omni_structured_tool

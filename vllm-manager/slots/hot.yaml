@@ -1,0 +1,5 @@
+slot: hot
+profile: gemma4_12b_awq
+port: 9000
+gpu_uuid: GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb
+host: 127.0.0.1

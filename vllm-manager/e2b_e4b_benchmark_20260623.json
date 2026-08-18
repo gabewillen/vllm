@@ -1,0 +1,557 @@
+{
+  "created_at": "2026-06-23T00:00:00Z",
+  "method": "direct vLLM OpenAI chat completions after swapper warm/load",
+  "models": {
+    "gemma4-e2b-w4a16": {
+      "base_url": "http://127.0.0.1:9000",
+      "single": [
+        {
+          "status": 200,
+          "elapsed_s": 2.4244454661384225,
+          "completion_tokens": 256,
+          "prompt_tokens": 51,
+          "tok_s": 105.59115623571786
+        },
+        {
+          "status": 200,
+          "elapsed_s": 2.4238431500270963,
+          "completion_tokens": 256,
+          "prompt_tokens": 51,
+          "tok_s": 105.61739524982801
+        },
+        {
+          "status": 200,
+          "elapsed_s": 2.42435943800956,
+          "completion_tokens": 256,
+          "prompt_tokens": 51,
+          "tok_s": 105.59490312632038
+        }
+      ],
+      "single_avg_tok_s": 105.60115153728874,
+      "single_median_tok_s": 105.59490312632038,
+      "stream": [
+        {
+          "elapsed_s": 1.223215151578188,
+          "ttft_s": 0.02921273000538349,
+          "completion_tokens": 128,
+          "tok_s_after_ttft": 107.2024626477654,
+          "chunks": 128,
+          "chars": 647
+        },
+        {
+          "elapsed_s": 1.2185966400429606,
+          "ttft_s": 0.024481997825205326,
+          "completion_tokens": 128,
+          "tok_s_after_ttft": 107.19238796224248,
+          "chunks": 128,
+          "chars": 787
+        },
+        {
+          "elapsed_s": 1.2183201191946864,
+          "ttft_s": 0.024225547909736633,
+          "completion_tokens": 128,
+          "tok_s_after_ttft": 107.19418970497526,
+          "chunks": 128,
+          "chars": 870
+        }
+      ],
+      "ttft_avg_s": 0.02597342524677515,
+      "decode_after_ttft_avg_tok_s": 107.19634677166106,
+      "aggregate": [
+        {
+          "concurrency": 2,
+          "elapsed_s": 4.8460301058366895,
+          "completion_tokens": 512,
+          "aggregate_tok_s": 105.6534913770621,
+          "per_request_tok_s": [
+            105.5516104959307,
+            52.829588386161596
+          ]
+        },
+        {
+          "concurrency": 4,
+          "elapsed_s": 9.697181012481451,
+          "completion_tokens": 1024,
+          "aggregate_tok_s": 105.59769882422403,
+          "per_request_tok_s": [
+            105.37584730394737,
+            52.74027872164797,
+            35.19641484908535,
+            26.400905512159678
+          ]
+        },
+        {
+          "concurrency": 8,
+          "elapsed_s": 19.397566175088286,
+          "completion_tokens": 2048,
+          "aggregate_tok_s": 105.58025586891334,
+          "per_request_tok_s": [
+            105.23913820394856,
+            52.69845700982949,
+            35.174433930157754,
+            26.38726843424297,
+            21.11401735327706,
+            17.596131361713113,
+            15.083148887569367,
+            13.198163870770768
+          ]
+        }
+      ],
+      "best_aggregate_tok_s": 105.6534913770621
+    },
+    "gemma4-e4b-w4a16": {
+      "base_url": "http://127.0.0.1:9001",
+      "single": [
+        {
+          "status": 200,
+          "elapsed_s": 4.169201026670635,
+          "completion_tokens": 256,
+          "prompt_tokens": 51,
+          "tok_s": 61.40265205787687
+        },
+        {
+          "status": 200,
+          "elapsed_s": 4.171219569630921,
+          "completion_tokens": 256,
+          "prompt_tokens": 51,
+          "tok_s": 61.37293799248537
+        },
+        {
+          "status": 200,
+          "elapsed_s": 4.172287644818425,
+          "completion_tokens": 256,
+          "prompt_tokens": 51,
+          "tok_s": 61.35722696826214
+        }
+      ],
+      "single_avg_tok_s": 61.3776056728748,
+      "single_median_tok_s": 61.37293799248537,
+      "stream": [
+        {
+          "elapsed_s": 2.093773229047656,
+          "ttft_s": 0.032631407491862774,
+          "completion_tokens": 128,
+          "tok_s_after_ttft": 62.10150056699296,
+          "chunks": 128,
+          "chars": 720
+        },
+        {
+          "elapsed_s": 2.0920572048053145,
+          "ttft_s": 0.030334025621414185,
+          "completion_tokens": 128,
+          "tok_s_after_ttft": 62.08398939893896,
+          "chunks": 128,
+          "chars": 633
+        },
+        {
+          "elapsed_s": 2.091845376417041,
+          "ttft_s": 0.030242965556681156,
+          "completion_tokens": 128,
+          "tok_s_after_ttft": 62.087626268627766,
+          "chunks": 128,
+          "chars": 799
+        }
+      ],
+      "ttft_avg_s": 0.03106946622331937,
+      "decode_after_ttft_avg_tok_s": 62.09103874485323,
+      "aggregate": [
+        {
+          "concurrency": 2,
+          "elapsed_s": 8.352188841439784,
+          "completion_tokens": 512,
+          "aggregate_tok_s": 61.301295950073296,
+          "per_request_tok_s": [
+            61.29074412289326,
+            30.651529733833705
+          ]
+        },
+        {
+          "concurrency": 4,
+          "elapsed_s": 16.705567027442157,
+          "completion_tokens": 1024,
+          "aggregate_tok_s": 61.29693163469878,
+          "per_request_tok_s": [
+            61.24090412957588,
+            30.645556113024703,
+            20.434499573905175,
+            15.32470764958103
+          ]
+        },
+        {
+          "concurrency": 8,
+          "elapsed_s": 33.44352103210986,
+          "completion_tokens": 2048,
+          "aggregate_tok_s": 61.237571188562065,
+          "per_request_tok_s": [
+            61.15651437169853,
+            30.607376910509675,
+            20.413027969339417,
+            15.310935745284535,
+            12.2487132825231,
+            10.206949517851156,
+            8.748520836873118,
+            7.65490785630518
+          ]
+        }
+      ],
+      "best_aggregate_tok_s": 61.301295950073296
+    }
+  },
+  "status": {
+    "state": {
+      "workers": {
+        "hot-a": {
+          "profile": "gemma4_e2b_awq",
+          "unit": "vllm-managed@hot-a.service",
+          "slot": "hot-a",
+          "host": "127.0.0.1",
+          "port": 9000,
+          "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+          "served_model_name": "gemma4-e2b-w4a16",
+          "loaded_at": "2026-06-23T03:11:19.521049+00:00",
+          "last_used": "2026-06-23T03:11:19.521049+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 7486043004,
+            "files": 16,
+            "seconds": 2.234
+          }
+        },
+        "hot-b": {
+          "profile": "gemma4_e4b_awq",
+          "unit": "vllm-managed@hot-b.service",
+          "slot": "hot-b",
+          "host": "127.0.0.1",
+          "port": 9001,
+          "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+          "served_model_name": "gemma4-e4b-w4a16",
+          "loaded_at": "2026-06-23T03:14:03.137265+00:00",
+          "last_used": "2026-06-23T03:14:03.137265+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 10107698232,
+            "files": 15,
+            "seconds": 3.325
+          }
+        }
+      },
+      "previous": [
+        {
+          "profile": "gemma4_12b_awq",
+          "unit": "vllm-managed@hot-b.service",
+          "slot": "hot-b",
+          "host": "127.0.0.1",
+          "port": 9001,
+          "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+          "served_model_name": "gemma4-12b-awq",
+          "loaded_at": "2026-06-22T15:51:17.005761+00:00",
+          "last_used": "2026-06-22T15:51:17.005761+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 7814907770,
+            "files": 14,
+            "seconds": 5.952
+          }
+        },
+        {
+          "profile": "qwen2_5_omni_awq",
+          "unit": "vllm-managed@hot-a.service",
+          "slot": "hot-a",
+          "host": "127.0.0.1",
+          "port": 9000,
+          "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+          "served_model_name": "qwen2.5-omni-awq",
+          "loaded_at": "2026-06-22T15:49:01.261155+00:00",
+          "last_used": "2026-06-22T15:49:01.261155+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 12718584283,
+            "files": 20,
+            "seconds": 8.692
+          }
+        },
+        {
+          "profile": "gemma4_12b_awq",
+          "unit": "vllm-managed@hot-b.service",
+          "slot": "hot-b",
+          "host": "127.0.0.1",
+          "port": 9001,
+          "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+          "served_model_name": "gemma4-12b-awq",
+          "loaded_at": "2026-06-22T15:19:26.446236+00:00",
+          "last_used": "2026-06-22T15:40:22.567416+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 7814907770,
+            "files": 14,
+            "seconds": 5.941
+          }
+        },
+        {
+          "profile": "gemma4_e2b_awq",
+          "unit": "vllm-managed@hot-a.service",
+          "slot": "hot-a",
+          "host": "127.0.0.1",
+          "port": 9000,
+          "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+          "served_model_name": "gemma4-e2b-w4a16",
+          "loaded_at": "2026-06-22T15:43:15.585699+00:00",
+          "last_used": "2026-06-22T15:43:26.700609+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 7486043004,
+            "files": 16,
+            "seconds": 7.875
+          }
+        },
+        {
+          "profile": "qwen2_5_omni_awq",
+          "unit": "vllm-managed@hot-a.service",
+          "slot": "hot-a",
+          "host": "127.0.0.1",
+          "port": 9000,
+          "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+          "served_model_name": "qwen2.5-omni-awq",
+          "loaded_at": "2026-06-22T15:17:13.343667+00:00",
+          "last_used": "2026-06-22T15:39:43.320682+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 12718584283,
+            "files": 20,
+            "seconds": 3.635
+          }
+        },
+        {
+          "profile": "gemma4_12b_awq",
+          "unit": "vllm-managed@hot-b.service",
+          "slot": "hot-b",
+          "host": "127.0.0.1",
+          "port": 9001,
+          "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+          "served_model_name": "gemma4-12b-awq",
+          "loaded_at": "2026-06-22T14:32:54.225402+00:00",
+          "last_used": "2026-06-22T14:35:48.916058+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 7814907770,
+            "files": 8,
+            "seconds": 5.803
+          }
+        },
+        {
+          "profile": "qwen2_5_omni_awq",
+          "unit": "vllm-managed@hot-a.service",
+          "slot": "hot-a",
+          "host": "127.0.0.1",
+          "port": 9000,
+          "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+          "served_model_name": "qwen2.5-omni-awq",
+          "loaded_at": "2026-06-22T14:41:03.738495+00:00",
+          "last_used": "2026-06-22T14:41:03.738495+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 12718584283,
+            "files": 20,
+            "seconds": 5.964
+          }
+        },
+        {
+          "profile": "qwen2_5_omni_awq",
+          "unit": "vllm-managed@hot-a.service",
+          "slot": "hot-a",
+          "host": "127.0.0.1",
+          "port": 9000,
+          "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca",
+          "served_model_name": "qwen2.5-omni-awq",
+          "loaded_at": "2026-06-22T14:30:45.244215+00:00",
+          "last_used": "2026-06-22T14:35:47.463809+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 12718584283,
+            "files": 14,
+            "seconds": 1.097
+          }
+        },
+        {
+          "profile": "qwen2_5_omni_awq",
+          "unit": "vllm-managed@hot.service",
+          "slot": "hot",
+          "port": 9000,
+          "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb",
+          "served_model_name": "qwen2.5-omni-awq",
+          "loaded_at": "2026-06-22T05:09:02.930928+00:00",
+          "cache": {
+            "enabled": true,
+            "bytes": 12718584283,
+            "files": 14,
+            "seconds": 0.991
+          }
+        }
+      ]
+    },
+    "workers": [
+      {
+        "host": "127.0.0.1",
+        "port": 9000,
+        "slot": "hot-a",
+        "gpu_uuid": "GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca"
+      },
+      {
+        "host": "127.0.0.1",
+        "port": 9001,
+        "slot": "hot-b",
+        "gpu_uuid": "GPU-653b223f-f36b-2fcc-bdc9-78adcbab14eb"
+      }
+    ],
+    "preload_profiles": {
+      "hot-a": "qwen2_5_omni_awq",
+      "hot-b": "gemma4_12b_awq"
+    },
+    "active_requests": {
+      "hot-a": 0,
+      "hot-b": 0
+    },
+    "models": [
+      {
+        "id": "qwen2.5-omni-awq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "qwen2.5-omni",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "qwen",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4-12b-awq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma-4-12b-awq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4-12b",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma-4-12b",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gamma4-12b",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "mattbucci/gemma-4-12B-AWQ",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4-e2b-w4a16",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma-4-e2b-w4a16",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4-e2b-gptq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma-4-e2b-gptq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4-e2b-awq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma-4-e2b-awq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4-e2b",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma-4-e2b",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "Vishva007/gemma-4-E2B-it-W4A16-AutoRound-GPTQ",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4-e4b-w4a16",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma-4-e4b-w4a16",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4-e4b-gptq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma-4-e4b-gptq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4-e4b-awq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma-4-e4b-awq",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma4-e4b",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "gemma-4-e4b",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      },
+      {
+        "id": "ciocan/gemma-4-E4B-it-W4A16",
+        "object": "model",
+        "owned_by": "vllm-swapper"
+      }
+    ]
+  }
+}

@@ -1,0 +1,5 @@
+slot: hot-a
+profile: qwen2_5_omni_awq
+port: 9000
+gpu_uuid: GPU-019676ed-23c9-ad9a-20cb-7bdc13ac61ca
+host: 127.0.0.1
