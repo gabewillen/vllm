@@ -263,6 +263,8 @@ class RejectionSampler:
             input_batch.idx_mapping_np
         )
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
+        effort_state = self.sampler.effort_state
+        effort_state.begin(input_batch.idx_mapping_np)
         sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
             logits,
             input_batch,
@@ -281,10 +283,19 @@ class RejectionSampler:
             self.sampler.req_states.prefill_len.gpu,
         )
 
+        effort_signals = effort_state.finish(input_batch.cu_num_logits, num_sampled)
+        effort_flags = (
+            effort_state.batch_flags(input_batch.idx_mapping_np)
+            if effort_signals is not None
+            else None
+        )
+
         return SamplerOutput(
             sampled_token_ids=sampled,
             logprobs_tensors=logprobs_tensors,
             num_nans=num_nans,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+            effort_signals=effort_signals,
+            effort_flags=effort_flags,
         )

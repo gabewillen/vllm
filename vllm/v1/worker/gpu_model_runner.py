@@ -187,6 +187,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+from vllm.v1.sample.effort_signals import signals_to_dict
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -301,6 +302,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         routed_experts: RoutedExpertsTensors | None = None,
         check_ep_fault: bool = False,
         num_nans: torch.Tensor | None = None,
+        effort_signals: torch.Tensor | None = None,
+        effort_flags: np.ndarray | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -316,6 +319,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._logprobs_tensors = logprobs_tensors
         self._routed_experts = routed_experts
         self._num_nans = num_nans
+        self._effort_signals = effort_signals
+        self._effort_flags = effort_flags
         self._has_fault: torch.Tensor | None = None
 
         # Initiate the copy on a separate stream, but do not synchronize it.
@@ -338,6 +343,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             self._num_nans_cpu = (
                 self._num_nans.to("cpu", non_blocking=True)
                 if self._num_nans is not None
+                else None
+            )
+            self._effort_signals_cpu = (
+                self._effort_signals.to("cpu", non_blocking=True)
+                if self._effort_signals is not None
                 else None
             )
             if check_ep_fault:
@@ -386,6 +396,12 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             if envs.VLLM_RAISE_ON_LOGIT_NANS:
                 raise_if_nan_logits(output.num_nans_in_logits)
         del self._num_nans
+
+        if self._effort_signals_cpu is not None:
+            output.effort_signals = signals_to_dict(
+                output.req_ids, self._effort_signals_cpu.numpy(), self._effort_flags
+            )
+        del self._effort_signals
 
         if self._has_fault is not None and self._has_fault.item():
             mask = get_ep_all2all_manager().query_active_mask()
@@ -949,6 +965,13 @@ class GPUModelRunner(
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
             dtype=torch.int64,
+            device="cpu",
+            pin_memory=PIN_MEMORY,
+        )
+        # Sync-scheduling D2H target for per-request effort signals.
+        self.effort_signals_pinned_cpu = torch.empty(
+            (self.max_num_reqs, 3),
+            dtype=torch.float32,
             device="cpu",
             pin_memory=PIN_MEMORY,
         )
@@ -3805,6 +3828,7 @@ class GPUModelRunner(
         list[str],
         dict[str, int],
         list[int],
+        dict[str, tuple[float, float, int]] | None,
     ]:
         num_nans: torch.Tensor | None = None
         num_nans_in_logits: dict[str, int] = {}
@@ -3833,6 +3857,8 @@ class GPUModelRunner(
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
+        effort_signals_gpu = sampler_output.effort_signals
+        effort_signals: dict[str, tuple[float, float, int]] | None = None
         invalid_req_indices = []
         logprobs_lists = None
         if not self.use_async_scheduling:
@@ -3849,6 +3875,12 @@ class GPUModelRunner(
                 self.routed_experts_slot_mapping_cpu[:total].copy_(
                     self.routed_experts_slot_mapping_device[:total],
                     non_blocking=True,
+                )
+            if effort_signals_gpu is not None:
+                # Same coverage as the routed-experts D2H above: ``_to_list``
+                # synchronizes the transfer event after this enqueue.
+                self.effort_signals_pinned_cpu[:num_reqs].copy_(
+                    effort_signals_gpu, non_blocking=True
                 )
             with gpu_sync_allowed():
                 # Get the valid generated tokens.
@@ -3871,6 +3903,12 @@ class GPUModelRunner(
                             discard_sampled_tokens_req_indices,
                             logprobs_tensors=logprobs_tensors,
                         )
+                    )
+                if effort_signals_gpu is not None:
+                    effort_signals = signals_to_dict(
+                        req_ids_output_copy,
+                        self.effort_signals_pinned_cpu[:num_reqs].numpy(),
+                        sampler_output.effort_flags,
                     )
         else:
             valid_sampled_token_ids = []
@@ -3938,6 +3976,7 @@ class GPUModelRunner(
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
+            effort_signals,
         )
 
     @contextmanager
@@ -4850,6 +4889,7 @@ class GPUModelRunner(
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
+                effort_signals,
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
@@ -4905,6 +4945,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                effort_signals=effort_signals,
             )
 
         if not self.use_async_scheduling:
@@ -4947,6 +4988,8 @@ class GPUModelRunner(
                 routed_experts=routed_experts_snapshot,
                 check_ep_fault=self.check_ep_fault,
                 num_nans=num_nans_device,
+                effort_signals=sampler_output.effort_signals,
+                effort_flags=sampler_output.effort_flags,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
