@@ -10,6 +10,7 @@ from typing import Any, Final, cast
 
 from fastapi import Request
 
+from vllm.config.reasoning import DynamicEffortConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -23,6 +24,10 @@ from vllm.entrypoints.generate.base.serving import (
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
+from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+    DynamicEffortError,
+    apply_dynamic_effort,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -34,6 +39,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    EffortInfo,
 )
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
@@ -175,6 +181,11 @@ class OpenAIServingChat(GenerateBaseServing):
         self.supports_code_interpreter = False
         self.python_tool = None
 
+    def _dynamic_effort_config(self) -> DynamicEffortConfig | None:
+        vllm_config = getattr(self.engine_client, "vllm_config", None)
+        reasoning_config = getattr(vllm_config, "reasoning_config", None)
+        return getattr(reasoning_config, "dynamic_effort", None)
+
     def _effective_chat_template_kwargs(
         self, request: ChatCompletionRequest
     ) -> dict[str, Any]:
@@ -238,6 +249,11 @@ class OpenAIServingChat(GenerateBaseServing):
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
+        if request.reasoning_effort == "dynamic":
+            try:
+                apply_dynamic_effort(request, self._dynamic_effort_config())
+            except DynamicEffortError as e:
+                return self.create_error_response(str(e))
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
         parser: Parser | None = None
         if self.parser_cls is not None:
@@ -801,6 +817,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     usage=final_usage,
                     system_fingerprint=self.system_fingerprint,
                     metrics=stream_per_request_metrics,
+                    effort=EffortInfo.from_report(
+                        last_res.effort if last_res is not None else None
+                    ),
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=True, exclude_none=True
@@ -1098,6 +1117,7 @@ class OpenAIServingChat(GenerateBaseServing):
             kv_transfer_params=final_res.kv_transfer_params,
             ec_transfer_params=final_res.ec_transfer_params,
             metrics=per_request_metrics,
+            effort=EffortInfo.from_report(final_res.effort),
         )
 
         # Log complete response if output logging is enabled
