@@ -14,6 +14,10 @@
 #     memory-bound decode batch doubles the weight reads.
 #   attention-backend TRITON_ATTN: same speed as FlashInfer here and no
 #     workspace reservation, so a larger KV pool.
+#   additional-config lm_head_dtype fp8 + lm_head_free_bf16 (venv patch 0008):
+#     logits from a per-channel fp8 lm_head copy (no drafter here, so the bf16
+#     shard is released: +2% KV pool); c32/c64 +2-3%; logprob agreement within
+#     the noise floor; 200k needle OK.
 #   mamba-ssm-cache-dtype float16: the checkpoint asks for a float32 GDN
 #     recurrent state; at 128 concurrent that state's read+write (786 KB per
 #     seq per layer, 48 layers) is ~9.7 GB per step - a third of the step, at
@@ -60,6 +64,7 @@ reasoning-parser: qwen3
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
+additional-config: '{"lm_head_dtype": "fp8", "lm_head_free_bf16": true}'
 port: 8012
 middleware: ["vllm_keepalive.KeepAliveMiddleware"]
 # Tiered KV offload (native TieringOffloadingSpec): 24 GiB pinned-RAM staging
