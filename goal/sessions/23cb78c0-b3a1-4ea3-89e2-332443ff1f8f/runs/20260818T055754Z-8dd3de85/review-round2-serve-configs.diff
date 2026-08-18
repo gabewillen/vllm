@@ -1,0 +1,1918 @@
+diff --git a/serve-configs/middleware/vllm_keepalive.py b/serve-configs/middleware/vllm_keepalive.py
+index 97772ee..31ab65b 100644
+--- a/serve-configs/middleware/vllm_keepalive.py
++++ b/serve-configs/middleware/vllm_keepalive.py
+@@ -10,12 +10,19 @@ works, in a way every client parser ignores:
+ * text/event-stream responses: SSE comment lines (``: keepalive``) whenever
+   no bytes have been sent for ``ping_interval`` seconds. Comment lines are
+   ignored by the SSE spec and by the OpenAI SDKs' decoders.
+-* JSON (non-streaming) responses: if the app has not started its response
+-  after ``json_commit_after`` seconds, commit ``200 application/json``
+-  early and send whitespace pings; JSON parsers skip leading whitespace.
+-  Only the status line is lost - if the app later fails, the client gets a
+-  200 with the error JSON body instead of a 4xx/5xx (logged as a warning).
+-  This is strictly better than the certain 524.
++* Responses the app has not started after ``json_commit_after`` seconds are
++  committed early as ``200``: ``text/event-stream`` with comment pings when
++  the request body has ``"stream": true`` (vLLM only sends the SSE headers
++  with the first token, so a queued streaming request looks idle too), else
++  ``application/json`` with whitespace pings (JSON parsers skip leading
++  whitespace). Only the status line is lost - if the app later fails, the
++  client gets a 200 with the error body instead of a 4xx/5xx (logged as a
++  warning; after an SSE commit the JSON error body is wrapped as one
++  ``data:`` event so the stream stays well-formed). This is strictly better
++  than the certain 524.
++* Telemetry: OTEL counters ``vllm.keepalive.pings`` /
++  ``vllm.keepalive.early_commits`` (label content_type = sse|json) and the
++  same as prometheus ``vllm_keepalive_*_total`` on vLLM's ``/metrics``.
+ 
+ Enable with ``--middleware vllm_keepalive.KeepAliveMiddleware`` and put this
+ directory on PYTHONPATH. Env overrides: VLLM_KEEPALIVE_PING_INTERVAL (s),
+@@ -23,20 +30,68 @@ VLLM_KEEPALIVE_JSON_COMMIT_AFTER (s), VLLM_KEEPALIVE_PATH_PREFIX.
+ """
+ 
+ import asyncio
++import json
+ import logging
+ import os
+ import time
++from collections.abc import Awaitable, Callable, MutableMapping
++from typing import Any
++
++from opentelemetry import metrics as otel_metrics
++from prometheus_client import Counter
++
++Scope = MutableMapping[str, Any]
++Message = MutableMapping[str, Any]
++Receive = Callable[[], Awaitable[Message]]
++Send = Callable[[Message], Awaitable[None]]
++ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
+ 
+ logger = logging.getLogger("vllm.keepalive")
+ 
+ _SSE_PING = b": keepalive\n\n"
+ _JSON_PING = b"\n"
++# Bytes of request body kept while looking for "stream": true; larger bodies
++# (a full 262k-token chat is ~2 MiB) fall back to the JSON commit path.
++_MAX_PEEK_BYTES = 8 * 1024 * 1024
++
++# Telemetry: OTEL counters (exported when the operator wires an OTEL metrics
++# SDK) mirrored to the prometheus registry vLLM already serves at /metrics.
++# Labels are bounded: content_type in {sse, json}.
++_meter = otel_metrics.get_meter("vllm.keepalive")
++_otel_pings = _meter.create_counter(
++    "vllm.keepalive.pings", description="keep-alive bytes sent while idle"
++)
++_otel_early_commits = _meter.create_counter(
++    "vllm.keepalive.early_commits",
++    description="responses committed before the app started them",
++)
++_prom_pings = Counter(
++    "vllm_keepalive_pings_total", "keep-alive pings sent", ["content_type"]
++)
++_prom_early_commits = Counter(
++    "vllm_keepalive_early_commits_total",
++    "responses committed before the app started them",
++    ["content_type"],
++)
++
++
++def _body_requests_stream(body: bytes) -> bool:
++    """True when a JSON request body asks for a streaming response."""
++    if len(body) > _MAX_PEEK_BYTES:
++        logger.debug("keepalive: body peek skipped (%d bytes)", len(body))
++        return False
++    try:
++        return bool(json.loads(body).get("stream"))
++    except (ValueError, AttributeError):
++        # Not JSON, or JSON that is not an object: no streaming request.
++        logger.debug("keepalive: body peek found no stream flag")
++        return False
+ 
+ 
+ class KeepAliveMiddleware:
+     def __init__(
+         self,
+-        app,
++        app: ASGIApp,
+         ping_interval: float | None = None,
+         json_commit_after: float | None = None,
+         path_prefix: str | None = None,
+@@ -53,7 +108,7 @@ class KeepAliveMiddleware:
+             "VLLM_KEEPALIVE_PATH_PREFIX", "/v1/"
+         )
+ 
+-    async def __call__(self, scope, receive, send):
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+         if (
+             scope["type"] != "http"
+             or scope.get("method") != "POST"
+@@ -65,11 +120,17 @@ class KeepAliveMiddleware:
+ 
+ 
+ class _KeepAliveResponder:
+-    def __init__(self, cfg: KeepAliveMiddleware, scope, receive, send) -> None:
++    def __init__(
++        self, cfg: KeepAliveMiddleware, scope: Scope, receive: Receive, send: Send
++    ) -> None:
+         self.cfg = cfg
+         self.scope = scope
+         self.receive = receive
+         self.send = send
++        self._body = bytearray()
++        self.expect_sse = False  # request asked for a streaming response
++        self.wrap_body_as_sse = False  # app sent non-SSE after an SSE commit
++        self._sse_wrap_started = False
+         self.lock = asyncio.Lock()
+         self.started = False  # response.start delivered to the client
+         self.early_committed = False  # we sent the start ourselves
+@@ -80,10 +141,23 @@ class _KeepAliveResponder:
+         self.pinger: asyncio.Task | None = None
+         self.n_pings = 0
+ 
++    async def _receive(self) -> Message:
++        # Peek at the request body: a streaming request must be committed as
++        # SSE (not JSON) if the app is slow to start its response.
++        message = await self.receive()
++        if message["type"] != "http.request":
++            return message
++        if len(self._body) <= _MAX_PEEK_BYTES:
++            self._body += message.get("body", b"")
++        if not message.get("more_body", False):
++            self.expect_sse = _body_requests_stream(bytes(self._body))
++            self._body = bytearray()
++        return message
++
+     async def run(self) -> None:
+         self.pinger = asyncio.create_task(self._ping_loop())
+         try:
+-            await self.cfg.app(self.scope, self.receive, self._send)
++            await self.cfg.app(self.scope, self._receive, self._send)
+         finally:
+             self.finished = True
+             self.pinger.cancel()
+@@ -96,7 +170,7 @@ class _KeepAliveResponder:
+                     time.monotonic() - self.t0,
+                 )
+ 
+-    async def _send(self, message) -> None:
++    async def _send(self, message: Message) -> None:
+         async with self.lock:
+             if message["type"] == "http.response.start":
+                 headers = message.get("headers") or []
+@@ -106,7 +180,14 @@ class _KeepAliveResponder:
+                         ctype = v.lower()
+                         break
+                 if self.early_committed:
+-                    # We already committed 200/json; only the body can follow.
++                    # We already committed 200 (json or SSE); only the body
++                    # can follow. A non-SSE body after an SSE commit is
++                    # wrapped as one SSE data event so SSE parsers still see
++                    # a well-formed stream (the status line is lost either
++                    # way; logged for the operator).
++                    self.wrap_body_as_sse = self.is_sse and not ctype.startswith(
++                        b"text/event-stream"
++                    )
+                     if message.get("status", 200) >= 300:
+                         logger.warning(
+                             "keepalive: app responded %s after early commit "
+@@ -121,6 +202,15 @@ class _KeepAliveResponder:
+                 self.last_bytes_at = time.monotonic()
+                 return
+             if message["type"] == "http.response.body":
++                if self.wrap_body_as_sse:
++                    message = dict(message)
++                    body = bytes(message.get("body", b""))
++                    if not self._sse_wrap_started:
++                        body = b"data: " + body
++                        self._sse_wrap_started = True
++                    if not message.get("more_body", False):
++                        body += b"\n\n"
++                    message["body"] = body
+                 await self.send(message)
+                 self.last_bytes_at = time.monotonic()
+                 if not message.get("more_body", False):
+@@ -140,13 +230,18 @@ class _KeepAliveResponder:
+                     if not self.started:
+                         if now - self.t0 < self.cfg.json_commit_after:
+                             continue
+-                        # No response yet: assume JSON, commit early.
++                        # No response yet: commit early with the content type
++                        # the client asked for (SSE for stream=true, else JSON).
++                        ctype = (
++                            b"text/event-stream" if self.expect_sse
++                            else b"application/json"
++                        )
+                         await self.send(
+                             {
+                                 "type": "http.response.start",
+                                 "status": 200,
+                                 "headers": [
+-                                    (b"content-type", b"application/json"),
++                                    (b"content-type", ctype),
+                                     (b"cache-control", b"no-cache"),
+                                     (b"x-vllm-keepalive", b"early-commit"),
+                                 ],
+@@ -154,8 +249,11 @@ class _KeepAliveResponder:
+                         )
+                         self.started = True
+                         self.early_committed = True
+-                        self.is_sse = False
+-                        await self._ping(_JSON_PING)
++                        self.is_sse = self.expect_sse
++                        label = "sse" if self.is_sse else "json"
++                        _otel_early_commits.add(1, {"content_type": label})
++                        _prom_early_commits.labels(content_type=label).inc()
++                        await self._ping(_SSE_PING if self.is_sse else _JSON_PING)
+                         continue
+                     if now - self.last_bytes_at >= interval:
+                         await self._ping(_SSE_PING if self.is_sse else _JSON_PING)
+@@ -170,3 +268,6 @@ class _KeepAliveResponder:
+         )
+         self.last_bytes_at = time.monotonic()
+         self.n_pings += 1
++        label = "sse" if self.is_sse else "json"
++        _otel_pings.add(1, {"content_type": label})
++        _prom_pings.labels(content_type=label).inc()
+diff --git a/serve-configs/patches/0005-spec-decode-adaptive-draft-length-quantized-draft-lm-head-v2-runner.patch b/serve-configs/patches/0005-spec-decode-adaptive-draft-length-quantized-draft-lm-head-v2-runner.patch
+new file mode 100644
+index 0000000..f815752
+--- /dev/null
++++ b/serve-configs/patches/0005-spec-decode-adaptive-draft-length-quantized-draft-lm-head-v2-runner.patch
+@@ -0,0 +1,850 @@
++--- a/vllm/config/vllm.py
+++++ b/vllm/config/vllm.py
++@@ -910,7 +910,10 @@
++         speculative_config = self.speculative_config
++         if (
++             speculative_config is None
++-            or not speculative_config.uses_dynamic_speculative_decoding()
+++            or not (
+++                speculative_config.uses_dynamic_speculative_decoding()
+++                or speculative_config.adaptive_draft_length
+++            )
++             or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
++             or self.use_v2_model_runner
++         ):
++@@ -927,11 +930,18 @@
++ 
++     def _maybe_disable_dynamic_sd_for_data_parallel(self) -> None:
++         speculative_config = self.speculative_config
++-        if (
++-            speculative_config is None
++-            or not speculative_config.uses_dynamic_speculative_decoding()
++-            or self.parallel_config.data_parallel_size <= 1
++-        ):
+++        if speculative_config is None or self.parallel_config.data_parallel_size <= 1:
+++            return
+++        if speculative_config.adaptive_draft_length:
+++            # Same divergence hazard as the batch-size schedule: each DP rank's
+++            # scheduler would pick its own draft length.
+++            logger.warning_once(
+++                "Adaptive draft length is not supported with data parallelism "
+++                "(ranks would draft different lengths); disabling "
+++                "adaptive_draft_length."
+++            )
+++            speculative_config.adaptive_draft_length = False
+++        if not speculative_config.uses_dynamic_speculative_decoding():
++             return
++ 
++         logger.warning_once(
++--- a/vllm/config/speculative.py
+++++ b/vllm/config/speculative.py
++@@ -185,6 +185,27 @@
++     inclusive batch-size range.
++     """
++ 
+++    draft_lm_head_dtype: Literal["auto", "fp8", "int4"] = "auto"
+++    """Storage dtype of the drafter's copy of a *shared* target lm_head (MTP /
+++    EAGLE without own head). ``fp8`` keeps a per-channel FP8 copy, ``int4`` a
+++    group-128 Marlin W4A16 copy, for the draft argmax only; the target head is
+++    untouched. Cuts draft-step memory traffic on large-vocab models."""
+++    adaptive_draft_length: bool = False
+++    """Adapt the number of draft tokens per step to recent acceptance. The
+++    scheduler keeps a per-request EMA of accepted draft tokens and drafts
+++    ``ceil(max_ema + adaptive_draft_margin)`` tokens for the batch (capped at
+++    ``num_speculative_tokens`` / the batch-size schedule). Cheap drafters that
+++    are memory-bound per step (e.g. MTP heads reading a large shared LM head)
+++    stop paying for draft positions that are almost never accepted."""
+++    adaptive_draft_ema_alpha: float = Field(default=0.7, ge=0.0, lt=1.0)
+++    """Weight of the previous EMA value when updating the per-request accepted
+++    draft-token average (higher = smoother, slower to react)."""
+++    adaptive_draft_margin: float = Field(default=2.0, ge=0.0)
+++    """Extra draft tokens beyond the EMA so the schedule can grow again when
+++    acceptance improves."""
+++    adaptive_draft_min_tokens: int = Field(default=1, ge=1)
+++    """Lower bound on the adaptive draft length."""
+++
++     # params generated in the post-init stage
++     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
++     """The configuration of the draft model initialized internal."""
++@@ -1362,6 +1383,19 @@
++                 f"than zero ({self.num_speculative_tokens})."
++             )
++ 
+++        if self.adaptive_draft_length:
+++            if self.num_speculative_tokens < 2:
+++                raise ValueError(
+++                    "adaptive_draft_length needs num_speculative_tokens >= 2 "
+++                    f"(got {self.num_speculative_tokens})."
+++                )
+++            if self.adaptive_draft_min_tokens > self.num_speculative_tokens:
+++                raise ValueError(
+++                    "adaptive_draft_min_tokens "
+++                    f"({self.adaptive_draft_min_tokens}) must not exceed "
+++                    f"num_speculative_tokens ({self.num_speculative_tokens})."
+++                )
+++
++         if self.rejection_sample_method == "synthetic":
++             # Consolidate to per-position rates
++             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
++--- a/vllm/v1/core/sched/scheduler.py
+++++ b/vllm/v1/core/sched/scheduler.py
++@@ -1,6 +1,7 @@
++ # SPDX-License-Identifier: Apache-2.0
++ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ import itertools
+++import math
++ import time
++ from collections import defaultdict, deque
++ from collections.abc import Iterable
++@@ -66,6 +67,31 @@
++ logger = init_logger(__name__)
++ 
++ 
+++def adaptive_num_spec_tokens(
+++    emas: list[float | None],
+++    max_tokens: int,
+++    min_tokens: int,
+++    margin: float,
+++) -> int:
+++    """Draft length for a batch from its requests' accepted-token EMAs.
+++
+++    A request without history (fresh decode) keeps the full length so its
+++    first steps are not starved; otherwise the batch drafts
+++    ``ceil(max_ema + margin)`` clamped to ``[min_tokens, max_tokens]``.
+++    """
+++    if not emas or any(ema is None for ema in emas):
+++        return max_tokens
+++    num = math.ceil(max(ema for ema in emas if ema is not None) + margin)
+++    return max(min_tokens, min(max_tokens, num))
+++
+++
+++def update_accepted_ema(prev: float | None, num_accepted: int, alpha: float) -> float:
+++    """EMA of accepted draft tokens; the first observation seeds it."""
+++    if prev is None:
+++        return float(num_accepted)
+++    return alpha * prev + (1.0 - alpha) * num_accepted
+++
+++
++ class Scheduler(SchedulerInterface):
++     def __init__(
++         self,
++@@ -255,6 +281,13 @@
++         # reserve between a chunk boundary and the prefill end.
++         self.num_prefill_lookahead = 0
++         self.dynamic_sd_lookup: list[int] | None = None
+++        # Adaptive draft length: per-request EMA of accepted draft tokens.
+++        self.adaptive_draft = (
+++            speculative_config is not None
+++            and speculative_config.adaptive_draft_length
+++            and self.num_spec_tokens > 1
+++        )
+++        self._accepted_ema: dict[str, float] = {}
++         if speculative_config is not None:
++             if speculative_config.num_speculative_tokens_per_batch_size:
++                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
++@@ -1257,6 +1290,11 @@
++             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
++                 len(num_scheduled_tokens)
++             ]
+++        if self.adaptive_draft and num_spec_tokens_to_schedule > 1:
+++            num_spec_tokens_to_schedule = min(
+++                num_spec_tokens_to_schedule,
+++                self._adaptive_num_spec_tokens(scheduled_running_reqs),
+++            )
++ 
++         scheduled_encoder_input_stats = None
++         if (
++@@ -1837,6 +1875,8 @@
++                 num_sampled = self.num_sampled_tokens_per_step
++                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
++                 num_rejected = num_draft_tokens - num_accepted
+++                if self.adaptive_draft:
+++                    self._update_accepted_ema(req_id=req_id, num_accepted=num_accepted)
++                 # Rejections roll back num_computed_tokens (and, under async
++                 # scheduling, num_output_placeholders, which covers the spec
++                 # tokens). A stale rejection count predates the preemption
++@@ -2385,10 +2425,30 @@
++ 
++         return valid_requests
++ 
+++    def _adaptive_num_spec_tokens(self, running_reqs: list[Request]) -> int:
+++        """Draft length for this step from the per-request acceptance EMAs."""
+++        assert self.vllm_config.speculative_config is not None
+++        cfg = self.vllm_config.speculative_config
+++        return adaptive_num_spec_tokens(
+++            emas=[self._accepted_ema.get(req.request_id) for req in running_reqs],
+++            max_tokens=self.num_spec_tokens,
+++            min_tokens=cfg.adaptive_draft_min_tokens,
+++            margin=cfg.adaptive_draft_margin,
+++        )
+++
+++    def _update_accepted_ema(self, req_id: str, num_accepted: int) -> None:
+++        assert self.vllm_config.speculative_config is not None
+++        self._accepted_ema[req_id] = update_accepted_ema(
+++            prev=self._accepted_ema.get(req_id),
+++            num_accepted=num_accepted,
+++            alpha=self.vllm_config.speculative_config.adaptive_draft_ema_alpha,
+++        )
+++
++     def _free_request(
++         self, request: Request, delay_free_blocks: bool = False
++     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
++         assert request.is_finished()
+++        self._accepted_ema.pop(request.request_id, None)
++ 
++         self._inflight_prefills.discard(request)
++         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
++--- a/vllm/v1/spec_decode/draft_lm_head.py
+++++ b/vllm/v1/spec_decode/draft_lm_head.py
++@@ -0,0 +1,196 @@
+++# SPDX-License-Identifier: Apache-2.0
+++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+++"""Quantized copies of a shared target lm_head for speculative drafters.
+++
+++MTP / EAGLE drafters that share the target's lm_head re-read the whole
+++(vocab / tp) x hidden shard on every draft step for one argmax. On
+++memory-bound GPUs that read dominates the draft step, so the drafter gets
+++its own fp8 (per-channel) or int4 (Marlin, group-128) copy. The target still
+++verifies with its unquantized head, so the output distribution is unchanged.
+++"""
+++
+++import torch
+++import torch.nn as nn
+++
+++from vllm import _custom_ops as ops
+++from vllm.logger import init_logger
+++from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+++    apply_gptq_marlin_linear,
+++    check_marlin_supported,
+++    marlin_make_workspace_new,
+++    marlin_permute_scales,
+++)
+++from vllm.model_executor.layers.quantization.utils.quant_utils import (
+++    get_pack_factor,
+++    quantize_weights,
+++)
+++from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+++    cutlass_fp8_supported,
+++)
+++from vllm.scalar_type import scalar_types
+++
+++logger = init_logger(__name__)
+++
+++MARLIN_GROUP_SIZE = 128
+++MARLIN_WEIGHT_TYPE = scalar_types.uint4b8
+++
+++
+++class _Fp8DraftHeadMethod:
+++    """quant_method shim: dynamic per-token FP8 activations x per-channel FP8
+++    weights through the CUTLASS scaled_mm (SM89+)."""
+++
+++    def apply(
+++        self,
+++        layer: "QuantizedDraftLMHead",
+++        x: torch.Tensor,
+++        bias: torch.Tensor | None = None,
+++    ) -> torch.Tensor:
+++        x2d = x.reshape(-1, x.shape[-1])
+++        x_q, x_s = ops.scaled_fp8_quant(x2d, use_per_token_if_dynamic=True)
+++        out = ops.cutlass_scaled_mm(
+++            x_q,
+++            layer.weight_fp8_t,
+++            scale_a=x_s,
+++            scale_b=layer.weight_scale,
+++            out_dtype=x.dtype,
+++            bias=bias,
+++        )
+++        return out.view(*x.shape[:-1], out.shape[-1])
+++
+++
+++class _Int4DraftHeadMethod:
+++    """quant_method shim: bf16 activations x group-128 INT4 weights through the
+++    Marlin W4A16 kernel."""
+++
+++    def apply(
+++        self,
+++        layer: "QuantizedDraftLMHead",
+++        x: torch.Tensor,
+++        bias: torch.Tensor | None = None,
+++    ) -> torch.Tensor:
+++        return apply_gptq_marlin_linear(
+++            input=x,
+++            weight=layer.marlin_qweight,
+++            weight_scale=layer.marlin_scales,
+++            weight_zp=layer.marlin_zp,
+++            g_idx=layer.marlin_g_idx,
+++            g_idx_sort_indices=layer.marlin_sort_indices,
+++            workspace=layer.marlin_workspace,
+++            wtype=MARLIN_WEIGHT_TYPE,
+++            output_size_per_partition=layer.output_size,
+++            input_size_per_partition=layer.input_size,
+++            is_k_full=True,
+++            bias=bias,
+++        )
+++
+++
+++def _pack_rows_gptq(q_w: torch.Tensor, num_bits: int) -> torch.Tensor:
+++    """Pack unpacked [K, N] integer weights into GPTQ int32 rows [K/pack, N]."""
+++    pack_factor = get_pack_factor(num_bits)
+++    size_k, size_n = q_w.shape
+++    if size_k % pack_factor:
+++        raise ValueError(f"K={size_k} is not a multiple of {pack_factor}")
+++    q_w = q_w.to(torch.int32)
+++    packed = torch.zeros(
+++        (size_k // pack_factor, size_n), dtype=torch.int32, device=q_w.device
+++    )
+++    for i in range(pack_factor):
+++        packed |= q_w[i::pack_factor, :] << (num_bits * i)
+++    return packed
+++
+++
+++class QuantizedDraftLMHead(nn.Module):
+++    """Quantized (fp8 per-channel or int4 group-128) copy of the target lm_head
+++    shard, used only by the drafter. Everything except the weights delegates
+++    to the target head, so vocab-parallel argmax and logits code work
+++    unchanged."""
+++
+++    def __init__(self, target_head: nn.Module, dtype: str = "fp8"):
+++        super().__init__()
+++        object.__setattr__(self, "_target_head", target_head)
+++        w = target_head.weight.data
+++        self.output_size, self.input_size = w.shape
+++        if dtype == "fp8":
+++            if not cutlass_fp8_supported():
+++                raise ValueError(
+++                    "draft_lm_head_dtype='fp8' needs CUTLASS FP8 scaled_mm "
+++                    "support (SM89+) on this device."
+++                )
+++            self._init_fp8(w)
+++            self.quant_method = _Fp8DraftHeadMethod()
+++        elif dtype == "int4":
+++            if not check_marlin_supported(
+++                quant_type=MARLIN_WEIGHT_TYPE, group_size=MARLIN_GROUP_SIZE
+++            ):
+++                raise ValueError(
+++                    "draft_lm_head_dtype='int4' needs Marlin uint4b8 group-128 "
+++                    "support on this device."
+++                )
+++            self._init_int4(w)
+++            self.quant_method = _Int4DraftHeadMethod()
+++        else:
+++            raise ValueError(f"unsupported draft_lm_head_dtype {dtype!r}")
+++
+++    def _init_fp8(self, w: torch.Tensor) -> None:
+++        finfo = torch.finfo(torch.float8_e4m3fn)
+++        amax = w.abs().amax(dim=1, keepdim=True).float().clamp(min=1e-12)
+++        weight_scale = amax / finfo.max
+++        w_fp8 = (
+++            (w.float() / weight_scale)
+++            .clamp(finfo.min, finfo.max)
+++            .to(torch.float8_e4m3fn)
+++        )
+++        # cutlass_scaled_mm wants B as [K, N] column-major = [N, K].t()
+++        self.weight_fp8_t = w_fp8.contiguous().t()
+++        self.weight_scale = weight_scale.contiguous()
+++
+++    def _init_int4(self, w: torch.Tensor) -> None:
+++        # Round-to-nearest symmetric group quantization ([K, N] layout), then
+++        # the same GPTQ pack -> Marlin repack path the GPTQ-Marlin loader uses.
+++        size_n, size_k = w.shape
+++        _, q_w, scales, _ = quantize_weights(
+++            w=w.t().contiguous().float(),
+++            quant_type=MARLIN_WEIGHT_TYPE,
+++            group_size=MARLIN_GROUP_SIZE,
+++        )
+++        empty = torch.empty(0, dtype=torch.int32, device=w.device)
+++        self.marlin_qweight = ops.gptq_marlin_repack(
+++            b_q_weight=_pack_rows_gptq(q_w, MARLIN_WEIGHT_TYPE.size_bits),
+++            perm=empty,
+++            size_k=size_k,
+++            size_n=size_n,
+++            num_bits=MARLIN_WEIGHT_TYPE.size_bits,
+++        )
+++        self.marlin_scales = marlin_permute_scales(
+++            s=scales.to(w.dtype),
+++            size_k=size_k,
+++            size_n=size_n,
+++            group_size=MARLIN_GROUP_SIZE,
+++        )
+++        self.marlin_zp = empty
+++        self.marlin_g_idx = empty
+++        self.marlin_sort_indices = empty
+++        self.marlin_workspace = marlin_make_workspace_new(w.device)
+++
+++    def __getattr__(self, name: str):
+++        try:
+++            return super().__getattr__(name)
+++        except AttributeError:
+++            return getattr(object.__getattribute__(self, "_target_head"), name)
+++
+++
+++def maybe_quantize_shared_lm_head(
+++    draft_model: nn.Module, target_lm_head: nn.Module, dtype: str
+++) -> None:
+++    """Replace ``draft_model.lm_head`` (shared with the target) by a quantized
+++    copy when ``dtype`` asks for one. No-op for ``auto``."""
+++    if dtype == "auto":
+++        return
+++    draft_model.lm_head = QuantizedDraftLMHead(target_head=target_lm_head, dtype=dtype)
+++    logger.info(
+++        "Draft lm_head: %s copy of the target lm_head shard %s for the "
+++        "drafter; the target keeps %s.",
+++        dtype,
+++        tuple(target_lm_head.weight.shape),
+++        target_lm_head.weight.dtype,
+++    )
++--- a/vllm/v1/spec_decode/llm_base_proposer.py
+++++ b/vllm/v1/spec_decode/llm_base_proposer.py
++@@ -49,6 +49,7 @@
++     sample_with_exponential_noise,
++ )
++ from vllm.v1.sample.sampler import _SAMPLING_EPS
+++from vllm.v1.spec_decode.draft_lm_head import maybe_quantize_shared_lm_head
++ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
++ from vllm.v1.spec_decode.utils import (
++     PADDING_SLOT_ID,
++@@ -1570,6 +1571,11 @@
++             if hasattr(self.model, "lm_head"):
++                 del self.model.lm_head
++             self.model.lm_head = target_language_model.lm_head
+++            maybe_quantize_shared_lm_head(
+++                draft_model=self.model,
+++                target_lm_head=target_language_model.lm_head,
+++                dtype=self.speculative_config.draft_lm_head_dtype,
+++            )
++ 
++             # MTP models call compute_logits via shared_head.head (a
++             # ParallelLMHead inside each MTP layer), not self.model.lm_head.
++--- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+++++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
++@@ -7,6 +7,8 @@
++ from vllm.distributed.parallel_state import get_pp_group
++ from vllm.lora.layers.base import BaseLayerWithLoRA
++ from vllm.model_executor.model_loader import get_model
+++from vllm.v1.spec_decode.draft_lm_head import maybe_quantize_shared_lm_head
+++
++ 
++ 
++ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
++@@ -88,6 +90,13 @@
++         if draft_lm_head is not None:
++             del eagle_model.lm_head
++         eagle_model.lm_head = target_lm_head
+++        spec_cfg = vllm_config.speculative_config
+++        if spec_cfg is not None:
+++            maybe_quantize_shared_lm_head(
+++                draft_model=eagle_model,
+++                target_lm_head=target_lm_head,
+++                dtype=spec_cfg.draft_lm_head_dtype,
+++            )
++ 
++         # MTP layers route logits through layer.shared_head.head, not
++         # eagle_model.lm_head, so the per-layer copies need fixing up too.
++--- a/vllm/v1/worker/gpu/cudagraph_utils.py
+++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
++@@ -15,7 +15,7 @@
++     is_breakable_cudagraph_enabled,
++ )
++ from vllm.compilation.counter import compilation_counter
++-from vllm.config import VllmConfig
+++from vllm.config import SpeculativeConfig, VllmConfig
++ from vllm.config.compilation import CUDAGraphMode
++ from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
++ from vllm.distributed.parallel_state import (
++@@ -40,6 +40,68 @@
++ logger = init_logger(__name__)
++ 
++ 
+++RangedQueryLens = list[tuple[int, int, set[int]]]
+++
+++
+++def decode_query_lens_for_spec(
+++    speculative_config: SpeculativeConfig,
+++    decode_query_len: int,
+++    max_num_reqs: int,
+++) -> tuple[list[int], RangedQueryLens]:
+++    """Uniform-decode query lengths to capture for a spec-decode target manager.
+++
+++    Returns the schedule-derived lengths (captured for every batch size, as
+++    upstream) plus, when adaptive draft length is on, one
+++    ``(range_start, range_end, query_lens)`` entry per schedule range so the
+++    adaptive lengths ``min_tokens..K_range`` are captured only for the batch
+++    sizes that can use them.
+++    """
+++    # decode_query_len = num_speculative_steps + num_new_sampled_tokens_per_step;
+++    # a manager whose query does not cover the verify tokens (draft decode,
+++    # decode_query_len == 1) has nothing to vary.
+++    num_new_sampled_tokens_per_step = (
+++        decode_query_len - speculative_config.num_speculative_tokens
+++    )
+++    if num_new_sampled_tokens_per_step < 1 or not (
+++        speculative_config.uses_dynamic_speculative_decoding()
+++        or speculative_config.adaptive_draft_length
+++    ):
+++        return [decode_query_len], []
+++    schedule = speculative_config.num_speculative_tokens_per_batch_size or [
+++        (1, max_num_reqs, speculative_config.num_speculative_tokens)
+++    ]
+++    decode_query_lens = [x[2] + num_new_sampled_tokens_per_step for x in schedule]
+++    ranged_query_lens: RangedQueryLens = []
+++    if speculative_config.adaptive_draft_length:
+++        k_min = speculative_config.adaptive_draft_min_tokens
+++        for start, end, k_range in schedule:
+++            if k_range > 1:
+++                qlens = {
+++                    k + num_new_sampled_tokens_per_step
+++                    for k in range(k_min, k_range + 1)
+++                }
+++                ranged_query_lens.append((start, end, qlens))
+++                for q in qlens:
+++                    if q not in decode_query_lens:
+++                        decode_query_lens.append(q)
+++    return decode_query_lens, ranged_query_lens
+++
+++
+++def decode_query_len_allowed(
+++    query_len: int,
+++    num_reqs: int,
+++    schedule_query_lens: set[int],
+++    ranged_query_lens: RangedQueryLens,
+++) -> bool:
+++    """Whether a uniform-decode graph (query_len x num_reqs) is worth capturing."""
+++    if query_len in schedule_query_lens:
+++        return True
+++    return any(
+++        start <= num_reqs <= end and query_len in qs
+++        for start, end, qs in ranged_query_lens
+++    )
+++
+++
++ class AttentionState(NamedTuple):
++     attn_metadata: dict[str, Any] | None
++     slot_mappings: dict[str, torch.Tensor]
++@@ -192,29 +254,33 @@
++ 
++         # When using Dynamic SD, num_speculative_tokens is the max number of
++         # draft tokens. The scheduler might use a smaller number so we need
++-        # to capture graphs for all possible values during decode.
+++        # to capture graphs for all possible values during decode. Only
+++        # managers whose decode query covers the verify tokens (target model,
+++        # draft prefill) vary with the draft length; the draft-decode manager
+++        # (decode_query_len == 1) does not.
++         speculative_config = self.vllm_config.speculative_config
++         if (
++-            speculative_config
++-            and speculative_config.uses_dynamic_speculative_decoding()
+++            speculative_config is not None
+++            and self.decode_query_len > self.vllm_config.num_speculative_tokens
++         ):
++-            num_spec_per_batch_size = (
++-                speculative_config.num_speculative_tokens_per_batch_size
++-            )
++-            # uses_dynamic_speculative_decoding() guarantees this is set.
++-            assert num_spec_per_batch_size is not None
++-            # decode_query_len = num_speculative_steps + num_new_sampled_tokens
++-            # _per_step. Recover num_new_sampled_tokens_per_step
++-            # from the values the manager already has.
++-            num_new_sampled_tokens_per_step = (
++-                self.decode_query_len - self.vllm_config.num_speculative_tokens
+++            decode_query_lens, ranged_query_lens = decode_query_lens_for_spec(
+++                speculative_config=speculative_config,
+++                decode_query_len=self.decode_query_len,
+++                max_num_reqs=self.max_num_reqs,
++             )
++-            # Each entry is (range_start, range_end, num_speculative_tokens).
++-            decode_query_lens = [
++-                x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
++-            ]
++         else:
++-            decode_query_lens = [self.decode_query_len]
+++            decode_query_lens, ranged_query_lens = [self.decode_query_len], []
+++        schedule_query_lens = set(decode_query_lens) - {
+++            q for _, _, qs in ranged_query_lens for q in qs
+++        }
+++
+++        def _query_len_allowed(query_len: int, num_reqs: int) -> bool:
+++            return decode_query_len_allowed(
+++                query_len=query_len,
+++                num_reqs=num_reqs,
+++                schedule_query_lens=schedule_query_lens,
+++                ranged_query_lens=ranged_query_lens,
+++            )
++ 
++         capture_varlen_decode = (
++             separate_decode_routine and bool(decode_mode) and self.varlen_decode
++@@ -245,6 +311,7 @@
++                         rounded_num_tokens > max_decode_tokens
++                         or rounded_num_tokens > max_cg_capture_size
++                         or rounded_num_reqs > self.max_num_reqs
+++                        or not _query_len_allowed(decode_query_len, rounded_num_reqs)
++                     ):
++                         continue
++ 
++--- a/vllm/v1/worker/gpu/model_runner.py
+++++ b/vllm/v1/worker/gpu/model_runner.py
++@@ -1673,6 +1673,7 @@
++             aux_hidden_states=aux_hidden_states,
++             finished_req_ids=finished_req_ids,
++             routed_experts=routed_experts,
+++            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
++         )
++ 
++         if not self.is_last_pp_rank:
++@@ -1696,6 +1697,9 @@
++         aux_hidden_states = self.execute_model_state.aux_hidden_states
++         finished_req_ids = self.execute_model_state.finished_req_ids
++         routed_experts = self.execute_model_state.routed_experts
+++        num_spec_tokens_to_schedule = (
+++            self.execute_model_state.num_spec_tokens_to_schedule
+++        )
++         self.execute_model_state = None
++ 
++         if not self.is_last_pp_rank:
++@@ -1812,19 +1816,27 @@
++                 self.sampler.sampling_states.temperature.gpu,
++                 self.sampler.sampling_states.seeds.gpu,
++                 mm_inputs=mm_inputs,
+++                num_speculative_steps=num_spec_tokens_to_schedule,
+++            )
+++            # The scheduler may have asked for fewer than num_speculative_steps
+++            # drafts (dynamic / adaptive SD); only those columns are valid.
+++            num_drafted = draft_tokens.shape[1]
+++            self.req_states.draft_tokens[input_batch.idx_mapping, :num_drafted] = (
+++                draft_tokens
++             )
++-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
++             if self.adaptive_verification is not None:
++                 self.adaptive_verification.record_confidences(
++                     self.speculator.draft_token_confidence_probs, input_batch
++                 )
+++        else:
+++            num_drafted = self.num_speculative_steps
++ 
++         if self.num_speculative_steps > 0:
++             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
++             # not have a speculator (i.e. self.speculator is None)
++             self.draft_tokens_handler.set_draft_tokens(
++                 input_batch,
++-                self.req_states.draft_tokens[input_batch.idx_mapping],
+++                self.req_states.draft_tokens[input_batch.idx_mapping, :num_drafted],
++             )
++ 
++         # Post-step KV connector related operations.
++@@ -1955,6 +1967,8 @@
++     aux_hidden_states: list[torch.Tensor] | None
++     finished_req_ids: set[str]
++     routed_experts: RoutedExpertsTensors | None
+++    # Draft tokens the scheduler will verify next step (dynamic/adaptive SD).
+++    num_spec_tokens_to_schedule: int = 0
++ 
++ 
++ class BatchReqState(NamedTuple):
++--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++@@ -25,6 +25,11 @@
++ 
++ logger = init_logger(__name__)
++ 
+++# A propose() call always runs at least the first draft step (draft position 0)
+++# and only counts >= 2 need a fused multi-step decode graph.
+++MIN_DRAFT_STEPS = 1
+++MIN_FUSED_DRAFT_STEPS = 2
+++
++ 
++ class AutoRegressiveSpeculator(DraftModelSpeculator):
++     def __init__(self, vllm_config: VllmConfig, device: torch.device):
++@@ -42,6 +47,12 @@
++ 
++         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
++         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+++        # One decode manager per draft-step count when the scheduler can ask
+++        # for fewer than num_speculative_steps drafts (adaptive draft length).
+++        self.decode_cudagraph_managers: dict[int, SpeculatorCudaGraphManager] = {}
+++        # Draft steps for the current propose()/capture() call.
+++        self._num_steps = self.num_speculative_steps
+++        self._active_decode_manager: SpeculatorCudaGraphManager | None = None
++         self.use_fused_multi_step_decode = False
++ 
++     def load_model(self, target_model: nn.Module) -> None:
++@@ -137,12 +148,24 @@
++             cudagraph_mode = CUDAGraphMode.NONE
++ 
++         # Initialize cudagraph manager for draft decodes (draft positions > 0).
++-        self.decode_cudagraph_manager = SpeculatorCudaGraphManager(
++-            self.vllm_config,
++-            self.device,
++-            cudagraph_mode,
++-            decode_query_len=1,
++-        )
+++        for num_steps in self._draft_step_options():
+++            self.decode_cudagraph_managers[num_steps] = SpeculatorCudaGraphManager(
+++                self.vllm_config,
+++                self.device,
+++                cudagraph_mode,
+++                decode_query_len=1,
+++            )
+++        self.decode_cudagraph_manager = self.decode_cudagraph_managers[
+++            self.num_speculative_steps
+++        ]
+++
+++    def _draft_step_options(self) -> list[int]:
+++        """Draft-step counts the scheduler may request that need a fused graph."""
+++        spec_cfg = self.speculative_config
+++        if spec_cfg.adaptive_draft_length:
+++            lo = max(MIN_FUSED_DRAFT_STEPS, spec_cfg.adaptive_draft_min_tokens)
+++            return list(range(lo, self.num_speculative_steps + 1))
+++        return [self.num_speculative_steps]
++ 
++     def capture(self) -> None:
++         logger.info("Capturing model for speculator...")
++@@ -186,15 +209,26 @@
++             if self.use_fused_multi_step_decode
++             else self._generate_draft
++         )
++-        self.decode_cudagraph_manager.capture(
++-            decode_fn,
++-            self.model_state,
++-            self.input_buffers,
++-            self.block_tables,
++-            self.attn_groups,
++-            self.kv_cache_config,
++-            progress_bar_desc="Capturing decode CUDA graphs",
+++        # The fused loop bakes the step count into the graph, so capture one
+++        # set of graphs per requestable step count; single-step graphs are
+++        # count-independent, capture them once.
+++        managers = (
+++            self.decode_cudagraph_managers.items()
+++            if self.use_fused_multi_step_decode
+++            else [(self.num_speculative_steps, self.decode_cudagraph_manager)]
++         )
+++        for num_steps, manager in managers:
+++            self._num_steps = num_steps
+++            manager.capture(
+++                decode_fn,
+++                self.model_state,
+++                self.input_buffers,
+++                self.block_tables,
+++                self.attn_groups,
+++                self.kv_cache_config,
+++                progress_bar_desc=f"Capturing decode CUDA graphs ({num_steps} steps)",
+++            )
+++        self._num_steps = self.num_speculative_steps
++         self.on_multi_step_decode_end(self.max_num_reqs)
++ 
++     @torch.inference_mode()
++@@ -224,7 +258,17 @@
++         skip_attn_for_dummy_run: bool = False,
++         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
++         is_profile: bool = False,
+++        num_speculative_steps: int | None = None,
++     ) -> torch.Tensor:
+++        # Draft steps for this call; the scheduler may ask for fewer than the
+++        # configured maximum (dynamic / adaptive speculative decoding). Even a
+++        # request for 0 runs the first draft step: it keeps the draft KV/state
+++        # in sync with the target, and its token is simply not scheduled.
+++        self._num_steps = self.num_speculative_steps
+++        if num_speculative_steps is not None:
+++            self._num_steps = max(
+++                MIN_DRAFT_STEPS, min(self.num_speculative_steps, num_speculative_steps)
+++            )
++         num_tokens = input_batch.num_tokens
++         num_tokens_padded = input_batch.num_tokens_after_padding
++         num_reqs = input_batch.num_reqs
++@@ -311,10 +355,27 @@
++             )
++         self.on_prefill_end(num_reqs)
++ 
++-        if self.num_speculative_steps == 1:
+++        if self._num_steps == 1:
++             # Early exit.
++             return self.draft_tokens[:num_reqs, :1]
++ 
+++        drafts = self._multi_step_propose(
+++            input_batch, num_reqs, num_rejected, dummy_run, skip_attn_for_dummy_run,
+++            is_profile,
+++        )
+++        # Only the columns this call drafted are valid.
+++        return drafts[:, : self._num_steps]
+++
+++    def _multi_step_propose(
+++        self,
+++        input_batch: InputBatch,
+++        num_reqs: int,
+++        num_rejected: torch.Tensor,
+++        dummy_run: bool,
+++        skip_attn_for_dummy_run: bool,
+++        is_profile: bool,
+++    ) -> torch.Tensor:
+++
++         # Prepare the inputs for the decode steps.
++         prepare_decode_inputs(
++             self.draft_tokens[:num_reqs, 0],
++@@ -328,8 +389,18 @@
++ 
++         # Each request produces exactly 1 token per draft generation step,
++         # enabling FULL graph replay.
+++        decode_manager = self.decode_cudagraph_manager
+++        if self.use_fused_multi_step_decode:
+++            # The fused loop is baked into the graph: pick the manager captured
+++            # for this step count, or fall back to the full chain.
+++            fused_manager = self.decode_cudagraph_managers.get(self._num_steps)
+++            if fused_manager is None:
+++                self._num_steps = self.num_speculative_steps
+++            else:
+++                decode_manager = fused_manager
+++        self._active_decode_manager = decode_manager
++         decode_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
++-            self.decode_cudagraph_manager,
+++            decode_manager,
++             num_reqs,
++             num_reqs,
++             uniform_token_count=1,
++@@ -469,7 +540,7 @@
++ 
++         attn_metadata = None
++         slot_mappings_by_layer = None
++-        for step in range(1, self.num_speculative_steps):
+++        for step in range(1, self._num_steps):
++             # Rebuild every step when positions advance, or just once
++             # on the first step when positions are constant (Gemma4 MTP).
++             if not skip_attn and (self.advance_draft_positions or step == 1):
++@@ -493,8 +564,8 @@
++             self.current_draft_step.fill_(step)
++ 
++             if batch_desc.cg_mode == CUDAGraphMode.FULL:
++-                assert self.decode_cudagraph_manager is not None
++-                self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+++                assert self._active_decode_manager is not None
+++                self._active_decode_manager.run_fullgraph(batch_desc)
++             else:
++                 self._generate_draft(
++                     num_reqs,
++@@ -539,8 +610,8 @@
++             )
++ 
++         if batch_desc.cg_mode == CUDAGraphMode.FULL:
++-            assert self.decode_cudagraph_manager is not None
++-            self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+++            assert self._active_decode_manager is not None
+++            self._active_decode_manager.run_fullgraph(batch_desc)
++             return
++ 
++         self._generate_fused_drafts(
++@@ -570,7 +641,7 @@
++             else []
++         )
++ 
++-        for step in range(1, self.num_speculative_steps):
+++        for step in range(1, self._num_steps):
++             self.current_draft_step.fill_(step)
++             self._generate_draft(
++                 num_reqs,
++@@ -581,7 +652,7 @@
++                 cudagraph_runtime_mode,
++             )
++             if (
++-                step < self.num_speculative_steps - 1
+++                step < self._num_steps - 1
++                 and attn_metadata is not None
++                 and self.advance_draft_positions
++             ):
+diff --git a/serve-configs/patches/0006-dense-tp-dual-batch-overlap-prefill-allreduce.patch b/serve-configs/patches/0006-dense-tp-dual-batch-overlap-prefill-allreduce.patch
+new file mode 100644
+index 0000000..5ff994d
+--- /dev/null
++++ b/serve-configs/patches/0006-dense-tp-dual-batch-overlap-prefill-allreduce.patch
+@@ -0,0 +1,260 @@
++--- a/vllm/config/vllm.py
+++++ b/vllm/config/vllm.py
++@@ -1679,7 +1689,11 @@
++                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
++             )
++ 
++-        if self.parallel_config.use_ubatching:
+++        if self.parallel_config.use_ubatching and (
+++            self.model_config is None or self.model_config.is_moe
+++        ):
+++            # Dense models overlap TP all-reduces instead of all2all
+++            # dispatch/combine, so they need no special all2all backend.
++             a2a_backend = self.parallel_config.all2all_backend
++             assert a2a_backend in [
++                 "deepep_low_latency",
++--- a/vllm/distributed/parallel_state.py
+++++ b/vllm/distributed/parallel_state.py
++@@ -686,6 +686,22 @@
++     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
++         if self.device_communicator is None:
++             raise ValueError("No device communicator found")
+++        # Function-local import: vllm.v1.worker.ubatching imports
+++        # forward_context, which imports this module.
+++        from vllm.v1.worker.ubatching import (
+++            dbo_overlap_tp_all_reduce,
+++            dbo_yield_and_switch_from_comm_to_compute,
+++            dbo_yield_and_switch_from_compute_to_comm,
+++        )
+++
+++        if dbo_overlap_tp_all_reduce():
+++            # Dual-batch overlap for dense TP: hand the compute stream to the
+++            # other micro-batch while this one's all-reduce runs on the comm
+++            # stream, then wait for it before continuing.
+++            dbo_yield_and_switch_from_compute_to_comm()
+++            output = self.device_communicator.all_reduce(input_)
+++            dbo_yield_and_switch_from_comm_to_compute()
+++            return output
++         return self.device_communicator.all_reduce(input_)
++ 
++     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
++--- a/vllm/v1/worker/gpu_model_runner.py
+++++ b/vllm/v1/worker/gpu_model_runner.py
++@@ -228,6 +228,7 @@
++ from vllm.v1.worker.ubatch_utils import (
++     UBatchSlices,
++     check_ubatch_thresholds,
+++    is_last_ubatch_empty,
++     maybe_create_ubatch_slices,
++     split_attn_metadata,
++ )
++@@ -4124,7 +4125,18 @@
++         # Extra coordination when running data-parallel since we need to coordinate
++         # across ranks
++         should_ubatch, num_tokens_across_dp = False, None
++-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+++        if (
+++            self.vllm_config.parallel_config.data_parallel_size == 1
+++            and self.parallel_config.use_ubatching
+++            and allow_microbatching
+++        ):
+++            # Single DP rank: decide microbatching locally (no cross-rank sync).
+++            should_ubatch = check_ubatch_thresholds(
+++                self.parallel_config, num_tokens, uniform_decode=uniform_decode
+++            ) and not is_last_ubatch_empty(
+++                num_tokens, num_tokens_padded, self.parallel_config.num_ubatches
+++            )
+++        elif self.vllm_config.parallel_config.data_parallel_size > 1:
++             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
++                 coordinate_batch_across_dp(
++                     num_tokens_unpadded=num_tokens,
++--- a/vllm/v1/worker/gpu_ubatch_wrapper.py
+++++ b/vllm/v1/worker/gpu_ubatch_wrapper.py
++@@ -26,7 +26,11 @@
++ from vllm.utils.deep_gemm import set_num_sms as deep_gemm_set_num_sms
++ from vllm.utils.import_utils import has_deep_gemm
++ from vllm.utils.platform_utils import num_compute_units
++-from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
+++from vllm.v1.worker.ubatching import (
+++    UBatchContext,
+++    make_ubatch_contexts,
+++    set_overlap_tp_all_reduce,
+++)
++ 
++ logger = init_logger(__name__)
++ 
++@@ -121,6 +125,11 @@
++         self.runnable = runnable
++         self.vllm_config = vllm_config
++         self.compilation_config = vllm_config.compilation_config
+++        # Dense (non-MoE) models overlap the TP all-reduce itself under DBO.
+++        set_overlap_tp_all_reduce(
+++            vllm_config.model_config is not None
+++            and not vllm_config.model_config.is_moe
+++        )
++         self.comm_stream = torch.cuda.Stream(device=device)
++         # Ubatch threads plus the main thread
++         self.ready_barrier = threading.Barrier(
++@@ -474,10 +483,13 @@
++ 
++         dp_metadata = forward_context.dp_metadata
++ 
++-        # We shouldn't be here unless we are running with multiple DP ranks
++-        assert dp_metadata is not None
++-        ubatch_dp_metadata = []
+++        # With a single DP rank there is no DP metadata to split; the
+++        # micro-batches only overlap TP collectives with compute.
+++        ubatch_dp_metadata: list[DPMetadata | None] = []
++         for ubatch_slice in ubatch_slices:
+++            if dp_metadata is None:
+++                ubatch_dp_metadata.append(None)
+++                continue
++             dp_size = self.vllm_config.parallel_config.data_parallel_size
++             ubatch_num_tokens_across_dp = torch.tensor(
++                 [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
++--- a/vllm/v1/worker/ubatch_utils.py
+++++ b/vllm/v1/worker/ubatch_utils.py
++@@ -177,6 +177,9 @@
++         query_start_loc[1:] -= tokens_skipped
++         query_start_loc_cpu[1:] -= tokens_skipped
++     seq_lens = attn_metadata.seq_lens[request_slice]
+++    # State-carrying backends must use the request's full step length for
+++    # slot selection in every slice (see CommonAttentionMetadata).
+++    mamba_state_seq_lens = attn_metadata.state_seq_lens[request_slice]
++     # Read raw fields to avoid triggering the deprecated D2H-syncing properties.
++     seq_lens_cpu = (
++         attn_metadata._seq_lens_cpu[request_slice]
++@@ -194,6 +197,14 @@
++         else None
++     )
++ 
+++    if splits_first_request and num_computed_tokens_cpu is not None:
+++        # The continuation has already "computed" the tokens of the earlier
+++        # slice this step: state-carrying backends (mamba/GDN align mode) read
+++        # their initial state from the block of the last computed token.
+++        tokens_skipped = first_tok - start_locs[first_req]
+++        num_computed_tokens_cpu = num_computed_tokens_cpu.clone()
+++        num_computed_tokens_cpu[0] += tokens_skipped
+++
++     if splits_last_request:
++         # NOTE: We use start_locs (the original query_start_loc_cpu) to calculate
++         # the tokens skipped because query_start_loc_cpu might have been modified
++@@ -243,6 +254,7 @@
++         block_table_tensor=block_table_tensor,
++         slot_mapping=slot_mapping,
++         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+++        mamba_state_seq_lens=mamba_state_seq_lens,
++         _seq_lens_cpu=seq_lens_cpu,
++         _num_computed_tokens_cpu=num_computed_tokens_cpu,
++     )
++--- a/vllm/v1/worker/ubatching.py
+++++ b/vllm/v1/worker/ubatching.py
++@@ -147,10 +147,26 @@
++         self._wait_comm_done()
++ 
++ 
+++# Whether TP all-reduces themselves are overlapped under DBO. Dense models
+++# have no all2all to overlap, so their all-reduce is the collective that
+++# yields to the other micro-batch; MoE models keep the upstream schedule.
+++_OVERLAP_TP_ALL_REDUCE: bool = False
+++
+++
+++def set_overlap_tp_all_reduce(enabled: bool) -> None:
+++    global _OVERLAP_TP_ALL_REDUCE
+++    _OVERLAP_TP_ALL_REDUCE = enabled
+++
+++
++ def dbo_enabled() -> bool:
++     return len(_THREAD_ID_TO_CONTEXT) > 0
++ 
++ 
+++def dbo_overlap_tp_all_reduce() -> bool:
+++    """True inside a micro-batch thread when TP all-reduces should yield."""
+++    return _OVERLAP_TP_ALL_REDUCE and dbo_enabled()
+++
+++
++ def dbo_current_ubatch_id() -> int:
++     if len(_THREAD_ID_TO_CONTEXT) == 0:
++         return 0
++--- a/vllm/v1/attention/backend.py
+++++ b/vllm/v1/attention/backend.py
++@@ -537,6 +537,14 @@
++     at the current decode run's last full-state write. write_pos counts from
++     here, so a preemption-resumed request re-anchors past the prompt boundary."""
++ 
+++    mamba_state_seq_lens: torch.Tensor | None = None
+++    """(batch_size,) sequence lengths that select the mamba/GDN state slot in
+++    align mode. Set by micro-batch slicing when a request is split across
+++    micro-batches: every slice must read/write the state block of the request's
+++    last token this step (where the runner pre-copied the initial state), while
+++    ``seq_lens`` stays the slice's true attention length. ``None`` means
+++    ``seq_lens``."""
+++
++     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
++     _seq_lens_cpu: torch.Tensor | None = None
++     _num_computed_tokens_cpu: torch.Tensor | None = None
++@@ -547,6 +555,13 @@
++     def batch_size(self) -> int:
++         return self.seq_lens.shape[0]
++ 
+++    @property
+++    def state_seq_lens(self) -> torch.Tensor:
+++        """Sequence lengths for mamba/GDN state-slot selection."""
+++        if self.mamba_state_seq_lens is not None:
+++            return self.mamba_state_seq_lens
+++        return self.seq_lens
+++
++     def naive_query_lens(self) -> torch.Tensor:
++         """Naive because it assumes that query ends where the next query starts."""
++         return self.query_start_loc[1:] - self.query_start_loc[:-1]
++--- a/vllm/v1/attention/backends/gdn_attn.py
+++++ b/vllm/v1/attention/backends/gdn_attn.py
++@@ -222,7 +222,7 @@
++         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
++         block_table_tensor = mamba_get_block_table_tensor(
++             m.block_table_tensor,
++-            m.seq_lens,
+++            m.state_seq_lens,
++             self.kv_cache_spec,
++             self.vllm_config.cache_config.mamba_cache_mode,
++         )
++--- a/vllm/v1/attention/backends/mamba_attn.py
+++++ b/vllm/v1/attention/backends/mamba_attn.py
++@@ -526,7 +526,7 @@
++         else:
++             state_indices_tensor = mamba_get_block_table_tensor(
++                 common_attn_metadata.block_table_tensor,
++-                common_attn_metadata.seq_lens,
+++                common_attn_metadata.state_seq_lens,
++                 self.kv_cache_spec,
++                 self.vllm_config.cache_config.mamba_cache_mode,
++             )
++@@ -812,7 +812,7 @@
++     ) -> M:
++         state_indices_tensor = mamba_get_block_table_tensor(
++             blk_table,
++-            metadata.seq_lens,
+++            metadata.state_seq_lens,
++             self.kv_cache_spec,
++             self.vllm_config.cache_config.mamba_cache_mode,
++         )
++--- a/vllm/v1/attention/backends/linear_attn.py
+++++ b/vllm/v1/attention/backends/linear_attn.py
++@@ -71,7 +71,7 @@
++ 
++         state_indices_tensor = mamba_get_block_table_tensor(
++             common_attn_metadata.block_table_tensor,
++-            common_attn_metadata.seq_lens,
+++            common_attn_metadata.state_seq_lens,
++             self.kv_cache_spec,
++             self.vllm_config.cache_config.mamba_cache_mode,
++         )[:, 0]
++@@ -196,7 +196,7 @@
++ 
++         state_indices_tensor = mamba_get_block_table_tensor(
++             common_attn_metadata.block_table_tensor,
++-            common_attn_metadata.seq_lens,
+++            common_attn_metadata.state_seq_lens,
++             self.kv_cache_spec,
++             self.vllm_config.cache_config.mamba_cache_mode,
++         )
+diff --git a/serve-configs/patches/README.md b/serve-configs/patches/README.md
+index f7191a8..854c3fb 100644
+--- a/serve-configs/patches/README.md
++++ b/serve-configs/patches/README.md
+@@ -1,7 +1,7 @@
+ # Venv-local vLLM patches for the Qwen3.8-27B deployment
+ 
+ Production runs the nightly wheel `vllm 0.27.2rc1.dev110+gacb0f1dcd` in
+-`/shared/vllm/.venv-qwen38` with three source patches that are NOT in any
++`/shared/vllm/.venv-qwen38` with six source patches that are NOT in any
+ release. A venv rebuild silently drops them; run `apply-to-venv.sh` afterwards.
+ 
+ | Patch | Fixes | Symptom without it |
+@@ -9,8 +9,15 @@ release. A venv rebuild silently drops them; run `apply-to-venv.sh` afterwards.
+ | 0001 gpu_worker.py | flock-serialized, row-stride-aligned chunked `cudaHostRegister` of the /dev/shm offload region | startup deadlock with `cpu_bytes_to_use` >= ~16 GiB at TP4 (all ranks pin the whole region concurrently); naive 1 GiB chunking then breaks `cuMemcpyBatchAsync` (error 1) |
+ | 0002 shared_offload_region.py | unregister the same chunks on cleanup | leaked pinned mappings / errors at shutdown after 0001 |
+ | 0003 offloading/scheduler.py | detect the MTP draft tower by `mtp.` layer prefix instead of marking every KV group EAGLE-volatile | with `speculative-config` MTP enabled, tiered-offload restore never converges (fs tier hits, promotes, then full-recompute); resume of a 32k chat 20 s instead of 2-3 s |
++| 0005 config/speculative.py, config/vllm.py, v1/core/sched/scheduler.py, v1/spec_decode/{draft_lm_head.py (new), llm_base_proposer.py}, v1/worker/gpu/{cudagraph_utils.py, model_runner.py, spec_decode/eagle/utils.py, spec_decode/autoregressive/speculator.py} | speculative-config `adaptive_draft_length` (+`adaptive_draft_ema_alpha`/`_margin`/`_min_tokens`, validated: K >= 2, min <= K, disabled with a warning under DP > 1): scheduler EMA of accepted draft tokens picks the per-step draft count; V1 drafts that many; the V2 speculator runs that many steps (one fused draft graph set per count) and returns only the drafted columns so the scheduler verifies exactly those; cudagraph_utils captures the adaptive query lengths only for the batch-size range that can use them and only for managers whose decode query covers the verify tokens. `draft_lm_head_dtype: fp8|int4`: quantized copy of the shared target lm_head (CUTLASS fp8 per-channel / Marlin int4 group-128 via the production GPTQ repack path) for the drafter's argmax only; target head untouched; hardware support checked at load | latency profile: single-stream 44/39/77/112 -> 62-68/56/95-106/143 tok/s (reason/prose/write/edit); target distribution untouched (per-token logprob agreement with the previous config: mean |dlogprob| 0.079, top-1 disagreement 3.2%, vs 0.092 / 3.5% between the two pre-existing prod configs). Without it: every step drafts K=7 (each draft step re-reads the 636 MB bf16 lm_head shard) and V2 + dynamic SD divides by zero building draft-decode graphs. Observability: mean draft length = spec_decode_num_draft_tokens_total / spec_decode_num_drafts_total |
++| 0006 config/vllm.py, distributed/parallel_state.py, v1/worker/{gpu_model_runner.py, gpu_ubatch_wrapper.py, ubatch_utils.py, ubatching.py}, v1/attention/backend.py, v1/attention/backends/{gdn_attn,mamba_attn,linear_attn}.py | dense-TP dual batch overlap: `--enable-dbo` on a non-MoE model (all2all assert relaxed for dense models), micro-batching decided locally when DP=1, `dp_metadata` may be None, and - only for dense models (`ubatching.set_overlap_tp_all_reduce`, MoE keeps its upstream schedule) - every TP all-reduce yields to the other micro-batch while it runs on the comm stream; a request split across micro-batches keeps ONE mamba/GDN state slot (`CommonAttentionMetadata.mamba_state_seq_lens`). No per-step ubatch counter exists in the model runner (documented exception: owner gwillen, revisit when vLLM adds runner-level OTEL metrics; the effect is visible in prefill throughput / TTFT metrics) | throughput profile: prefill 16k 7.8 -> 5.7 s, 128x1k/1k 757 -> 828 tok/s at 128 concurrent (with `NCCL_MAX_NCHANNELS=1`, offload on). Without the state-slot fix a split prompt returns garbage/EOS (the second half read the pre-copied old state) |
+ | 0004 model_loader/weight_utils.py | `get_quant_config` tolerates a callable `hf_overrides` (draft models compose one) instead of raising | `speculative-config` with `"quantization"` on a dspark/eagle draft crashes at load with "hf_overrides must be a dict" (note: online-fp8 for the DSpark drafter still fails later in the DFlash precompute path on SM89 — Marlin-repacked weight; keep the drafter bf16) |
+ 
+-Evidence, repros and benchmarks: `goal/sessions/ea737f9a-4156-40c9-b1b8-1e900c68c3ee/runs/20260815T021827Z-475a50cd/artifacts/offload-debug/`.
+-All three are unreported upstream as of 2026-08-17 and are candidates for PRs
+-(human-owned per AGENTS.md).
++Evidence, repros and benchmarks: `goal/sessions/ea737f9a-4156-40c9-b1b8-1e900c68c3ee/runs/20260815T021827Z-475a50cd/artifacts/offload-debug/`
++(0001-0004) and `goal/sessions/23cb78c0-b3a1-4ea3-89e2-332443ff1f8f/runs/20260818T055754Z-8dd3de85/`
++(0005-0006: progress.jsonl, artifacts/logs/ss-*.log, bench-*.json, prof_*/).
++Tests for the CPU-checkable parts: `serve-configs/tests/` (see its README).
++All are unreported upstream as of 2026-08-18 and are candidates for PRs
++(human-owned per AGENTS.md). 0005/0006 are the most upstream-worthy: adaptive
++draft length + quantized draft head are model-agnostic MTP/EAGLE wins on
++memory-bound GPUs; dense-TP DBO generalizes DBO beyond MoE all2all.
+diff --git a/serve-configs/patches/apply-to-venv.sh b/serve-configs/patches/apply-to-venv.sh
+index 5d4f986..6f5bfc6 100755
+--- a/serve-configs/patches/apply-to-venv.sh
++++ b/serve-configs/patches/apply-to-venv.sh
+@@ -1,7 +1,7 @@
+ #!/bin/sh
+ # Re-apply the venv-local vLLM patches after a rebuild of .venv-qwen38.
+ # Usage: serve-configs/patches/apply-to-venv.sh [venv_dir]
+-# All three were written against vllm 0.27.2rc1.dev110+gacb0f1dcd; on a newer
++# All were written against vllm 0.27.2rc1.dev110+gacb0f1dcd; on a newer
+ # wheel check `patch --dry-run` output and re-port if hunks fail.
+ set -e
+ VENV="${1:-/shared/vllm/.venv-qwen38}"
+@@ -11,6 +11,5 @@ for p in "$(dirname "$0")"/000*.patch; do
+   echo "== $(basename "$p")"
+   patch -p1 -N -r - < "$p" || true
+ done
+-find "$SP/vllm" -name '__pycache__' -path '*kv_offload*' -prune -exec rm -rf {} + 2>/dev/null
+-find "$SP/vllm" -name '__pycache__' -path '*offloading*' -prune -exec rm -rf {} + 2>/dev/null
++find "$SP/vllm" -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null
+ echo "done — restart vllm-qwen38 to pick up."
+diff --git a/serve-configs/qwen3_8_27b_fp8_max.yaml b/serve-configs/qwen3_8_27b_fp8_max.yaml
+index 8b493c5..dba6f54 100644
+--- a/serve-configs/qwen3_8_27b_fp8_max.yaml
++++ b/serve-configs/qwen3_8_27b_fp8_max.yaml
+@@ -1,5 +1,19 @@
+ # Qwen3.8-27B-FP8 on 4x L4 23 GiB — max-throughput config, full 262k context.
+ #
++# Throughput settings (2026-08-18; evidence in goal run
++# goal/sessions/23cb78c0-b3a1-4ea3-89e2-332443ff1f8f/runs/20260818T055754Z-8dd3de85):
++#   max-num-seqs 128: with NCCL P2P the decode step is no longer comm-bound,
++#     so 128 concurrent still scale (192 only raises TPOT).
++#   enable-dbo (venv patch serve-configs/patches/0006): dense-TP dual batch
++#     overlap. A prefill chunk is split in two micro-batches and every TP
++#     all-reduce of one half runs while the other half computes; NCCL was
++#     ~45% of prefill GPU time even with P2P. The unit sets
++#     NCCL_MAX_NCHANNELS=1 so the polling NCCL CTAs do not steal SMs from the
++#     overlapped GEMMs (also the fastest setting for 84 MB all-reduces).
++#   dbo-decode-token-threshold 1000000: never micro-batch decode; splitting a
++#     memory-bound decode batch doubles the weight reads.
++#   attention-backend TRITON_ATTN: same speed as FlashInfer here and no
++#     workspace reservation, so a larger KV pool.
+ # Serve (dedicated venv, vLLM >= 0.27.2 nightly — NOT the repo .venv/.venv-ling):
+ #   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 \
+ #     /shared/vllm/.venv-qwen38/bin/vllm serve \
+@@ -25,15 +39,19 @@ kv-cache-dtype: fp8
+ gpu-memory-utilization: 0.95
+ # Concurrency saturates ~seqs96 on L4 (seqs64->96 was +2.2%); GDN fp32
+ # recurrent state per seq is the cost that scales here, not KV.
+-max-num-seqs: 96
++max-num-seqs: 128
+ # 16384 measured -0.1%: not worth it. Keep the 8192 chunk.
+ max-num-batched-tokens: 8192
+-compilation-config: '{"max_cudagraph_capture_size": 96}'
++compilation-config: '{"max_cudagraph_capture_size": 128}'
++attention-backend: TRITON_ATTN
++enable-dbo: true
++dbo-decode-token-threshold: 1000000
+ reasoning-parser: qwen3
+ enable-auto-tool-choice: true
+ tool-call-parser: qwen3_coder
+ served-model-name: Qwen3.8-27B
+ port: 8012
++middleware: ["vllm_keepalive.KeepAliveMiddleware"]
+ # Tiered KV offload (native TieringOffloadingSpec): 24 GiB pinned-RAM staging
+ # tier + content-addressed fs tier on the NVMe RAID0. Long chats evicted from
+ # the ~1.39M-token GPU pool restore from RAM or disk instead of a ~155 s cold
+diff --git a/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml b/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml
+index f35f118..6e0ffc2 100644
+--- a/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml
++++ b/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml
+@@ -57,15 +57,42 @@
+ # takes 130-150 s to prefill on 4x L4, so agent compaction calls died at the
+ # edge and were retried in loops. The middleware emits SSE comments / JSON
+ # leading whitespace while the engine works; every client parser ignores them.
++#
++# Speculative-decoding settings (venv patch serve-configs/patches/0005):
++#   adaptive_draft_length + adaptive_draft_margin 2.0: the scheduler keeps a
++#     per-request EMA of accepted draft tokens and drafts ceil(ema+margin)
++#     tokens (capped by the batch-size schedule) instead of always K. Each MTP
++#     draft step is memory-bound (draft layer + lm_head read), so prompts that
++#     rarely accept deep drafts (prose, reasoning) stop paying for them; margin
++#     2 keeps code drafts near K (margin 1 starved code-write, 3 gained nothing).
++#   draft_lm_head_dtype int4: the drafter reads a Marlin group-128 copy of the
++#     bf16 target lm_head shard for its argmax; the target verifies with its
++#     own bf16 head, so the target distribution is untouched (fp8 is the other
++#     option; int4 is faster on L4 and costs ~1% acceptance). Token-level
++#     outputs still differ from the previous config at numeric near-ties, as
++#     between any two kernel paths: per-token logprob agreement with the old
++#     config is at the noise floor of vLLM's own config variation (run
++#     artifacts logprob-agreement-*.log).
++#   draft_tensor_parallel_size is ignored for MTP (the eagle path uses the
++#     target TP group); it stays for documentation only.
++# Model Runner V2 (unit sets VLLM_USE_V2_MODEL_RUNNER=1): full CUDA graphs and
++# a fused multi-step draft graph. The eager GDN op otherwise costs ~0.6 ms CPU
++# per call (48/step) and desyncs the TP ranks. V2's graphs take ~1.6 GiB, so
++# gpu-memory-utilization is 0.92 (0.94 OOMs on a 200k prefill).
++# Observability: draft length is visible as spec_decode_num_draft_tokens_total
++# / spec_decode_num_drafts_total (mean K) and the per-position acceptance
++# counters vLLM already exports.
++# Measurements and rejected alternatives: goal run
++# goal/sessions/23cb78c0-b3a1-4ea3-89e2-332443ff1f8f/runs/20260818T055754Z-8dd3de85.
+ model: Qwen/Qwen3.8-27B-FP8
+ tensor-parallel-size: 4
+ max-model-len: 262144
+ kv-cache-dtype: fp8
+-gpu-memory-utilization: 0.95
++gpu-memory-utilization: 0.92
+ max-num-seqs: 96
+ max-num-batched-tokens: 8192
+ compilation-config: '{"max_cudagraph_capture_size": 96}'
+-speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
++speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
+ kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
+ reasoning-parser: qwen3
+ enable-auto-tool-choice: true
+diff --git a/serve-configs/systemd/vllm-qwen38-throughput.service b/serve-configs/systemd/vllm-qwen38-throughput.service
+new file mode 100644
+index 0000000..4ec57a4
+--- /dev/null
++++ b/serve-configs/systemd/vllm-qwen38-throughput.service
+@@ -0,0 +1,42 @@
++[Unit]
++Description=vLLM Qwen3.8-27B-FP8 throughput profile (TP4, seqs128, DBO, 262k ctx) on 4x L4
++Conflicts=vllm-qwen38.service
++After=network-online.target
++Wants=network-online.target
++
++[Service]
++Type=simple
++User=gwillen
++Group=gwillen
++# API key + HF cache settings; key is root-only (chmod 600).
++EnvironmentFile=/etc/vllm/qwen38.env
++ExecStartPre=/bin/sh -c "rm -f /dev/shm/vllm_offload_*.mmap"
++ExecStart=/shared/vllm/.venv-qwen38/bin/vllm serve --config /shared/vllm/serve-configs/qwen3_8_27b_fp8_max.yaml
++# Model load + inductor compile + graph capture can take several minutes.
++TimeoutStartSec=1800
++# Cgroup kill (default control-group) tears down all TP workers with the
++# parent, so no stale /dev/shm psm_* segments are left to wedge the next
++# start (manual SIGKILLs were the only source of those).
++TimeoutStopSec=60
++Restart=on-failure
++RestartSec=15
++# Hardening that keeps the GPU/IPC paths working: no privilege escalation, a
++# private /tmp (torch/triton caches live under HOME), read-only /usr /etc.
++# /dev/shm (KV offload region, NCCL) and /data, /shared, /home stay writable.
++NoNewPrivileges=true
++PrivateTmp=true
++ProtectSystem=full
++# vLLM writes torch compile caches under HOME.
++Environment=HOME=/home/gwillen
++# Fixed hash seed: block hashes (and thus fs-tier filenames) must be stable
++# across restarts or the disk tier can never hit after a service restart.
++Environment=PYTHONHASHSEED=8012
++Environment=PYTHONPATH=/shared/vllm/serve-configs/middleware
++Environment=NCCL_P2P_LEVEL=SYS
++# Throughput profile: dense-TP dual batch overlap needs few NCCL channels so
++# the overlapped GEMMs keep their SMs (see qwen3_8_27b_fp8_max.yaml). Do not
++# set VLLM_USE_V2_MODEL_RUNNER here (V2 rejects --enable-dbo).
++Environment=NCCL_MAX_NCHANNELS=1
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/serve-configs/systemd/vllm-qwen38.service b/serve-configs/systemd/vllm-qwen38.service
+index 5b7cfd6..43c237b 100644
+--- a/serve-configs/systemd/vllm-qwen38.service
++++ b/serve-configs/systemd/vllm-qwen38.service
+@@ -1,5 +1,6 @@
+ [Unit]
+-Description=vLLM Qwen3.8-27B-FP8 (TP4, 262k ctx) on 4x L4
++Description=vLLM Qwen3.8-27B-FP8 latency profile (MTP K7, TP4, 262k ctx) on 4x L4
++Conflicts=vllm-qwen38-throughput.service
+ After=network-online.target
+ Wants=network-online.target
+ 
+@@ -19,6 +20,12 @@ TimeoutStartSec=1800
+ TimeoutStopSec=60
+ Restart=on-failure
+ RestartSec=15
++# Hardening that keeps the GPU/IPC paths working: no privilege escalation, a
++# private /tmp (torch/triton caches live under HOME), read-only /usr /etc.
++# /dev/shm (KV offload region, NCCL) and /data, /shared, /home stay writable.
++NoNewPrivileges=true
++PrivateTmp=true
++ProtectSystem=full
+ # vLLM writes torch compile caches under HOME.
+ Environment=HOME=/home/gwillen
+ # Fixed hash seed: block hashes (and thus fs-tier filenames) must be stable
+@@ -26,6 +33,10 @@ Environment=HOME=/home/gwillen
+ Environment=PYTHONHASHSEED=8012
+ Environment=PYTHONPATH=/shared/vllm/serve-configs/middleware
+ Environment=NCCL_P2P_LEVEL=SYS
++# Latency profile runs Model Runner V2 (full CUDA graphs + fused multi-step
++# MTP drafts; see qwen3_8_27b_fp8_mtp_latency.yaml). The throughput unit
++# (vllm-qwen38-throughput.service) must NOT set this: V2 rejects --enable-dbo.
++Environment=VLLM_USE_V2_MODEL_RUNNER=1
+ 
+ [Install]
+ WantedBy=multi-user.target
+diff --git a/serve-configs/tests/README.md b/serve-configs/tests/README.md
+new file mode 100644
+index 0000000..647cb83
+--- /dev/null
++++ b/serve-configs/tests/README.md
+@@ -0,0 +1,14 @@
++# Tests for the venv-local vLLM patches and the keepalive middleware
++
++Run with the deployment venv (never system python):
++
++    cd serve-configs/tests && /shared/vllm/.venv-qwen38/bin/python -m pytest -q .
++
++(Run from the tests directory: from the repo root the source tree `vllm/`
++would shadow the installed wheel. `uv pip install pytest` into the venv once.)
++
++They exercise the pure/CPU parts of `serve-configs/patches/0005-*.patch` and
++`0006-*.patch` (config validation, adaptive draft-length policy, cudagraph
++query-length capture policy, micro-batch metadata slicing) and the
++`serve-configs/middleware/vllm_keepalive.py` ASGI behavior. GPU behavior is
++covered by the goal-run evidence linked from `serve-configs/patches/README.md`.
+diff --git a/serve-configs/tests/test_adaptive_draft_length.py b/serve-configs/tests/test_adaptive_draft_length.py
+new file mode 100644
+index 0000000..26174a7
+--- /dev/null
++++ b/serve-configs/tests/test_adaptive_draft_length.py
+@@ -0,0 +1,106 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Contract tests for the adaptive draft-length patch (0005), CPU only."""
++
++import pytest
++from vllm.config.speculative import SpeculativeConfig
++from vllm.v1.core.sched.scheduler import adaptive_num_spec_tokens, update_accepted_ema
++from vllm.v1.worker.gpu.cudagraph_utils import (
++    decode_query_len_allowed,
++    decode_query_lens_for_spec,
++)
++
++SCHEDULE = [[1, 8, 7], [9, 32, 2], [33, 96, 0]]
++
++
++def _cfg(**kw):
++    return SpeculativeConfig(method="ngram", prompt_lookup_max=3, **kw)
++
++
++def test_adaptive_requires_at_least_two_tokens():
++    with pytest.raises(ValueError, match="num_speculative_tokens >= 2"):
++        _cfg(num_speculative_tokens=1, adaptive_draft_length=True)
++
++
++def test_adaptive_min_tokens_bounded_by_k():
++    with pytest.raises(ValueError, match="must not exceed"):
++        _cfg(num_speculative_tokens=4, adaptive_draft_length=True,
++             adaptive_draft_min_tokens=5)
++
++
++def test_adaptive_defaults_accept():
++    cfg = _cfg(num_speculative_tokens=7, adaptive_draft_length=True)
++    assert cfg.adaptive_draft_margin == 2.0
++    assert cfg.adaptive_draft_min_tokens == 1
++    assert cfg.draft_lm_head_dtype == "auto"
++
++
++def test_draft_lm_head_dtype_is_validated():
++    with pytest.raises(ValueError):
++        _cfg(num_speculative_tokens=2, draft_lm_head_dtype="int3")
++
++
++@pytest.mark.parametrize(
++    "emas,expected",
++    [
++        ([], 7),  # no requests -> full length
++        ([None], 7),  # fresh request keeps the full length
++        ([1.6], 4),  # ceil(1.6 + 2.0)
++        ([1.6, 4.4], 7),  # most-accepting request wins, capped at K
++        ([0.0], 2),  # ceil(0 + 2) = 2, above the floor
++        ([None, 3.0], 7),  # any fresh request -> full length
++    ],
++)
++def test_adaptive_num_spec_tokens(emas, expected):
++    assert (
++        adaptive_num_spec_tokens(emas=emas, max_tokens=7, min_tokens=1, margin=2.0)
++        == expected
++    )
++
++
++def test_adaptive_num_spec_tokens_respects_min():
++    assert adaptive_num_spec_tokens(emas=[0.0], max_tokens=7, min_tokens=3,
++                                    margin=0.0) == 3
++
++
++def test_update_accepted_ema_seeds_then_smooths():
++    assert update_accepted_ema(prev=None, num_accepted=3, alpha=0.7) == 3.0
++    ema = update_accepted_ema(prev=2.0, num_accepted=0, alpha=0.7)
++    assert ema == pytest.approx(1.4)
++
++
++def test_capture_lengths_follow_schedule_and_adaptive_ranges():
++    cfg = _cfg(num_speculative_tokens=7, adaptive_draft_length=True,
++               num_speculative_tokens_per_batch_size=SCHEDULE)
++    lens, ranged = decode_query_lens_for_spec(
++        speculative_config=cfg, decode_query_len=8, max_num_reqs=96
++    )
++    assert sorted(lens) == list(range(1, 9))
++    assert ranged == [(1, 8, {2, 3, 4, 5, 6, 7, 8}), (9, 32, {2, 3})]
++    schedule_lens = set(lens) - {q for _, _, qs in ranged for q in qs}
++    assert schedule_lens == {1}
++    # adaptive length only for batch sizes inside its range
++    assert decode_query_len_allowed(query_len=5, num_reqs=4,
++                                    schedule_query_lens=schedule_lens,
++                                    ranged_query_lens=ranged)
++    assert not decode_query_len_allowed(query_len=5, num_reqs=12,
++                                        schedule_query_lens=schedule_lens,
++                                        ranged_query_lens=ranged)
++    # schedule-derived length stays unrestricted
++    assert decode_query_len_allowed(query_len=1, num_reqs=90,
++                                    schedule_query_lens=schedule_lens,
++                                    ranged_query_lens=ranged)
++
++
++def test_capture_lengths_draft_decode_manager_is_untouched():
++    cfg = _cfg(num_speculative_tokens=7, adaptive_draft_length=True,
++               num_speculative_tokens_per_batch_size=SCHEDULE)
++    assert decode_query_lens_for_spec(
++        speculative_config=cfg, decode_query_len=1, max_num_reqs=96
++    ) == ([1], [])
++
++
++def test_capture_lengths_static_k():
++    cfg = _cfg(num_speculative_tokens=3)
++    assert decode_query_lens_for_spec(
++        speculative_config=cfg, decode_query_len=4, max_num_reqs=8
++    ) == ([4], [])
+diff --git a/serve-configs/tests/test_keepalive_middleware.py b/serve-configs/tests/test_keepalive_middleware.py
+new file mode 100644
+index 0000000..a36b49f
+--- /dev/null
++++ b/serve-configs/tests/test_keepalive_middleware.py
+@@ -0,0 +1,137 @@
++# SPDX-License-Identifier: Apache-2.0
++"""ASGI behavior of serve-configs/middleware/vllm_keepalive.py."""
++
++import asyncio
++import json
++import sys
++from pathlib import Path
++
++import pytest
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "middleware"))
++import vllm_keepalive  # noqa: E402
++
++
++def _scope(path="/v1/chat/completions"):
++    return {"type": "http", "method": "POST", "path": path}
++
++
++def _receive_for(body: bytes):
++    sent = False
++
++    async def receive():
++        nonlocal sent
++        if sent:
++            await asyncio.sleep(3600)
++        sent = True
++        return {"type": "http.request", "body": body, "more_body": False}
++
++    return receive
++
++
++def _collect():
++    out = []
++
++    async def send(message):
++        out.append(message)
++
++    return out, send
++
++
++def _slow_app(delay, ctype=b"application/json", body=b'{"ok":true}', status=200):
++    async def app(scope, receive, send):
++        await receive()
++        await asyncio.sleep(delay)
++        await send({"type": "http.response.start", "status": status,
++                    "headers": [(b"content-type", ctype)]})
++        await send({"type": "http.response.body", "body": body,
++                    "more_body": False})
++
++    return app
++
++
++def _run(app, body, ping=0.05, commit=0.2):
++    mw = vllm_keepalive.KeepAliveMiddleware(app, ping_interval=ping,
++                                            json_commit_after=commit)
++    out, send = _collect()
++    asyncio.run(mw(_scope(), _receive_for(body), send))
++    return out
++
++
++def test_body_peek():
++    assert vllm_keepalive._body_requests_stream(b'{"stream": true}') is True
++    assert vllm_keepalive._body_requests_stream(b'{"stream": false}') is False
++    assert vllm_keepalive._body_requests_stream(b"not json") is False
++    assert vllm_keepalive._body_requests_stream(b"[1,2]") is False
++    pad = b"a" * (vllm_keepalive._MAX_PEEK_BYTES + 1)
++    big = b'{"stream": true, "x": "' + pad + b'"}'
++    assert vllm_keepalive._body_requests_stream(big) is False
++
++
++def test_stream_request_early_commits_as_sse():
++    out = _run(_slow_app(1.5, ctype=b"text/event-stream", body=b"data: x\n\n"),
++               json.dumps({"stream": True}).encode())
++    start = out[0]
++    assert start["type"] == "http.response.start"
++    assert dict(start["headers"])[b"content-type"] == b"text/event-stream"
++    assert dict(start["headers"])[b"x-vllm-keepalive"] == b"early-commit"
++    bodies = [m["body"] for m in out[1:] if m["type"] == "http.response.body"]
++    assert bodies[0] == vllm_keepalive._SSE_PING
++    assert bodies[-1] == b"data: x\n\n"
++    # the app's own response.start was swallowed (already committed)
++    assert sum(m["type"] == "http.response.start" for m in out) == 1
++
++
++def test_json_request_early_commits_as_json():
++    out = _run(_slow_app(1.5), json.dumps({"stream": False}).encode())
++    assert dict(out[0]["headers"])[b"content-type"] == b"application/json"
++    bodies = [m["body"] for m in out[1:] if m["type"] == "http.response.body"]
++    assert bodies[0] == vllm_keepalive._JSON_PING
++    assert bodies[-1] == b'{"ok":true}'
++
++
++def test_fast_response_is_untouched():
++    out = _run(_slow_app(0.0), json.dumps({"stream": True}).encode())
++    assert [m["type"] for m in out] == ["http.response.start", "http.response.body"]
++    assert dict(out[0]["headers"])[b"content-type"] == b"application/json"
++
++
++def test_json_error_after_sse_commit_is_wrapped_as_sse_event():
++    out = _run(_slow_app(1.5, body=b'{"error":"boom"}', status=500),
++               json.dumps({"stream": True}).encode())
++    assert dict(out[0]["headers"])[b"content-type"] == b"text/event-stream"
++    bodies = [m["body"] for m in out[1:] if m["type"] == "http.response.body"]
++    assert bodies[-1] == b'data: {"error":"boom"}\n\n'
++
++
++def test_idle_stream_gets_comment_pings():
++    async def app(scope, receive, send):
++        await receive()
++        await send({"type": "http.response.start", "status": 200,
++                    "headers": [(b"content-type", b"text/event-stream")]})
++        await asyncio.sleep(2.5)  # the ping loop polls once per second
++        await send({"type": "http.response.body", "body": b"data: [DONE]\n\n",
++                    "more_body": False})
++
++    out = _run(app, json.dumps({"stream": True}).encode(), ping=0.3, commit=60)
++    pings = [m for m in out if m.get("body") == vllm_keepalive._SSE_PING]
++    assert len(pings) >= 2
++
++
++def test_non_v1_paths_bypass():
++    async def app(scope, receive, send):
++        await send({"type": "http.response.start", "status": 200, "headers": []})
++        await send({"type": "http.response.body", "body": b"", "more_body": False})
++
++    mw = vllm_keepalive.KeepAliveMiddleware(app)
++    out, send = _collect()
++    asyncio.run(mw(_scope("/health"), _receive_for(b""), send))
++    assert out[0]["type"] == "http.response.start"
++
++
++@pytest.mark.parametrize("path", ["/v1/completions", "/v1/chat/completions"])
++def test_v1_paths_are_wrapped(path):
++    mw = vllm_keepalive.KeepAliveMiddleware(_slow_app(0.0))
++    out, send = _collect()
++    asyncio.run(mw(_scope(path), _receive_for(b"{}"), send))
++    assert out[-1]["body"] == b'{"ok":true}'
+diff --git a/serve-configs/tests/test_ubatch_split_metadata.py b/serve-configs/tests/test_ubatch_split_metadata.py
+new file mode 100644
+index 0000000..4cae3e3
+--- /dev/null
++++ b/serve-configs/tests/test_ubatch_split_metadata.py
+@@ -0,0 +1,47 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Micro-batch slicing keeps one state slot for a split request (patch 0006)."""
++
++import torch
++from vllm.v1.attention.backend import CommonAttentionMetadata
++from vllm.v1.worker.ubatch_utils import UBatchSlice, _make_metadata_with_slice
++
++
++def _metadata():
++    # two requests: req0 has 100 computed + 300 new tokens, req1 20 + 100
++    query_start_loc = torch.tensor([0, 300, 400], dtype=torch.int32)
++    seq_lens = torch.tensor([400, 120], dtype=torch.int32)
++    return CommonAttentionMetadata(
++        query_start_loc=query_start_loc,
++        query_start_loc_cpu=query_start_loc.clone(),
++        seq_lens=seq_lens,
++        num_reqs=2,
++        num_actual_tokens=400,
++        max_query_len=300,
++        max_seq_len=400,
++        block_table_tensor=torch.zeros((2, 4), dtype=torch.int32),
++        slot_mapping=torch.arange(400, dtype=torch.int64),
++        seq_lens_cpu_upper_bound=seq_lens.clone(),
++        _seq_lens_cpu=seq_lens.clone(),
++        _num_computed_tokens_cpu=torch.tensor([100, 20], dtype=torch.int32),
++    )
++
++
++def test_split_request_keeps_full_state_seq_len():
++    md = _metadata()
++    first = _make_metadata_with_slice(UBatchSlice(slice(0, 1), slice(0, 200)), md)
++    second = _make_metadata_with_slice(UBatchSlice(slice(0, 2), slice(200, 400)), md)
++    # attention lengths describe each slice ...
++    assert first.seq_lens.tolist() == [300]  # 400 - 100 skipped tokens
++    assert second.seq_lens.tolist() == [400, 120]
++    # ... but the state slot follows the request's full step length
++    assert first.state_seq_lens.tolist() == [400]
++    assert second.state_seq_lens.tolist() == [400, 120]
++    # the continuation has computed the first slice's tokens
++    assert second.num_computed_tokens_cpu.tolist() == [300, 20]
++    assert second.compute_num_computed_tokens().tolist() == [300, 20]
++
++
++def test_state_seq_lens_defaults_to_seq_lens():
++    md = _metadata()
++    assert md.mamba_state_seq_lens is None
++    assert torch.equal(md.state_seq_lens, md.seq_lens)

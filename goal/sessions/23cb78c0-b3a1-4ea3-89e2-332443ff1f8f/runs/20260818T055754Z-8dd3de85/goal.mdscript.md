@@ -1,6 +1,6 @@
 ---
-active: true
-status: in_progress
+active: false
+status: completed
 goal: >-
   Maximize Qwen3.8-27B FP8 on 4x L4 for two independent production profiles:
   (1) LATENCY: max single-stream decode + min TTFT, preserving K7 MTP, 262k ctx,
@@ -17,7 +17,7 @@ primary_user_action: >-
   Serve each profile config on the real 4x L4 stack (vllm serve --config ...),
   run bench_single_stream.py (latency) and vllm bench serve 128x1k/1k + a
   long-context/stress probe (throughput), and record tok/s vs the prior best.
-resume_heading: pursue-goal
+resume_heading: complete-goal
 iteration: 9
 started_at: 2026-08-18T05:57:54Z
 skip_hooks: true
@@ -75,6 +75,8 @@ best_throughput: "seqs128 + DBO + TRITON + NCCL ch1 + offload: c128 828 (base 62
 * review round 1: 6 lanes, none signed off (see progress.jsonl review_rejected); fix wave: config validators + DP guard, V2 propose returns drafted columns, production Marlin path + hw preconditions, pure functions + tests (serve-configs/tests, 26 pass), DBO overlap gated to dense models, middleware cap/typing/OTEL+prom counters/SSE-wrap, unit hardening, docs rationale-only, manifest venv python, scripts self-contained; re-measured (wave2/3): TTFT V2=V1, burst 128/128, greedy 2/8 identical -> claim reworded, logprob agreement 0.079/3.2% vs reference 0.092/3.5%; commits split into 6 atomic product commits + evidence
 
 ## Next Steps
+
+* superseded: user waived the review loop and set a follow-on goal (push to hardware limit) -> new run
 
 * review round 2 (packet + 6 lanes) on head after the fix wave; if Proven-for -> complete goal; else next fix wave
 * remaining small levers noted, not taken: in_proj_ba bf16 GEMM cuBLAS pick (~1 ms/step), fp8 target lm_head (quality-touching), DBO for V2 (V2 rejects dbo)
