@@ -11,5 +11,7 @@ for p in "$(dirname "$0")"/000*.patch; do
   echo "== $(basename "$p")"
   patch -p1 -N -r - < "$p" || true
 done
+# L4-tuned block-fp8 GEMM configs (per-rank Qwen3.8-27B shapes; see README)
+cp "$(dirname "$0")"/l4-configs/*.json "$SP/vllm/model_executor/layers/quantization/utils/configs/"
 find "$SP/vllm" -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null
 echo "done — restart vllm-qwen38 to pick up."
