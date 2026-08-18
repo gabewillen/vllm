@@ -41,6 +41,15 @@
 # output byte-identical to cold. A venv rebuild loses this AND the two
 # pin_mmap_region patches (see qwen3_8_27b_fp8_max.yaml).
 #
+# NCCL P2P + Triton attention (2026-08-18): the unit sets NCCL_P2P_LEVEL=SYS
+# (needs IOMMU off + ACS cleared on the host; 4-way all-reduce 25.9 -> 11.7 ms,
+# cold 90k prefill 61 -> 42 s, plain TP4 aggregate 477 -> 620 tok/s, single-
+# stream reason/prose/write/edit 46/40/68/103 -> 51/42/81/115). With P2P the
+# FlashInfer backend faults (illegal memory access; GPU core dump names
+# flashinfer::PersistentVariableLengthMergeStatesKernel) on the spec-decode
+# verify path — a FlashInfer race exposed by faster all-reduces — so both the
+# target and the MTP draft run TRITON_ATTN. Never mix P2P with FLASHINFER here.
+#
 # Keep-alive middleware (serve-configs/middleware/vllm_keepalive.py, needs that
 # dir on PYTHONPATH): Cloudflare returns 524 when the origin sends no response
 # BYTES for 100 s, streaming or not (verified through the tunnel: 524 at 125 s
@@ -56,11 +65,12 @@ gpu-memory-utilization: 0.95
 max-num-seqs: 96
 max-num-batched-tokens: 8192
 compilation-config: '{"max_cudagraph_capture_size": 96}'
-speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
+speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
 kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
 reasoning-parser: qwen3
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
+attention-backend: TRITON_ATTN
 port: 8012
 middleware: ["vllm_keepalive.KeepAliveMiddleware"]
