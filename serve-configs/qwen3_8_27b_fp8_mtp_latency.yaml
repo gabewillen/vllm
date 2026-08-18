@@ -57,15 +57,42 @@
 # takes 130-150 s to prefill on 4x L4, so agent compaction calls died at the
 # edge and were retried in loops. The middleware emits SSE comments / JSON
 # leading whitespace while the engine works; every client parser ignores them.
+#
+# Speculative-decoding settings (venv patch serve-configs/patches/0005):
+#   adaptive_draft_length + adaptive_draft_margin 2.0: the scheduler keeps a
+#     per-request EMA of accepted draft tokens and drafts ceil(ema+margin)
+#     tokens (capped by the batch-size schedule) instead of always K. Each MTP
+#     draft step is memory-bound (draft layer + lm_head read), so prompts that
+#     rarely accept deep drafts (prose, reasoning) stop paying for them; margin
+#     2 keeps code drafts near K (margin 1 starved code-write, 3 gained nothing).
+#   draft_lm_head_dtype int4: the drafter reads a Marlin group-128 copy of the
+#     bf16 target lm_head shard for its argmax; the target verifies with its
+#     own bf16 head, so the target distribution is untouched (fp8 is the other
+#     option; int4 is faster on L4 and costs ~1% acceptance). Token-level
+#     outputs still differ from the previous config at numeric near-ties, as
+#     between any two kernel paths: per-token logprob agreement with the old
+#     config is at the noise floor of vLLM's own config variation (run
+#     artifacts logprob-agreement-*.log).
+#   draft_tensor_parallel_size is ignored for MTP (the eagle path uses the
+#     target TP group); it stays for documentation only.
+# Model Runner V2 (unit sets VLLM_USE_V2_MODEL_RUNNER=1): full CUDA graphs and
+# a fused multi-step draft graph. The eager GDN op otherwise costs ~0.6 ms CPU
+# per call (48/step) and desyncs the TP ranks. V2's graphs take ~1.6 GiB, so
+# gpu-memory-utilization is 0.92 (0.94 OOMs on a 200k prefill).
+# Observability: draft length is visible as spec_decode_num_draft_tokens_total
+# / spec_decode_num_drafts_total (mean K) and the per-position acceptance
+# counters vLLM already exports.
+# Measurements and rejected alternatives: goal run
+# goal/sessions/23cb78c0-b3a1-4ea3-89e2-332443ff1f8f/runs/20260818T055754Z-8dd3de85.
 model: Qwen/Qwen3.8-27B-FP8
 tensor-parallel-size: 4
 max-model-len: 262144
 kv-cache-dtype: fp8
-gpu-memory-utilization: 0.95
+gpu-memory-utilization: 0.92
 max-num-seqs: 96
 max-num-batched-tokens: 8192
 compilation-config: '{"max_cudagraph_capture_size": 96}'
-speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
+speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
 kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
 reasoning-parser: qwen3
 enable-auto-tool-choice: true
