@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -53,3 +54,6 @@ class SamplingMetadata:
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
+    # [num_reqs] host bool mask of requests that opted into effort telemetry;
+    # ``None`` when no request in the batch did (no extra sampler work).
+    effort_mask: np.ndarray | None = None

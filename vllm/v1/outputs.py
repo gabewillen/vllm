@@ -256,6 +256,11 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
+    # [num_reqs, 3] fp32 (mean entropy, mean margin, n committed rows), only
+    # when a request in the batch opted into effort telemetry.
+    effort_signals: torch.Tensor | None = None
+    # [num_reqs] bool host mask of the opted-in requests.
+    effort_flags: np.ndarray | None = None
 
 
 @dataclass

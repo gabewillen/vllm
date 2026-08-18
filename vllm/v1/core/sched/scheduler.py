@@ -73,6 +73,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.sample.effort_signals import EffortTelemetrySink
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -314,6 +315,11 @@ class Scheduler(SchedulerInterface):
         reasoning_config = vllm_config.reasoning_config
         if reasoning_config is not None and reasoning_config.dynamic_effort:
             self._init_effort_controller(reasoning_config)
+        # Optional JSONL sink for per-step effort signals (VLLM_EFFORT_TELEMETRY).
+        self.effort_sink = EffortTelemetrySink.from_env(
+            reasoning_config.reasoning_start_token_ids if reasoning_config else None,
+            reasoning_config.reasoning_end_token_ids if reasoning_config else None,
+        )
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -1809,6 +1815,8 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        effort_signals = model_runner_output.effort_signals
+        effort_sink = self.effort_sink if effort_signals else None
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -1823,7 +1831,6 @@ class Scheduler(SchedulerInterface):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
-        effort_signals = model_runner_output.effort_signals
         effort_acks = model_runner_output.thinking_budget_acks
         if effort_acks and self._effort:
             self._ingest_effort_acks(effort_acks)
@@ -1902,6 +1909,8 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
             effort_draft = effort_accepted = 0
+            effort_num_draft: int | None = None
+            effort_num_accepted: int | None = None
             if scheduled_spec_token_ids and (
                 generated_token_ids or self.num_sampled_tokens_per_step == 0
             ):
@@ -1910,6 +1919,7 @@ class Scheduler(SchedulerInterface):
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
                 effort_draft, effort_accepted = num_draft_tokens, num_accepted
+                effort_num_draft, effort_num_accepted = num_draft_tokens, num_accepted
                 if self.adaptive_draft:
                     self._update_accepted_ema(req_id=req_id, num_accepted=num_accepted)
                 # Rejections roll back num_computed_tokens (and, under async
@@ -1978,6 +1988,17 @@ class Scheduler(SchedulerInterface):
                     num_accepted_tokens=effort_accepted,
                     now_ms=effort_now_ms,
                 )
+            if effort_sink is not None:
+                effort_signal = effort_signals.get(req_id)
+                if effort_signal is not None:
+                    effort_sink.record(
+                        req_id,
+                        request.output_token_ids,
+                        effort_signal,
+                        effort_num_draft,
+                        effort_num_accepted,
+                        stopped,
+                    )
 
             if new_token_ids and self.structured_output_manager.should_advance(
                 request, new_token_ids=new_token_ids
@@ -2627,6 +2648,8 @@ class Scheduler(SchedulerInterface):
             self._effort.pop(request.request_id, None)
             self._effort_pending.pop(request.request_id, None)
             self._effort_rep_params.pop(request.request_id, None)
+        if self.effort_sink is not None:
+            self.effort_sink.forget(request.request_id)
 
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)

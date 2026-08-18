@@ -258,6 +258,9 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
+    # req_id -> (revision, absolute thinking budget) for dynamic effort.
+    thinking_budget_updates: dict[str, tuple[int, int]] = field(default_factory=dict)
+
     # Producer partial-tail offload hand-off for external KV connectors:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
     # the durable boundary block of a producer's last-prompt-boundary partial

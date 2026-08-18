@@ -16,6 +16,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.effort import EffortState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logprob import (
@@ -53,6 +54,7 @@ class Sampler:
         self.bad_words_state = BadWordsState(req_states)
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
         self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
+        self.effort_state = EffortState(max_num_reqs, device)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -68,6 +70,7 @@ class Sampler:
         self.bad_words_state.add_request(req_idx, sampling_params)
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         self.thinking_budget_state.add_request(req_idx, sampling_params)
+        self.effort_state.add_request(req_idx, sampling_params)
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -76,6 +79,7 @@ class Sampler:
         self.bad_words_state.apply_staged_writes()
         self.logprob_token_ids_state.apply_staged_writes()
         self.thinking_budget_state.apply_staged_writes()
+        self.effort_state.apply_staged_writes()
 
     def __call__(
         self,
@@ -100,6 +104,7 @@ class Sampler:
         )
         return_logprobs = max_num_logprobs != NO_LOGPROBS or max_per_req_token_ids > 0
 
+        self.effort_state.begin(idx_mapping_np)
         sampled, processed_logits = self.sample(
             logits,
             expanded_idx_mapping,
@@ -147,6 +152,15 @@ class Sampler:
                 processed_logits, num_sampled
             )
 
+        effort_signals = self.effort_state.finish(
+            input_batch.cu_num_logits, num_sampled
+        )
+        effort_flags = (
+            self.effort_state.batch_flags(idx_mapping_np)
+            if effort_signals is not None
+            else None
+        )
+
         # These are GPU tensors.
         sampler_output = SamplerOutput(
             # The sampled tokens are expanded to 2D tensor with shape
@@ -158,6 +172,8 @@ class Sampler:
             num_sampled=num_sampled,
             num_rejected=num_rejected,
             sampling_mask_tensors=sampling_mask_tensors,
+            effort_signals=effort_signals,
+            effort_flags=effort_flags,
         )
         return sampler_output
 
@@ -173,6 +189,8 @@ class Sampler:
         skip_top_k_top_p: bool = False,
     ) -> torch.Tensor:
         if not self._requires_logits_processing(idx_mapping_np):
+            # Nothing modifies the logits: they are already canonical-stage.
+            self.effort_state.compute(logits, expanded_idx_mapping, idx_mapping_np)
             return logits
 
         # Copy logits to a new FP32 tensor.
@@ -200,6 +218,10 @@ class Sampler:
             input_ids,
             expanded_local_pos,
         )
+
+        # Canonical effort-telemetry stage: after penalties and bad words,
+        # before the thinking-budget force and temperature.
+        self.effort_state.compute(logits, expanded_idx_mapping, idx_mapping_np)
 
         # Force the reasoning end marker once a request's thinking budget is
         # reached; applied before temperature so the forced token is always kept.
