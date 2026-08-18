@@ -83,19 +83,18 @@
  
  logger = init_logger(__name__)
  
-@@ -121,6 +125,11 @@
+@@ -121,6 +125,10 @@
          self.runnable = runnable
          self.vllm_config = vllm_config
          self.compilation_config = vllm_config.compilation_config
 +        # Dense (non-MoE) models overlap the TP all-reduce itself under DBO.
 +        set_overlap_tp_all_reduce(
-+            vllm_config.model_config is not None
-+            and not vllm_config.model_config.is_moe
++            vllm_config.model_config is not None and not vllm_config.model_config.is_moe
 +        )
          self.comm_stream = torch.cuda.Stream(device=device)
          # Ubatch threads plus the main thread
          self.ready_barrier = threading.Barrier(
-@@ -474,10 +483,13 @@
+@@ -474,10 +482,13 @@
  
          dp_metadata = forward_context.dp_metadata
  
@@ -207,6 +206,16 @@
      def naive_query_lens(self) -> torch.Tensor:
          """Naive because it assumes that query ends where the next query starts."""
          return self.query_start_loc[1:] - self.query_start_loc[:-1]
+@@ -627,6 +642,9 @@
+             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
+             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
+             seq_lens=self.seq_lens[:num_actual_reqs],
++            mamba_state_seq_lens=self.mamba_state_seq_lens[:num_actual_reqs]
++            if self.mamba_state_seq_lens is not None
++            else None,
+             _seq_lens_cpu=self._seq_lens_cpu[:num_actual_reqs]
+             if self._seq_lens_cpu is not None
+             else None,
 --- a/vllm/v1/attention/backends/gdn_attn.py
 +++ b/vllm/v1/attention/backends/gdn_attn.py
 @@ -222,7 +222,7 @@
