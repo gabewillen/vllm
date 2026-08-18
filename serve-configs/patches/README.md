@@ -1,7 +1,7 @@
 # Venv-local vLLM patches for the Qwen3.8-27B deployment
 
 Production runs the nightly wheel `vllm 0.27.2rc1.dev110+gacb0f1dcd` in
-`/shared/vllm/.venv-qwen38` with five source patches that are NOT in any
+`/shared/vllm/.venv-qwen38` with six source patches that are NOT in any
 release. A venv rebuild silently drops them; run `apply-to-venv.sh` afterwards.
 
 | Patch | Fixes | Symptom without it |
@@ -10,12 +10,14 @@ release. A venv rebuild silently drops them; run `apply-to-venv.sh` afterwards.
 | 0002 shared_offload_region.py | unregister the same chunks on cleanup | leaked pinned mappings / errors at shutdown after 0001 |
 | 0003 offloading/scheduler.py | detect the MTP draft tower by `mtp.` layer prefix instead of marking every KV group EAGLE-volatile | with `speculative-config` MTP enabled, tiered-offload restore never converges (fs tier hits, promotes, then full-recompute); resume of a 32k chat 20 s instead of 2-3 s |
 | 0005 config/speculative.py, config/vllm.py, v1/core/sched/scheduler.py, v1/spec_decode/{draft_lm_head.py (new), llm_base_proposer.py}, v1/worker/gpu/{cudagraph_utils.py, model_runner.py, spec_decode/eagle/utils.py, spec_decode/autoregressive/speculator.py} | speculative-config `adaptive_draft_length` (+`adaptive_draft_ema_alpha`/`_margin`/`_min_tokens`, validated: K >= 2, min <= K, disabled with a warning under DP > 1): scheduler EMA of accepted draft tokens picks the per-step draft count; V1 drafts that many; the V2 speculator runs that many steps (one fused draft graph set per count) and returns only the drafted columns so the scheduler verifies exactly those; cudagraph_utils captures the adaptive query lengths only for the batch-size range that can use them and only for managers whose decode query covers the verify tokens. `draft_lm_head_dtype: fp8|int4`: quantized copy of the shared target lm_head (CUTLASS fp8 per-channel / Marlin int4 group-128 via the production GPTQ repack path) for the drafter's argmax only; target head untouched; hardware support checked at load | latency profile: single-stream 44/39/77/112 -> 62-68/56/95-106/143 tok/s (reason/prose/write/edit); target distribution untouched (per-token logprob agreement with the previous config: mean |dlogprob| 0.079, top-1 disagreement 3.2%, vs 0.092 / 3.5% between the two pre-existing prod configs). Without it: every step drafts K=7 (each draft step re-reads the 636 MB bf16 lm_head shard) and V2 + dynamic SD divides by zero building draft-decode graphs. Observability: mean draft length = spec_decode_num_draft_tokens_total / spec_decode_num_drafts_total |
+| 0006 config/vllm.py, distributed/parallel_state.py, v1/worker/{gpu_model_runner.py, gpu_ubatch_wrapper.py, ubatch_utils.py, ubatching.py}, v1/attention/backend.py, v1/attention/backends/{gdn_attn,mamba_attn,linear_attn}.py | dense-TP dual batch overlap: `--enable-dbo` on a non-MoE model (all2all assert relaxed for dense models), micro-batching decided locally when DP=1, `dp_metadata` may be None, and - only for dense models (`ubatching.set_overlap_tp_all_reduce`, MoE keeps its upstream schedule) - every TP all-reduce yields to the other micro-batch while it runs on the comm stream; a request split across micro-batches keeps ONE mamba/GDN state slot (`CommonAttentionMetadata.mamba_state_seq_lens`). No per-step ubatch counter exists in the model runner (documented exception: owner gwillen, revisit when vLLM adds runner-level OTEL metrics; the effect is visible in prefill throughput / TTFT metrics) | throughput profile: prefill 16k 7.8 -> 5.7 s, 128x1k/1k 757 -> 828 tok/s at 128 concurrent (with `NCCL_MAX_NCHANNELS=1`, offload on). Without the state-slot fix a split prompt returns garbage/EOS (the second half read the pre-copied old state) |
 | 0004 model_loader/weight_utils.py | `get_quant_config` tolerates a callable `hf_overrides` (draft models compose one) instead of raising | `speculative-config` with `"quantization"` on a dspark/eagle draft crashes at load with "hf_overrides must be a dict" (note: online-fp8 for the DSpark drafter still fails later in the DFlash precompute path on SM89 — Marlin-repacked weight; keep the drafter bf16) |
 
 Evidence, repros and benchmarks: `goal/sessions/ea737f9a-4156-40c9-b1b8-1e900c68c3ee/runs/20260815T021827Z-475a50cd/artifacts/offload-debug/`
 (0001-0004) and `goal/sessions/23cb78c0-b3a1-4ea3-89e2-332443ff1f8f/runs/20260818T055754Z-8dd3de85/`
-(0005: progress.jsonl, artifacts/logs/ss-*.log, bench-*.json, prof_*/).
+(0005-0006: progress.jsonl, artifacts/logs/ss-*.log, bench-*.json, prof_*/).
 Tests for the CPU-checkable parts: `serve-configs/tests/` (see its README).
 All are unreported upstream as of 2026-08-18 and are candidates for PRs
-(human-owned per AGENTS.md). 0005 is the most upstream-worthy: adaptive draft length + quantized draft
-head are model-agnostic MTP/EAGLE wins on memory-bound GPUs.
+(human-owned per AGENTS.md). 0005/0006 are the most upstream-worthy: adaptive
+draft length + quantized draft head are model-agnostic MTP/EAGLE wins on
+memory-bound GPUs; dense-TP DBO generalizes DBO beyond MoE all2all.
