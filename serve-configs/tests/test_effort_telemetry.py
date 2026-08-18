@@ -415,3 +415,16 @@ def test_sink_from_env(monkeypatch, tmp_path):
     sink.record("x", [1, 3], (0.9, 0.1, 1), None, None, True)
     sink.close()
     assert json.loads(path.read_text().strip())["in_think"] is True
+
+
+def test_think_tracker_seeded_from_prompt_tail():
+    from vllm.v1.sample.effort_signals import ThinkTracker
+
+    t = ThinkTracker([7], [8])
+    t.seed_from_prompt([1, 2, 7, 3])  # "<think>\n" opened in the prompt
+    assert t.update([5, 6]) is True
+    assert t.update([5, 6, 8, 9]) is False
+    assert t.update([5, 6, 8, 9, 7, 1]) is True
+    u = ThinkTracker([7], [8])
+    u.seed_from_prompt([1, 7, 2, 8])  # closed in the prompt
+    assert u.update([5]) is False

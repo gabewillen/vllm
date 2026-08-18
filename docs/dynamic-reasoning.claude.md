@@ -1,6 +1,6 @@
 # Dynamic reasoning effort — signals and implementation plan
 
-Status: plan (2026-08-18). Target: the two Qwen3.8-27B-FP8 profiles on the
+Status: P0-P2 shipped as patch 0009 and GPU-validated 2026-08-18 (§2c); P3+ open. Target: the two Qwen3.8-27B-FP8 profiles on the
 4x L4 box (`serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml`, V2 runner + MTP;
 `serve-configs/qwen3_8_27b_fp8_max.yaml`, V1 runner + DBO). Ships as venv-local
 patches `0009+` (`serve-configs/patches/`), same contract as 0005-0008.
@@ -170,6 +170,35 @@ letting a conversation change effort per turn without re-prefill; a
 template-file change is optional; (b) the engine ladder is the primary
 mechanism, the sentence is only the rung-0 prior; (c) `dynamic` in the
 system message is off the table.
+
+### 2c. Measured 2026-08-18: patch 0009 on the live latency profile (P0/P1/P2 GPU validation)
+
+Window: `vllm-qwen38` stopped, patch 0009 applied to the venv, YAML gained
+`reasoning-config: '{"dynamic_effort": {...}}'`, unit drop-in
+`VLLM_EFFORT_TELEMETRY=/data/effort-telemetry/latency.jsonl`; three restarts
+(161-171 s to ready each). All greedy, single request unless noted.
+
+- Triton vs torch reference of the V2 budget kernels: 300 random batches
+  (K≤7 drafts, multi-token end sequences, prompt mid-think) → 0 mismatches.
+- Static caps on V2 + MTP K=7: `thinking_token_budget` 100 → 99 reasoning
+  tokens, 400 → 399; the answer follows.
+- Signal path + acks: `dynamic` with `effort_bias=100` escalated 0→1→2,
+  7 055 reasoning tokens, `late: false`; effort object on the response;
+  `vllm:effort_*` metrics exported.
+- Telemetry corpus (8 prompts × xhigh/low, 13 615 decode steps): entropy/logV
+  mean 0.043 sd 0.046, margin mean 5.9 sd 4.5 → written into both YAMLs as
+  the calibration. Confident grinding (`hard`, H 0.017 / margin 8.9) and
+  open-ended uncertainty (`agent`, H 0.066 / margin 3.2) sit ~2 z apart.
+- With calibration, `reasoning_effort: dynamic`: fact/edit/algo/debug/aime →
+  rung 0, 19-614 tokens, correct; `hard` → rung 0, capped at 1 024 (was
+  12 000+ and still wrong at xhigh/low); `agent` → rung 1, 2 901 tokens,
+  full answer. `late: false` everywhere; 46-111 tok/s, unchanged.
+- Sink bug found and fixed in the window: `in_think` ignored the prompt's
+  trailing `<think>`; the tracker is now seeded from the prompt tail.
+
+Not yet measured: accuracy Pareto vs fixed efforts on a real eval set (P3),
+`max_rung_by_batch_size` under load, the throughput profile (YAML updated,
+takes effect on its next restart), the floor actuator (P5).
 
 ## 3. Signal inventory
 
@@ -367,7 +396,7 @@ reasoning tokens on the mixed set, no regression on the code-edit slice.
 - **P0a — prompt-lever placement (done, §2b):** tail placement is
   cache-safe and steers ≥ system placement; `dynamic` renders as
   `medium` + the `low` sentence on the last user turn.
-- **P0 — telemetry (code done in patch 0009, CPU-verified; corpus run pending).** Add S2/S3 computation +
+- **P0 — telemetry (done: patch 0009 + 13.6k-step corpus, calibration in the YAMLs; §2c).** Add S2/S3 computation +
   D2H (both runners) behind a flag, log per-token `H`, margin, accepted-count,
   think position, marker hits to a JSONL sink for a corpus run at
   `xhigh`/unbounded. Offline: how well do S2-S7 at 1k/4k/16k thinking tokens
@@ -375,7 +404,7 @@ reasoning tokens on the mixed set, no regression on the code-edit slice.
   z-tables and initial `theta`. Also measure the cost of S2/S3 at 96 and 128
   seqs (expect < 0.2 ms/step). Deliverable: `artifacts/effort-p0/*.jsonl`
   + a notebook-free summary in this doc.
-- **P1 — cap actuator on V2 (done in patch 0009, CPU-verified).** The
+- **P1 — cap actuator on V2 (done; GPU parity 300/300, static caps exact on MTP; §2c).** The
   deployed package already had the actuator; lane B added a torch reference,
   26 CPU tests cross-checked against the V1 holder, versioned updates + acks
   on both runners, and the greedy-path forcing fix. GPU parity check (Triton
@@ -384,7 +413,7 @@ reasoning tokens on the mixed set, no regression on the code-edit slice.
   mode on real traffic (no enforcement): measure escalation precision/
   recall against offline quality deltas and the decision-reserve ack
   latency before any request is actually capped.
-- **P2 — controller (code done in patch 0009, CPU-verified; 50 tests).** Scheduler-side per-request state (§4), ladder,
+- **P2 — controller (done; GPU-validated end to end incl. escalation and acks; §2c).** Scheduler-side per-request state (§4), ladder,
   hard-stop, `thinking_budget_updates` in `SchedulerOutput`, both runners
   apply. Deterministic replay test from a recorded signal stream. Frontend
   `reasoning_effort: "dynamic"` + `vllm_xargs` + usage/`x_effort` + metrics.
