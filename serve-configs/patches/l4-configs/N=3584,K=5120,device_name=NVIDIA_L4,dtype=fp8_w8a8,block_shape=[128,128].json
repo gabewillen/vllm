@@ -43,25 +43,25 @@
   "BLOCK_SIZE_M": 32,
   "BLOCK_SIZE_N": 64,
   "BLOCK_SIZE_K": 128,
-  "GROUP_SIZE_M": 8,
+  "GROUP_SIZE_M": 4,
   "num_warps": 4,
   "num_stages": 3
  },
  "128": {
-  "BLOCK_SIZE_M": 64,
-  "BLOCK_SIZE_N": 128,
+  "BLOCK_SIZE_M": 32,
+  "BLOCK_SIZE_N": 64,
   "BLOCK_SIZE_K": 128,
-  "GROUP_SIZE_M": 32,
+  "GROUP_SIZE_M": 4,
   "num_warps": 4,
-  "num_stages": 2
+  "num_stages": 3
  },
  "192": {
   "BLOCK_SIZE_M": 64,
-  "BLOCK_SIZE_N": 128,
+  "BLOCK_SIZE_N": 64,
   "BLOCK_SIZE_K": 128,
-  "GROUP_SIZE_M": 32,
+  "GROUP_SIZE_M": 4,
   "num_warps": 4,
-  "num_stages": 2
+  "num_stages": 3
  },
  "256": {
   "BLOCK_SIZE_M": 128,
