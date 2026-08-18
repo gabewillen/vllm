@@ -111,6 +111,28 @@ class ThinkingBudgetStateHolder:
                 if state is not None:
                     self._state[i2] = state
 
+    def update_budget(self, index: int, revision: int, budget: int) -> int | None:
+        """Apply a scheduler budget update to a tracked request.
+
+        Only strictly increasing revisions change the state; the currently
+        applied revision is returned as the ack, or `None` when the request
+        is not tracked (not in this batch or no budget). A request already
+        forcing its end sequence keeps forcing: the scheduler records that
+        as a late decision.
+        """
+        state = self._state.get(index)
+        if state is None:
+            return None
+        applied = state.get("budget_revision", 0)
+        if revision <= applied:
+            return applied
+        state["budget_revision"] = revision
+        if not state.get("in_end", False):
+            old_budget = state["thinking_token_budget"]
+            state["thinking_token_budget"] = budget
+            state["check_count_down"] += budget - old_budget
+        return revision
+
     def update_state(
         self,
         output_token_ids: list[list[int]],

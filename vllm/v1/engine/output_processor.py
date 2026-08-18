@@ -175,6 +175,7 @@ class RequestState:
         self.queue = queue
         self.num_cached_tokens = 0
         self.num_cache_creation_tokens = 0
+        self.effort: dict[str, int] | None = None
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -386,6 +387,7 @@ class RequestState:
             num_cached_tokens=self.num_cached_tokens,
             num_cache_creation_tokens=self.num_cache_creation_tokens,
             metrics=self.stats,
+            effort=self.effort,
         )
 
     def _new_completion_output(
@@ -643,6 +645,8 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             ec_transfer_params = engine_core_output.ec_transfer_params
+            if engine_core_output.effort is not None:
+                req_state.effort = engine_core_output.effort
             if engine_core_output.routed_experts is not None:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
@@ -841,6 +845,7 @@ class OutputProcessor:
             max_tokens_param=req_state.max_tokens_param,
             req_stats=req_state.stats,
             num_cached_tokens=req_state.num_cached_tokens,
+            effort=req_state.effort,
         )
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 

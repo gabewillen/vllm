@@ -124,6 +124,26 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     routed_experts: str | None = None
 
 
+class EffortInfo(OpenAIBaseModel):
+    """Dynamic reasoning-effort outcome (`reasoning_effort: "dynamic"` only)."""
+
+    rung: int
+    escalations: int
+    reasoning_tokens: int
+    late: bool = False
+
+    @classmethod
+    def from_report(cls, report: dict[str, int] | None) -> "EffortInfo | None":
+        if report is None:
+            return None
+        return cls(
+            rung=report.get("rung", 0),
+            escalations=report.get("escalations", 0),
+            reasoning_tokens=report.get("reasoning_tokens", 0),
+            late=bool(report.get("late", 0)),
+        )
+
+
 class ChatCompletionResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: Literal["chat.completion"] = "chat.completion"
@@ -147,6 +167,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
         default=None, description="ECTransfer parameters."
     )
     metrics: PerRequestTimingMetrics | None = None
+    effort: EffortInfo | None = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -179,6 +200,8 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
     prompt_text: str | None = None
     metrics: PerRequestTimingMetrics | None = None
+    # Set on the final usage chunk of a dynamic-effort request only.
+    effort: EffortInfo | None = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -243,16 +266,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
         | None
     ) = "none"
     reasoning_effort: (
-        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "dynamic"]
+        | None
     ) = Field(
         default=None,
         description=(
             "Constrains effort on reasoning for reasoning models. "
             "Currently supported values are none, minimal, low, medium, "
-            "high, xhigh, and max. Reducing reasoning effort can result in "
-            "faster responses and fewer tokens used on reasoning in a response. "
-            "Note that 'max' is specific to the DeepSeek V4 series and is not "
-            "part of the standard OpenAI API specification."
+            "high, xhigh, max, and dynamic. Reducing reasoning effort can "
+            "result in faster responses and fewer tokens used on reasoning in "
+            "a response. Note that 'max' is specific to the DeepSeek V4 series "
+            "and is not part of the standard OpenAI API specification. "
+            "'dynamic' is vLLM-specific: the engine starts at the lowest "
+            "thinking budget and escalates from live signals (requires "
+            "--reasoning-config with dynamic_effort)."
         ),
     )
     thinking_token_budget: ThinkingTokenBudget = None
@@ -566,6 +593,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     _grammar_from_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
+    _dynamic_effort: dict[str, Any] | None = PrivateAttr(default=None)
+    """Validated dynamic-effort overrides; set only by `apply_dynamic_effort`."""
 
     def build_chat_params(
         self,
@@ -709,6 +738,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
+        if self._dynamic_effort is not None:
+            extra_args["dynamic_effort"] = self._dynamic_effort
+            extra_args.setdefault("effort_telemetry", True)
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

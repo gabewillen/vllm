@@ -724,6 +724,7 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self._thinking_budget_acks: dict[str, int] = {}
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -1239,6 +1240,28 @@ class GPUModelRunner(
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
 
+    def _apply_thinking_budget_updates(
+        self, updates: dict[str, tuple[int, int]]
+    ) -> None:
+        """Dynamic effort: raise/clamp budgets of tracked requests; ack them."""
+        holder = self.input_batch.thinking_budget_state_holder
+        if holder is None:
+            return
+        for req_id, (revision, budget) in updates.items():
+            index = self.input_batch.req_id_to_index.get(req_id)
+            if index is None:
+                continue
+            applied = holder.update_budget(index, revision, budget)
+            if applied is not None:
+                self._thinking_budget_acks[req_id] = applied
+
+    def _take_thinking_budget_acks(self) -> dict[str, int] | None:
+        if not self._thinking_budget_acks:
+            return None
+        acks = self._thinking_budget_acks
+        self._thinking_budget_acks = {}
+        return acks
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1568,6 +1591,10 @@ class GPUModelRunner(
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
+        if scheduler_output.thinking_budget_updates:
+            self._apply_thinking_budget_updates(
+                scheduler_output.thinking_budget_updates
+            )
 
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
@@ -4905,6 +4932,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                thinking_budget_acks=self._take_thinking_budget_acks(),
             )
 
         if not self.use_async_scheduling:

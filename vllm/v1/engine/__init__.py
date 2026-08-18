@@ -222,6 +222,10 @@ class EngineCoreOutput(
 
     new_sampling_mask: SamplingMaskLists | None = None
 
+    # Dynamic reasoning effort report, set on the finishing output only:
+    # {"rung", "escalations", "reasoning_tokens", "late", "stall_clamps"}.
+    effort: dict[str, int] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

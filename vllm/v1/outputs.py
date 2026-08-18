@@ -349,6 +349,14 @@ class ModelRunnerOutput:
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 
+    # Dynamic reasoning effort (per-request opt-in via
+    # SamplingParams.extra_args["effort_telemetry"]): {req_id: (mean
+    # normalised entropy, mean top1-top2 margin, n committed rows)} this step.
+    effort_signals: dict[str, tuple[float, float, int]] | None = None
+    # {req_id: budget revision applied this step} for
+    # SchedulerOutput.thinking_budget_updates.
+    thinking_budget_acks: dict[str, int] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,
