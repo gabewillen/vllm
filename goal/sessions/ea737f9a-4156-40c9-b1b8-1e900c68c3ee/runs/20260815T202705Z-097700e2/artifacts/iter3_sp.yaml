@@ -1,0 +1,15 @@
+# iter3: TP2xPP2 + sequence parallelism
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 2
+pipeline-parallel-size: 2
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.95
+max-num-seqs: 96
+max-num-batched-tokens: 8192
+compilation-config: '{"max_cudagraph_capture_size": 96, "pass_config": {"enable_sp": true}}'
+reasoning-parser: qwen3
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+port: 8018
