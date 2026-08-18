@@ -20,6 +20,12 @@ TimeoutStartSec=1800
 TimeoutStopSec=60
 Restart=on-failure
 RestartSec=15
+# Hardening that keeps the GPU/IPC paths working: no privilege escalation, a
+# private /tmp (torch/triton caches live under HOME), read-only /usr /etc.
+# /dev/shm (KV offload region, NCCL) and /data, /shared, /home stay writable.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
 # vLLM writes torch compile caches under HOME.
 Environment=HOME=/home/gwillen
 # Fixed hash seed: block hashes (and thus fs-tier filenames) must be stable
