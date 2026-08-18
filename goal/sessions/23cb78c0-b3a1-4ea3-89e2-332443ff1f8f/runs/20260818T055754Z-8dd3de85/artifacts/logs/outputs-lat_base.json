@@ -1,0 +1,82 @@
+{
+ "reason-math": {
+  "content": null,
+  "reasoning": "We need answer user: train problem. Need solve specific and generalize symbolic speeds v1, v2, gap D, delay t. Need be careful about directions, times. Let's analyze.\n\nSpecific: Train A leaves city A at 9:00 speed 80 km/h toward B. Train B leaves city B at 9:30 speed 100 km/h toward A. Distance D=300 km. Delay t=0.",
+  "usage": {
+   "prompt_tokens": 121,
+   "total_tokens": 217,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "reason-sys": {
+  "content": null,
+  "reasoning": "We need answer user: \"A ZFS pool on 2 NVMe drives shows 12 GiB ARC but the box has 120 GB RAM; explain what limits ARC, whether raising it helps a KV-cache file store of 55 MB files, and give a recommendation.\"\n\nNeed produce final answer. Need think through ZFS ARC limits. Need likely explain ARC default max? On Linux ZFS, ARC size controlled by zfs_arc_max, default",
+  "usage": {
+   "prompt_tokens": 106,
+   "total_tokens": 202,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "prose-essay": {
+  "content": "# The Box That Changed the World: A History of Container Shipping\n\nIn the mid-20th century, the global economy was held together by a complex, inefficient, and often dangerous web of logistics. Goods were loaded and unloaded by hand, piece by piece, from massive wooden crates, barrels, and sacks. This process, known as \"breakbulk\" shipping, was slow, prone to theft, and incredibly expensive. The invention of the standardized shipping container did not merely",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 23,
+   "total_tokens": 119,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "prose-story": {
+  "content": "The fog in the North Atlantic didn\u2019t just obscure the world; it swallowed it. For Elias Thorne, the keeper of the Blackrock Lighthouse, the silence was a physical weight, pressing against the thick glass of the lantern room. He had been here for thirty years, long enough to know the rhythm of the tides, the groan of the iron stairs, and the specific, lonely hum of the Fresnel lens.\n\nBut lately, the hum had changed.",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 32,
+   "total_tokens": 128,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "code-write": {
+  "content": "```python\n\"\"\"\nLRU Cache with TTL Expiry, Thread Safety, and Statistics.\n\nThis module provides a thread-safe LRU (Least Recently Used) cache that supports\ntime-to-live (TTL) expiry for individual entries. It also tracks basic statistics\nsuch as hits, misses, evictions, and expirations.\n\"\"\"\n\nimport threading\nimport time\nfrom collections import OrderedDict\nfrom typing import Any, Optional, Tuple\n\n\nclass LRUCache",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 40,
+   "total_tokens": 136,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "code-edit": {
+  "content": "```python\n# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\"\"\"\nAsyncLookupManager: per-tier async lookup manager for secondary tier\nexistence checks.\n\nEach secondary tier that wants non-blocking lookups composes its own\nAsyncLookupManager instance internally.  The manager maintains lookup\nstate and uses a background thread to execute batch_lookup() calls.\n\nLocking design\n--------------\nThere",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 2200,
+   "total_tokens": 2296,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "code-explain": {
+  "content": "Here is the explanation of the code, followed by three potential bugs.\n\n### Code Explanation\n\nThis code implements **Micro-Batching (UBatching)** logic for the vLLM inference engine. The goal is to split a large batch of requests into smaller \"micro-batches\" (ubatches) to improve hardware utilization or fit within memory constraints, particularly when using Dual Batch Optimization (DBO) or similar parallelism strategies.\n\n#### 1. `UBatchSlice`",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 1545,
+   "total_tokens": 1641,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ },
+ "json-extract": {
+  "content": "```json\n[\n  {\n    \"name\": \"Widget Pro\",\n    \"price\": 19.99,\n    \"qty\": 3\n  },\n  {\n    \"name\": \"Gizmo Mini\",\n    \"price\": 4.50,\n    \"qty\": 12\n  },\n  {\n    \"name\": \"Deluxe Stand\",\n    \"price\": 89.",
+  "reasoning": null,
+  "usage": {
+   "prompt_tokens": 102,
+   "total_tokens": 198,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  }
+ }
+}

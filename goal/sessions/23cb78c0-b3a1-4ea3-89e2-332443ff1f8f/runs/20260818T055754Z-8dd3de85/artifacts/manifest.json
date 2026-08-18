@@ -1,0 +1,281 @@
+{
+ "goal": "Maximize Qwen3.8-27B FP8 on 4x L4 for two independent production profiles (latency: single-stream decode + TTFT with K7 MTP, 262k ctx; throughput: aggregate tok/s under high concurrency, 262k ctx), profile/optimize/benchmark/stress each change",
+ "conversation_id": "23cb78c0-b3a1-4ea3-89e2-332443ff1f8f",
+ "primary_user_action": "Serve each profile on the real 4x L4 stack (systemd units on port 8012 / experiment servers on 8013), run bench_single_stream / vllm bench serve / 200k needle, compare with the prior best",
+ "updated_at": "2026-08-18T12:23:03Z",
+ "artifacts": [
+  {
+   "path": "artifacts/live/20260818T105400Z-prod-8012-ss_bench.log",
+   "kind": "log",
+   "reproduce": "sudo systemctl start vllm-qwen38; VLLM_API_KEY=... /shared/vllm/.venv-qwen38/bin//shared/vllm/.venv-qwen38/bin/python artifacts/scripts/ss_bench.py 8012 (interpreter used for the live run: /shared/vllm/.venv-qwen38/bin/python)",
+   "proves": "LIVE latency profile on production port 8012 (systemd unit, V2 runner, offload+keepalive): reason/prose/write/edit 61.6/54.6/96.9/143.1 tok/s vs baseline 44.4/39.2/77.4/111.6",
+   "tier": "live"
+  },
+  {
+   "path": "artifacts/live/20260818T105911Z-prod-8012-throughput-c32.json",
+   "kind": "json",
+   "reproduce": "same as the .log",
+   "proves": "vllm bench serve result JSON for the live throughput run",
+   "tier": "live"
+  },
+  {
+   "path": "artifacts/live/20260818T105911Z-prod-8012-throughput-c32.log",
+   "kind": "log",
+   "reproduce": "sudo systemctl start vllm-qwen38-throughput; OPENAI_API_KEY=... vllm bench serve --port 8012 ... --max-concurrency 32 --num-prompts 128 (see artifacts/scripts/tp_bench.sh)",
+   "proves": "LIVE throughput unit on production port 8012 (seqs128+DBO+NCCL_MAX_NCHANNELS=1): 128/128 ok, 476 tok/s at c32, TPOT 62.4 ms (baseline 452.6 / 64.7)",
+   "tier": "live"
+  },
+  {
+   "path": "artifacts/logs/ss-lat_base.log",
+   "kind": "log",
+   "reproduce": "artifacts/scripts/up.sh artifacts/configs/lat_base.yaml; /shared/vllm/.venv-qwen38/bin/python artifacts/scripts/ss_bench.py 8013",
+   "proves": "baseline single-stream on 8013 (prod config minus offload): 44.4/39.2/77.4/111.6",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/ss-lat_int4_v2_adaptive.log",
+   "kind": "log",
+   "reproduce": "VLLM_USE_V2_MODEL_RUNNER=1 up.sh artifacts/configs/lat_int4_v2.yaml; /shared/vllm/.venv-qwen38/bin/python artifacts/scripts/ss_bench.py 8013",
+   "proves": "V2 + adaptive K + int4 draft head: 67.5/54.8/95.3/142.7",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/ss-lat_final_v2_offload.log",
+   "kind": "log",
+   "reproduce": "VLLM_USE_V2_MODEL_RUNNER=1 PYTHONPATH=serve-configs/middleware up.sh artifacts/configs/lat_final.yaml (0.94 then 0.92); /shared/vllm/.venv-qwen38/bin/python artifacts/scripts/ss_bench.py 8013",
+   "proves": "final latency yaml with offload connector + keepalive: 61.8-65.6/56.4/95/144",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/ss2-lat_final_v2.log",
+   "kind": "log",
+   "reproduce": "/shared/vllm/.venv-qwen38/bin/python artifacts/scripts/ss_bench2.py 8013 (final latency server)",
+   "proves": "8-prompt bench: mean 89.4 tok/s, median 80.5, mean TTFT 0.30 s",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/needle200k-lat_final_v2.log",
+   "kind": "log",
+   "reproduce": "/shared/vllm/.venv-qwen38/bin/python artifacts/scripts/long_ctx_probe.py --port 8013 --target-tokens 200000 (final latency server, gpu-mem 0.92)",
+   "proves": "262k-context invariant: 200k needle retrieved on the latency profile (183.9 s cold)",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/needle200k-tp_final.log",
+   "kind": "log",
+   "reproduce": "long_ctx_probe.py --port 8013 --target-tokens 200000 (final throughput server)",
+   "proves": "200k needle retrieved on the throughput profile (158 s cold, DBO)",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_base_c128.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_base_c128 [conc] (server from artifacts/configs)",
+   "proves": "baseline throughput c128: 621.7 tok/s",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_base_c64.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_base_c64 [conc] (server from artifacts/configs)",
+   "proves": "baseline c64: 632.6",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_base_c32.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_base_c32 [conc] (server from artifacts/configs)",
+   "proves": "baseline c32: 452.6",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_seqs128_c128.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_seqs128_c128 [conc] (server from artifacts/configs)",
+   "proves": "seqs128: 757",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_pp2_c128.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_pp2_c128 [conc] (server from artifacts/configs)",
+   "proves": "TP2xPP2: 408 (rejected)",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_triton_c128.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_triton_c128 [conc] (server from artifacts/configs)",
+   "proves": "triton attn: 614.7 (= flashinfer)",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_marlin_c128.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_marlin_c128 [conc] (server from artifacts/configs)",
+   "proves": "marlin fp8: 571.8 (rejected)",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_v2_c128.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_v2_c128 [conc] (server from artifacts/configs)",
+   "proves": "V2 runner plain: 618.8 (= V1)",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_dbo128_ch1_c128.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_dbo128_ch1_c128 [conc] (server from artifacts/configs)",
+   "proves": "seqs128+DBO+ch1: 814",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_dbo192_c192.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_dbo192_c192 [conc] (server from artifacts/configs)",
+   "proves": "seqs192: 797 (TPOT 206) rejected",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_final3_c128.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_final3_c128 [conc] (server from artifacts/configs)",
+   "proves": "FINAL throughput yaml (offload on): 827.9 tok/s, TPOT 137",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_final3_c64.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_final3_c64 [conc] (server from artifacts/configs)",
+   "proves": "FINAL c64: 680.2, TPOT 88.8",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/bench-tp_final3_c32.json",
+   "kind": "json",
+   "reproduce": "artifacts/scripts/tp_bench.sh tp_final3_c32 [conc] (server from artifacts/configs)",
+   "proves": "FINAL c32: 479.6, TPOT 62.5",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/outputs-dbo.json",
+   "kind": "json",
+   "reproduce": "/shared/vllm/.venv-qwen38/bin/python artifacts/scripts/cmp_out.py 8013 out.json on the DBO server",
+   "proves": "DBO correctness: sane greedy outputs incl. 37k split prompt after the mamba_state_seq_lens fix",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/prof_int4_v2/profiler_out_0.txt",
+   "kind": "profile",
+   "reproduce": "profiler-config torch on artifacts/configs/lat_int4_prof_v2.yaml; artifacts/scripts/prof_one.py; trace_sum.py rank0 trace",
+   "proves": "per-step breakdown of the final latency path (GEMM 62%, nccl 11%, int4 head 8.7%, cutlass bf16 8.3%)",
+   "tier": "integration"
+  },
+  {
+   "path": "progress.jsonl",
+   "kind": "log",
+   "reproduce": "cat progress.jsonl",
+   "proves": "iteration history with all measurements and decisions",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/live/20260818T122159Z-prod-8012-ss_bench-r2.log",
+   "kind": "log",
+   "reproduce": "sudo systemctl start vllm-qwen38 (hardened unit); VLLM_API_KEY=... /shared/vllm/.venv-qwen38/bin/python artifacts/scripts/ss_bench.py 8012",
+   "proves": "LIVE round 2 on the hardened production unit (NoNewPrivileges/PrivateTmp/ProtectSystem, reworked patches): 65.3/54.7/98.7/144.4 tok/s; /metrics exposes vllm_keepalive_* counters",
+   "tier": "live"
+  },
+  {
+   "path": "artifacts/logs/ss-lat_final_r2.log",
+   "kind": "log",
+   "reproduce": "VLLM_USE_V2_MODEL_RUNNER=1 artifacts/scripts/up.sh artifacts/configs/lat_final_v1.yaml <log>; /shared/vllm/.venv-qwen38/bin/python artifacts/scripts/ss_bench.py 8013",
+   "proves": "final latency profile after the review fix wave (production Marlin path, drafted-columns-only): 68.2/56.2/106.1/143.1",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/ttft-lat_final_v2.log",
+   "kind": "log",
+   "reproduce": "/shared/vllm/.venv-qwen38/bin/python artifacts/scripts/ttft_probe.py 8013 32000 61; ... 80000 62 (final latency server, cold prompts)",
+   "proves": "cold long-prefill TTFT of the final latency profile: 37k 17.82 s, 90k 58.57 s",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/ttft-lat_base_v1.log",
+   "kind": "log",
+   "reproduce": "/shared/vllm/.venv-qwen38/bin/python artifacts/scripts/ttft_probe.py 8013 32000 61; ... 80000 62 (baseline lat_base.yaml server)",
+   "proves": "baseline cold TTFT: 37k 17.53 s, 90k 56.95 s -> latency profile TTFT unchanged within 2-3% (prefill path untouched)",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/burst-lat_final_v2.log",
+   "kind": "log",
+   "reproduce": "/shared/vllm/.venv-qwen38/bin/python artifacts/scripts/burst_client.py 8013 128 1024 512 (final latency server)",
+   "proves": "128-request burst on the latency profile: 128/128 ok, no errors, 348 tok/s aggregate (K7 profile), server healthy",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/ttft-tp_final_dbo.log",
+   "kind": "log",
+   "reproduce": "/shared/vllm/.venv-qwen38/bin/python artifacts/scripts/ttft_probe.py 8013 <8000|16000|32000> <seed> (final throughput server, DBO+ch1)",
+   "proves": "throughput profile cold prefill: 9k 2.88 s, 16k 5.97 s, 37k 13.61 s",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/ttft-tp_base.log",
+   "kind": "log",
+   "reproduce": "same probes on the baseline tp_base.yaml server",
+   "proves": "baseline cold prefill: 9k 3.65 s, 16k 6.85 s, 37k 14.44 s -> DBO -21% / -13% / -6%",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/greedy-compare-latency.log",
+   "kind": "log",
+   "reproduce": "/shared/vllm/.venv-qwen38/bin/python artifacts/scripts/outputs_capture.py on both servers; compare_outputs.py",
+   "proves": "greedy 96-token continuations baseline vs final latency: 2/8 identical (divergence at numeric near-ties, expected across kernel paths)",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/greedy-compare-throughput.log",
+   "kind": "log",
+   "reproduce": "same for tp_base vs tp_final",
+   "proves": "greedy continuations baseline vs final throughput (no spec decode in either): 3/8 identical -> same divergence pattern without any drafter",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/logprob-agreement-latency.log",
+   "kind": "log",
+   "reproduce": "/shared/vllm/.venv-qwen38/bin/python artifacts/scripts/logprob_agreement.py 8013 <out.json> agree_texts.json on both servers; compare_logprobs.py",
+   "proves": "per-token logprob agreement baseline vs final latency: mean |dlogprob| 0.079, top-1 disagreement 3.2% over 1817 positions",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/logprob-agreement-throughput.log",
+   "kind": "log",
+   "reproduce": "same for tp_base vs tp_final",
+   "proves": "baseline vs final throughput: mean |dlogprob| 0.087, top-1 disagreement 3.25%",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/logprob-agreement-reference-latbase-vs-tpbase.log",
+   "kind": "log",
+   "reproduce": "compare_logprobs.py logprobs-lat_base.json logprobs-tp_base.json",
+   "proves": "reference noise floor between the two PRE-EXISTING prod configs (V1, MTP on/off, FlashInfer/Triton): mean |dlogprob| 0.092, top-1 disagreement 3.5% -> both profiles stay within vLLM config-to-config noise",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/outputs-lat_base.json",
+   "kind": "json",
+   "reproduce": "outputs_capture.py",
+   "proves": "baseline greedy outputs (latency)",
+   "tier": "integration"
+  },
+  {
+   "path": "artifacts/logs/outputs-lat_final_v2.json",
+   "kind": "json",
+   "reproduce": "outputs_capture.py",
+   "proves": "final greedy outputs (latency)",
+   "tier": "integration"
+  }
+ ]
+}

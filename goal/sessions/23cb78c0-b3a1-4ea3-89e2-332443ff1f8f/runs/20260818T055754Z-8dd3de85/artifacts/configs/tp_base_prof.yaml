@@ -1,0 +1,14 @@
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 4
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.95
+max-num-seqs: 96
+max-num-batched-tokens: 8192
+compilation-config: '{"max_cudagraph_capture_size": 96}'
+reasoning-parser: qwen3
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+port: 8013
+profiler-config: '{"profiler":"torch","torch_profiler_dir":"/shared/vllm/goal/sessions/23cb78c0-b3a1-4ea3-89e2-332443ff1f8f/runs/20260818T055754Z-8dd3de85/artifacts/logs/prof_tp_base","torch_profiler_with_stack":false}'

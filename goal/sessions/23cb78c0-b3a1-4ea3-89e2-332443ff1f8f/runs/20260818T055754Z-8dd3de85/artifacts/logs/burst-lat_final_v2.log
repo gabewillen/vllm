@@ -1,0 +1,1 @@
+burst N=128 in=1024 out=512: ok=128/128 errors=[] wall=188.4s agg=348 tok/s ttft median=68.2s max=147.6s
