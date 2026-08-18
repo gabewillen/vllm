@@ -1,0 +1,3158 @@
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index 0ac93be..330635f 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -1,14 +1,163 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import math
+ from dataclasses import field
+ 
++from pydantic import Field
++
+ from vllm.config.model import ModelConfig
+ from vllm.config.utils import config
+ from vllm.reasoning import ReasoningParserManager
+ from vllm.tokenizers import cached_tokenizer_from_config
+ 
+ 
++QWEN_LOW_EFFORT_SENTENCE = (
++    "Reasoning effort is set to low. Keep your thinking brief and focused, "
++    "moving directly to the conclusion without unnecessary elaboration."
++)
++
++
++@config
++class DynamicEffortConfig:
++    """Server defaults for `reasoning_effort: "dynamic"`.
++
++    Every dynamic request starts at `ladder[0]` and the scheduler-side
++    controller escalates one rung at a time from live signals; see
++    `vllm/v1/core/sched/effort_controller.py` for the policy.
++    """
++
++    ladder: list[int] = field(default_factory=lambda: [1024, 4096, 16384, 65536])
++    """Thinking-token caps per rung, strictly increasing."""
++    check_at: float = Field(default=0.75, gt=0.0, lt=1.0)
++    """Fraction of the current cap at which the escalation check fires."""
++    final_check_at: float = Field(default=0.9, gt=0.0, lt=1.0)
++    """Fraction of the current cap for the second (last) escalation check."""
++    theta: list[float] | None = None
++    """Escalation score threshold per transition (`len(ladder) - 1` entries).
++    Defaults to `[0.0, 0.5, 1.0, ...]` (harder to climb the higher rungs)."""
++    w_h: float = 1.0
++    """Weight of z(H_fast) in the escalation score."""
++    w_m: float = 1.0
++    """Weight of -z(margin_ema) in the escalation score."""
++    w_t: float = 0.5
++    """Weight of the entropy-trend indicator `[H_fast >= H_slow]`."""
++    w_a: float = 0.5
++    """Weight of the MTP acceptance drop `(acc_base - acc_ema)`."""
++    ema_fast_alpha: float = Field(default=0.3, gt=0.0, le=1.0)
++    """EMA weight of a new sample for `H_fast`, `margin_ema` and `acc_ema`."""
++    ema_slow_alpha: float = Field(default=0.05, gt=0.0, le=1.0)
++    """EMA weight of a new sample for `H_slow`."""
++    min_samples: int = Field(default=64, ge=1)
++    """Signal samples (committed think tokens with signals) required before
++    an escalation may fire."""
++    acc_baseline_tokens: int = Field(default=256, ge=1)
++    """Draft-token observations that form the per-request MTP acceptance
++    baseline (`acc_base`)."""
++    dwell_tokens: int = Field(default=128, ge=0)
++    """Think tokens that must pass at a rung before its checks may fire."""
++    cooldown_tokens: int = Field(default=0, ge=0)
++    """Think tokens after an escalation before the next check may fire."""
++    loop_ngram: int = Field(default=16, ge=2)
++    """N-gram length for the degenerate-loop detector."""
++    loop_repeats: int = Field(default=3, ge=2)
++    """Repeats of an n-gram (or 32-token window) that flag a loop."""
++    loop_window: int = Field(default=512, ge=32)
++    """Think tokens the n-gram loop detector looks back over."""
++    hash_window: int = Field(default=32, ge=2)
++    """Length of the rolling token windows hashed for the loop detector."""
++    hard_stop_margin: int = Field(default=32, ge=1)
++    """Tokens of thinking left after a stall clamp (`cap = think + margin`)."""
++    backtrack_markers: list[str] = field(
++        default_factory=lambda: ["Wait", "Hmm", "Actually", "Let me re-check"]
++    )
++    """Self-correction phrases whose density is tracked as churn evidence."""
++    marker_window: int = Field(default=256, ge=16)
++    """Think tokens over which the backtrack-marker density is measured."""
++    marker_max_rate: float = Field(default=0.05, gt=0.0)
++    """Markers per token above which non-converging thinking counts as churn
++    (vetoes escalation; never a hard stop)."""
++    answer_reserve_tokens: int = Field(default=256, ge=0)
++    """Tokens kept free below `max_tokens` for the answer after thinking;
++    a rung whose cap cannot leave this reserve is never entered."""
++    max_rung_by_batch_size: list[tuple[int, int, int]] | None = None
++    """`(range_start, range_end, max_rung)` with inclusive batch-size ranges;
++    the top rung is withheld under load. Batch sizes outside every range
++    keep the full ladder."""
++    floor_enabled: bool = False
++    """Thinking-floor actuator (P5). Rejected while unimplemented."""
++    calibration: dict[str, tuple[float, float]] = field(
++        default_factory=lambda: {"entropy": (0.0, 1.0), "margin": (0.0, 1.0)}
++    )
++    """Per-signal `(mean, std)` used by the z-scores; keys `entropy`, `margin`."""
++    render_effort: str = "medium"
++    """`reasoning_effort` value handed to the chat template for dynamic
++    requests (block-0-stable rendering)."""
++    low_effort_sentence: str = QWEN_LOW_EFFORT_SENTENCE
++    """Sentence appended to the last user turn of a dynamic request (the
++    rung-0 prior). Empty disables the append."""
++
++    def __post_init__(self) -> None:
++        if len(self.ladder) < 2:
++            raise ValueError("dynamic_effort.ladder needs at least two rungs")
++        if any(cap <= 0 for cap in self.ladder) or any(
++            b <= a for a, b in zip(self.ladder, self.ladder[1:])
++        ):
++            raise ValueError(
++                "dynamic_effort.ladder must be positive and strictly increasing"
++            )
++        if self.final_check_at <= self.check_at:
++            raise ValueError("dynamic_effort.final_check_at must exceed check_at")
++        if self.theta is None:
++            self.theta = [0.5 * i for i in range(len(self.ladder) - 1)]
++        if len(self.theta) != len(self.ladder) - 1:
++            raise ValueError(
++                "dynamic_effort.theta needs one entry per ladder transition "
++                f"({len(self.ladder) - 1}), got {len(self.theta)}"
++            )
++        if any(not math.isfinite(t) for t in self.theta):
++            raise ValueError("dynamic_effort.theta must be finite")
++        if self.hash_window <= self.loop_ngram:
++            raise ValueError("dynamic_effort.hash_window must exceed loop_ngram")
++        if self.floor_enabled:
++            raise ValueError("dynamic_effort.floor_enabled is not implemented")
++        for key in ("entropy", "margin"):
++            if key not in self.calibration:
++                raise ValueError(f"dynamic_effort.calibration is missing '{key}'")
++        for key, (mean, std) in self.calibration.items():
++            if not (math.isfinite(mean) and math.isfinite(std)) or std <= 0.0:
++                raise ValueError(
++                    f"dynamic_effort.calibration['{key}'] needs finite mean and std > 0"
++                )
++        if self.max_rung_by_batch_size is not None:
++            top = len(self.ladder) - 1
++            prev_end = 0
++            for start, end, rung in self.max_rung_by_batch_size:
++                if start < 1 or end < start or start <= prev_end:
++                    raise ValueError(
++                        "dynamic_effort.max_rung_by_batch_size ranges must be "
++                        "1-based, ordered and non-overlapping"
++                    )
++                if not 0 <= rung <= top:
++                    raise ValueError(
++                        f"dynamic_effort.max_rung_by_batch_size rung {rung} is "
++                        f"outside [0, {top}]"
++                    )
++                prev_end = end
++
++    @property
++    def top_rung(self) -> int:
++        return len(self.ladder) - 1
++
++    def max_rung_for_batch_size(self, batch_size: int) -> int:
++        """Highest rung allowed at `batch_size` (S11)."""
++        if self.max_rung_by_batch_size:
++            for start, end, rung in self.max_rung_by_batch_size:
++                if start <= batch_size <= end:
++                    return rung
++        return self.top_rung
++
++
+ @config
+ class ReasoningConfig:
+     """Configuration for reasoning models.
+@@ -25,6 +174,8 @@ class ReasoningConfig:
+     """String that indicates the start of reasoning."""
+     reasoning_end_str: str = ""
+     """String forced when the thinking budget is exhausted."""
++    dynamic_effort: DynamicEffortConfig | None = None
++    """Server defaults for `reasoning_effort: "dynamic"`; `None` rejects it."""
+ 
+     _reasoning_start_token_ids: list[int] | None = field(
+         default=None, init=False, repr=False
+diff --git a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+new file mode 100644
+index 0000000..b9010fb
+--- /dev/null
++++ b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+@@ -0,0 +1,172 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Frontend half of `reasoning_effort: "dynamic"` (docs/dynamic-reasoning §2b, §7).
++
++`dynamic` never reaches the chat template. The request is rewritten in place:
++the template sees `render_effort` (medium: no effort sentence, so block 0 of
++the prompt is identical for every effort), the low-effort sentence is appended
++to the *last user turn* (rung-0 prior, prefix-cache safe), the static
++`thinking_token_budget` becomes `ladder[0]`, and the validated overrides ride
++in `SamplingParams.extra_args["dynamic_effort"]` for the scheduler.
++"""
++
++import math
++from typing import TYPE_CHECKING, Any
++
++from vllm.config.reasoning import DynamicEffortConfig
++
++if TYPE_CHECKING:
++    from vllm.entrypoints.openai.chat_completion.protocol import (
++        ChatCompletionRequest,
++    )
++
++_LADDER_KEY = "dynamic_effort_ladder"
++_THETA_KEY = "dynamic_effort_theta"
++_BIAS_KEY = "effort_bias"
++_DEADLINE_KEY = "deadline_ms"
++_FLOOR_KEY = "dynamic_effort_floor"
++
++
++class DynamicEffortError(ValueError):
++    """Client error in a dynamic-effort request (rendered as HTTP 400)."""
++
++
++def _int_list(value: Any, key: str) -> list[int]:
++    if not isinstance(value, list) or not value:
++        raise DynamicEffortError(f"vllm_xargs.{key} must be a non-empty list")
++    out: list[int] = []
++    for x in value:
++        if isinstance(x, bool) or not isinstance(x, int | float) or x != int(x):
++            raise DynamicEffortError(f"vllm_xargs.{key} must contain integers")
++        out.append(int(x))
++    return out
++
++
++def _float_list(value: Any, key: str) -> list[float]:
++    if not isinstance(value, list) or not value:
++        raise DynamicEffortError(f"vllm_xargs.{key} must be a non-empty list")
++    out: list[float] = []
++    for x in value:
++        if isinstance(x, bool) or not isinstance(x, int | float):
++            raise DynamicEffortError(f"vllm_xargs.{key} must contain numbers")
++        if not math.isfinite(float(x)):
++            raise DynamicEffortError(f"vllm_xargs.{key} must be finite")
++        out.append(float(x))
++    return out
++
++
++def build_dynamic_effort_overrides(
++    cfg: DynamicEffortConfig, xargs: dict[str, Any] | None
++) -> dict[str, Any]:
++    """Validate the per-request `vllm_xargs` and merge them over `cfg`."""
++    xargs = xargs or {}
++    ladder = list(cfg.ladder)
++    theta = list(cfg.theta or [])
++    if _LADDER_KEY in xargs:
++        ladder = _int_list(xargs[_LADDER_KEY], _LADDER_KEY)
++        if len(ladder) < 2 or ladder[0] <= 0:
++            raise DynamicEffortError(
++                f"vllm_xargs.{_LADDER_KEY} needs at least two positive rungs"
++            )
++        if any(b <= a for a, b in zip(ladder, ladder[1:])):
++            raise DynamicEffortError(
++                f"vllm_xargs.{_LADDER_KEY} must be strictly increasing"
++            )
++        if _THETA_KEY not in xargs and len(theta) != len(ladder) - 1:
++            theta = [0.5 * i for i in range(len(ladder) - 1)]
++    if _THETA_KEY in xargs:
++        theta = _float_list(xargs[_THETA_KEY], _THETA_KEY)
++    if len(theta) != len(ladder) - 1:
++        raise DynamicEffortError(
++            f"vllm_xargs.{_THETA_KEY} needs one entry per ladder transition "
++            f"({len(ladder) - 1}), got {len(theta)}"
++        )
++    bias = 0.0
++    if _BIAS_KEY in xargs:
++        raw = xargs[_BIAS_KEY]
++        if isinstance(raw, bool) or not isinstance(raw, int | float):
++            raise DynamicEffortError(f"vllm_xargs.{_BIAS_KEY} must be a number")
++        bias = float(raw)
++        if not math.isfinite(bias):
++            raise DynamicEffortError(f"vllm_xargs.{_BIAS_KEY} must be finite")
++    deadline_ms = None
++    if _DEADLINE_KEY in xargs and xargs[_DEADLINE_KEY] is not None:
++        raw = xargs[_DEADLINE_KEY]
++        if (
++            isinstance(raw, bool)
++            or not isinstance(raw, int | float)
++            or not math.isfinite(float(raw))
++            or raw <= 0
++        ):
++            raise DynamicEffortError(
++                f"vllm_xargs.{_DEADLINE_KEY} must be a positive number"
++            )
++        deadline_ms = float(raw)
++    if xargs.get(_FLOOR_KEY):
++        raise DynamicEffortError(f"vllm_xargs.{_FLOOR_KEY} is not implemented")
++    return {
++        "ladder": ladder,
++        "theta": theta,
++        "bias": bias,
++        "deadline_ms": deadline_ms,
++    }
++
++
++def append_to_last_user_message(messages: list[Any], sentence: str) -> bool:
++    """Append `sentence` (after a blank line) to the last user turn in place.
++
++    String content is extended; list-of-parts content gets a text part.
++    Returns False when there is no user message.
++    """
++    for msg in reversed(messages):
++        if not isinstance(msg, dict) or msg.get("role") != "user":
++            continue
++        content = msg.get("content")
++        if content is None or isinstance(content, str):
++            msg["content"] = f"{content}\n\n{sentence}" if content else sentence
++        elif isinstance(content, list):
++            content.append({"type": "text", "text": sentence})
++        else:
++            raise DynamicEffortError(
++                "dynamic reasoning_effort needs string or list user content"
++            )
++        return True
++    return False
++
++
++def apply_dynamic_effort(
++    request: "ChatCompletionRequest", cfg: DynamicEffortConfig | None
++) -> None:
++    """Rewrite a `reasoning_effort: "dynamic"` request in place.
++
++    Raises:
++        DynamicEffortError: on conflicts, bad overrides or a server without
++            `dynamic_effort` in its reasoning config.
++    """
++    if request.reasoning_effort != "dynamic":
++        return
++    if cfg is None:
++        raise DynamicEffortError(
++            "reasoning_effort='dynamic' is not enabled on this server; start it "
++            "with --reasoning-config '{\"dynamic_effort\": {...}}'"
++        )
++    if request.thinking_token_budget is not None:
++        raise DynamicEffortError(
++            "reasoning_effort='dynamic' conflicts with a static thinking_token_budget"
++        )
++    kwargs = request.chat_template_kwargs or {}
++    if "enable_thinking" in kwargs and not kwargs["enable_thinking"]:
++        raise DynamicEffortError(
++            "reasoning_effort='dynamic' conflicts with "
++            "chat_template_kwargs.enable_thinking=false"
++        )
++    overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
++    if cfg.low_effort_sentence and not append_to_last_user_message(
++        request.messages, cfg.low_effort_sentence
++    ):
++        raise DynamicEffortError(
++            "reasoning_effort='dynamic' needs at least one user message"
++        )
++    request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
++    request.thinking_token_budget = overrides["ladder"][0]
++    request._dynamic_effort = overrides
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index e8bb4e5..4837783 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -124,6 +124,26 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
+     routed_experts: str | None = None
+ 
+ 
++class EffortInfo(OpenAIBaseModel):
++    """Dynamic reasoning-effort outcome (`reasoning_effort: "dynamic"` only)."""
++
++    rung: int
++    escalations: int
++    reasoning_tokens: int
++    late: bool = False
++
++    @classmethod
++    def from_report(cls, report: dict[str, int] | None) -> "EffortInfo | None":
++        if report is None:
++            return None
++        return cls(
++            rung=report.get("rung", 0),
++            escalations=report.get("escalations", 0),
++            reasoning_tokens=report.get("reasoning_tokens", 0),
++            late=bool(report.get("late", 0)),
++        )
++
++
+ class ChatCompletionResponse(OpenAIBaseModel):
+     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
+     object: Literal["chat.completion"] = "chat.completion"
+@@ -147,6 +167,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
+         default=None, description="ECTransfer parameters."
+     )
+     metrics: PerRequestTimingMetrics | None = None
++    effort: EffortInfo | None = None
+ 
+ 
+ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
+@@ -179,6 +200,8 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
+     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
+     prompt_text: str | None = None
+     metrics: PerRequestTimingMetrics | None = None
++    # Set on the final usage chunk of a dynamic-effort request only.
++    effort: EffortInfo | None = None
+ 
+ 
+ class ChatCompletionToolsParam(OpenAIBaseModel):
+@@ -243,16 +266,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         | None
+     ) = "none"
+     reasoning_effort: (
+-        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
++        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "dynamic"]
++        | None
+     ) = Field(
+         default=None,
+         description=(
+             "Constrains effort on reasoning for reasoning models. "
+             "Currently supported values are none, minimal, low, medium, "
+-            "high, xhigh, and max. Reducing reasoning effort can result in "
+-            "faster responses and fewer tokens used on reasoning in a response. "
+-            "Note that 'max' is specific to the DeepSeek V4 series and is not "
+-            "part of the standard OpenAI API specification."
++            "high, xhigh, max, and dynamic. Reducing reasoning effort can "
++            "result in faster responses and fewer tokens used on reasoning in "
++            "a response. Note that 'max' is specific to the DeepSeek V4 series "
++            "and is not part of the standard OpenAI API specification. "
++            "'dynamic' is vLLM-specific: the engine starts at the lowest "
++            "thinking budget and escalates from live signals (requires "
++            "--reasoning-config with dynamic_effort)."
+         ),
+     )
+     thinking_token_budget: ThinkingTokenBudget = None
+@@ -566,6 +593,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
+ 
+     _grammar_from_parser: bool = PrivateAttr(default=False)
+     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
++    _dynamic_effort: dict[str, Any] | None = PrivateAttr(default=None)
++    """Validated dynamic-effort overrides; set only by `apply_dynamic_effort`."""
+ 
+     def build_chat_params(
+         self,
+@@ -709,6 +738,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         if self.ec_transfer_params:
+             # Pass in ec_transfer_params via extra_args
+             extra_args["ec_transfer_params"] = self.ec_transfer_params
++        if self._dynamic_effort is not None:
++            extra_args["dynamic_effort"] = self._dynamic_effort
++            extra_args.setdefault("effort_telemetry", True)
+         return SamplingParams.from_optional(
+             n=self.n,
+             presence_penalty=self.presence_penalty,
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 12c0282..da62bd8 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -10,6 +10,7 @@ from typing import Any, Final, cast
+ 
+ from fastapi import Request
+ 
++from vllm.config.reasoning import DynamicEffortConfig
+ from vllm.engine.protocol import EngineClient
+ from vllm.entrypoints.chat_utils import (
+     ChatTemplateContentFormatOption,
+@@ -23,6 +24,10 @@ from vllm.entrypoints.generate.base.serving import (
+     clamp_prompt_logprobs,
+     format_token_id_placeholder,
+ )
++from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
++    DynamicEffortError,
++    apply_dynamic_effort,
++)
+ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionLogProb,
+     ChatCompletionLogProbs,
+@@ -34,6 +39,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionResponseStreamChoice,
+     ChatCompletionStreamResponse,
+     ChatMessage,
++    EffortInfo,
+ )
+ from vllm.entrypoints.openai.engine.protocol import (
+     DeltaMessage,
+@@ -175,6 +181,11 @@ class OpenAIServingChat(GenerateBaseServing):
+         self.supports_code_interpreter = False
+         self.python_tool = None
+ 
++    def _dynamic_effort_config(self) -> DynamicEffortConfig | None:
++        vllm_config = getattr(self.engine_client, "vllm_config", None)
++        reasoning_config = getattr(vllm_config, "reasoning_config", None)
++        return getattr(reasoning_config, "dynamic_effort", None)
++
+     def _effective_chat_template_kwargs(
+         self, request: ChatCompletionRequest
+     ) -> dict[str, Any]:
+@@ -238,6 +249,11 @@ class OpenAIServingChat(GenerateBaseServing):
+         # Streaming response
+         tokenizer = self.renderer.tokenizer
+         assert tokenizer is not None
++        if request.reasoning_effort == "dynamic":
++            try:
++                apply_dynamic_effort(request, self._dynamic_effort_config())
++            except DynamicEffortError as e:
++                return self.create_error_response(str(e))
+         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+         parser: Parser | None = None
+         if self.parser_cls is not None:
+@@ -801,6 +817,9 @@ class OpenAIServingChat(GenerateBaseServing):
+                     usage=final_usage,
+                     system_fingerprint=self.system_fingerprint,
+                     metrics=stream_per_request_metrics,
++                    effort=EffortInfo.from_report(
++                        last_res.effort if last_res is not None else None
++                    ),
+                 )
+                 final_usage_data = final_usage_chunk.model_dump_json(
+                     exclude_unset=True, exclude_none=True
+@@ -1098,6 +1117,7 @@ class OpenAIServingChat(GenerateBaseServing):
+             kv_transfer_params=final_res.kv_transfer_params,
+             ec_transfer_params=final_res.ec_transfer_params,
+             metrics=per_request_metrics,
++            effort=EffortInfo.from_report(final_res.effort),
+         )
+ 
+         # Log complete response if output logging is enabled
+diff --git a/vllm/outputs.py b/vllm/outputs.py
+index 29584e0..07d2c43 100644
+--- a/vllm/outputs.py
++++ b/vllm/outputs.py
+@@ -122,6 +122,8 @@ class RequestOutput:
+             prefix-cache writes for this request.
+         kv_transfer_params: The params for remote K/V transfer.
+         ec_transfer_params: The params for remote encoder-cache transfer.
++        effort: Dynamic reasoning-effort report (rung, escalations,
++            reasoning_tokens, late, stall_clamps), set on the final output.
+     """
+ 
+     def __init__(
+@@ -141,6 +143,7 @@ class RequestOutput:
+         *,
+         kv_transfer_params: dict[str, Any] | None = None,
+         ec_transfer_params: dict[str, Any] | None = None,
++        effort: dict[str, int] | None = None,
+         # Forward compatibility, code that uses args added in new release can
+         # still run with older versions of vLLM without breaking.
+         **kwargs: Any,
+@@ -163,6 +166,7 @@ class RequestOutput:
+         self.num_cache_creation_tokens = num_cache_creation_tokens
+         self.kv_transfer_params = kv_transfer_params
+         self.ec_transfer_params = ec_transfer_params
++        self.effort = effort
+ 
+     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
+         """Merge subsequent RequestOutput into this one"""
+@@ -170,6 +174,8 @@ class RequestOutput:
+         self.finished |= next_output.finished
+         self.kv_transfer_params = next_output.kv_transfer_params
+         self.ec_transfer_params = next_output.ec_transfer_params
++        if next_output.effort is not None:
++            self.effort = next_output.effort
+ 
+         for next_completion in next_output.outputs:
+             for i, completion in enumerate(self.outputs):
+diff --git a/vllm/v1/core/sched/effort_controller.py b/vllm/v1/core/sched/effort_controller.py
+new file mode 100644
+index 0000000..4b6fff2
+--- /dev/null
++++ b/vllm/v1/core/sched/effort_controller.py
+@@ -0,0 +1,485 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Dynamic reasoning-effort controller: pure per-request policy.
++
++The scheduler owns one `EffortState` per dynamic request and feeds it one
++`EffortEvent` per engine step through `step_effort`. Nothing here touches the
++scheduler, so a recorded event stream replays the same decisions.
++
++Signals (docs/dynamic-reasoning.claude.md §3): think position (S1), mean
++normalised entropy and top1-top2 margin of the committed rows (S2/S3) with
++fast/slow EMAs (S4), MTP acceptance (S6, corroboration only), loop/marker
++evidence (S7), max_tokens headroom (S8), batch-size rung cap (S11) and a
++client deadline (S12). Decisions (§4): hard-stop clamp on a loop, and a
++one-rung escalation at the `check_at` / `final_check_at` points of the cap.
++"""
++
++import math
++from collections import Counter, deque
++from collections.abc import Sequence
++from dataclasses import dataclass, field
++from itertools import islice
++from typing import Any
++
++from vllm.config.reasoning import DynamicEffortConfig
++
++
++@dataclass
++class EffortEvent:
++    """Per-step observations for one request (all CPU scalars)."""
++
++    new_token_ids: Sequence[int]
++    """Committed output tokens of this step, in commit order."""
++    entropy: float | None = None
++    """Mean normalised entropy over the committed rows; `None` = missing."""
++    margin: float | None = None
++    """Mean top1-top2 logit margin over the committed rows; `None` = missing."""
++    n_rows: int = 0
++    """Committed rows the two means were taken over."""
++    num_draft_tokens: int = 0
++    num_accepted_tokens: int = 0
++    batch_size: int = 1
++    max_tokens: int = 0
++    """The request's `max_tokens`."""
++    now_ms: float | None = None
++    """Monotonic clock in ms (only needed for `deadline_ms`)."""
++    repetition_evidence: bool = False
++    """The request's own `RepetitionDetectionParams` fired at a relaxed count."""
++    acked_revision: int | None = None
++    """Budget revision the worker reported applied this step."""
++
++
++@dataclass
++class EffortDecision:
++    """What the scheduler must do after a step."""
++
++    budget_update: tuple[int, int] | None = None
++    """`(revision, absolute thinking budget)` to ship, or `None`."""
++    escalation: tuple[int, int] | None = None
++    """`(from_rung, to_rung)` when the step escalated."""
++    stall_clamp: bool = False
++    late: bool = False
++    """The request left the think block with an unacked budget update."""
++    checked: bool = False
++    score: float | None = None
++    vector: dict[str, Any] = field(default_factory=dict)
++    """Signal vector at the check (replay/debug log)."""
++
++
++@dataclass
++class EffortState:
++    """Controller state for one request."""
++
++    request_id: str
++    ladder: list[int]
++    theta: list[float]
++    start_ids: list[int]
++    end_ids: list[int]
++    marker_seqs: list[tuple[int, ...]] = field(default_factory=list)
++    bias: float = 0.0
++    deadline_ms: float | None = None
++    start_ms: float | None = None
++    max_tokens: int = 0
++
++    rung: int = 0
++    cap: int = 0
++    revision: int = 0
++    acked_revision: int = 0
++    pending_is_escalation: bool = False
++
++    in_think: bool = False
++    think_count: int = 0
++    reasoning_tokens: int = 0
++    rung_entry_think: int = 0
++    last_escalation_think: int = 0
++    checked_primary: bool = False
++    checked_final: bool = False
++
++    h_fast: float | None = None
++    h_slow: float | None = None
++    margin_ema: float | None = None
++    samples: int = 0
++    acc_ema: float | None = None
++    acc_base: float | None = None
++    acc_base_draft: int = 0
++    acc_base_accepted: int = 0
++
++    loop_flag: bool = False
++    churn: bool = False
++    stalled: bool = False
++    late: bool = False
++    escalations: int = 0
++    finished: bool = False
++
++    _tail: deque[int] = field(default_factory=deque, repr=False)
++    _window: deque[int] = field(default_factory=deque, repr=False)
++    _recent: deque[int] = field(default_factory=deque, repr=False)
++    _ngram_counts: Counter[int] = field(default_factory=Counter, repr=False)
++    _hash_counts: Counter[int] = field(default_factory=Counter, repr=False)
++    _marker_positions: deque[int] = field(default_factory=deque, repr=False)
++
++    def __post_init__(self) -> None:
++        self.cap = self.ladder[0]
++        tail_len = max(
++            len(self.start_ids),
++            len(self.end_ids),
++            max((len(s) for s in self.marker_seqs), default=1),
++        )
++        self._tail = deque(maxlen=tail_len)
++
++    @property
++    def top_rung(self) -> int:
++        return len(self.ladder) - 1
++
++    @property
++    def report(self) -> dict[str, int]:
++        return {
++            "rung": self.rung,
++            "escalations": self.escalations,
++            "reasoning_tokens": self.reasoning_tokens,
++            "late": int(self.late),
++            "stall_clamps": int(self.stalled),
++        }
++
++
++def _rfind(seq: Sequence[int], sub: Sequence[int]) -> int:
++    """Index of the last occurrence of `sub` in `seq`, or -1."""
++    if not sub or len(sub) > len(seq):
++        return -1
++    if len(sub) == 1:
++        rev = list(seq)[::-1]
++        try:
++            return len(seq) - 1 - rev.index(sub[0])
++        except ValueError:
++            return -1
++    for i in range(len(seq) - len(sub), -1, -1):
++        if list(seq[i : i + len(sub)]) == list(sub):
++            return i
++    return -1
++
++
++def new_effort_state(
++    request_id: str,
++    cfg: DynamicEffortConfig,
++    overrides: dict[str, Any],
++    start_ids: list[int],
++    end_ids: list[int],
++    marker_seqs: list[tuple[int, ...]],
++    prompt_token_ids: Sequence[int] | None,
++    max_tokens: int,
++    now_ms: float | None = None,
++) -> EffortState:
++    """Build the state for a request; a prompt ending mid-think starts in it."""
++    ladder = [int(x) for x in overrides.get("ladder", cfg.ladder)]
++    theta = [float(x) for x in overrides.get("theta", cfg.theta or [])]
++    state = EffortState(
++        request_id=request_id,
++        ladder=ladder,
++        theta=theta,
++        start_ids=start_ids,
++        end_ids=end_ids,
++        marker_seqs=marker_seqs,
++        bias=float(overrides.get("bias", 0.0)),
++        deadline_ms=overrides.get("deadline_ms"),
++        start_ms=now_ms,
++        max_tokens=max_tokens,
++    )
++    if prompt_token_ids:
++        last_start = _rfind(prompt_token_ids, start_ids)
++        last_end = _rfind(prompt_token_ids, end_ids)
++        if last_start >= 0 and last_start > last_end:
++            _enter_think(state)
++            state.think_count = len(prompt_token_ids) - last_start - len(start_ids)
++    return state
++
++
++def _enter_think(state: EffortState) -> None:
++    state.in_think = True
++    state.think_count = 0
++    state.rung_entry_think = 0
++    state.last_escalation_think = 0
++    state.checked_primary = False
++    state.checked_final = False
++    state.h_fast = state.h_slow = state.margin_ema = None
++    state.samples = 0
++    state.loop_flag = False
++    state.churn = False
++    state._window.clear()
++    state._recent.clear()
++    state._ngram_counts.clear()
++    state._hash_counts.clear()
++    state._marker_positions.clear()
++
++
++def _leave_think(state: EffortState) -> None:
++    state.in_think = False
++    # The end sequence itself is not reasoning content.
++    state.think_count = max(state.think_count - len(state.end_ids), 0)
++    state.reasoning_tokens += state.think_count
++    if state.revision > state.acked_revision and state.pending_is_escalation:
++        state.late = True
++
++
++def _tail_endswith(tail: deque[int], seq: Sequence[int]) -> bool:
++    n = len(seq)
++    if n == 0 or len(tail) < n:
++        return False
++    if n == 1:
++        return tail[-1] == seq[0]
++    return list(tail)[-n:] == list(seq)
++
++
++def _push_think_token(state: EffortState, cfg: DynamicEffortConfig, tok: int) -> None:
++    """Loop and marker bookkeeping for one committed think token."""
++    window = state._window
++    recent = state._recent
++    if recent.maxlen != cfg.hash_window:
++        state._recent = recent = deque(recent, maxlen=cfg.hash_window)
++    if len(window) >= cfg.loop_window:
++        old = hash(tuple(islice(window, 0, cfg.loop_ngram)))
++        state._ngram_counts[old] -= 1
++        if state._ngram_counts[old] <= 0:
++            del state._ngram_counts[old]
++        window.popleft()
++    window.append(tok)
++    recent.append(tok)
++    if len(recent) >= cfg.loop_ngram:
++        gram = hash(tuple(list(recent)[-cfg.loop_ngram :]))
++        state._ngram_counts[gram] += 1
++        if state._ngram_counts[gram] >= cfg.loop_repeats:
++            state.loop_flag = True
++    if len(recent) >= cfg.hash_window:
++        h = hash(tuple(recent))
++        state._hash_counts[h] += 1
++        if state._hash_counts[h] >= cfg.loop_repeats:
++            state.loop_flag = True
++    for seq in state.marker_seqs:
++        if _tail_endswith(state._tail, seq):
++            state._marker_positions.append(state.think_count)
++            break
++    while (
++        state._marker_positions
++        and state._marker_positions[0] < state.think_count - cfg.marker_window
++    ):
++        state._marker_positions.popleft()
++
++
++def _ingest_tokens(
++    state: EffortState, cfg: DynamicEffortConfig, tokens: Sequence[int]
++) -> None:
++    for tok in tokens:
++        state._tail.append(tok)
++        if not state.in_think:
++            if _tail_endswith(state._tail, state.start_ids):
++                _enter_think(state)
++            continue
++        state.think_count += 1
++        if _tail_endswith(state._tail, state.end_ids):
++            _leave_think(state)
++            continue
++        _push_think_token(state, cfg, tok)
++
++
++def _ema(prev: float | None, sample: float, alpha: float, n: int) -> float:
++    if prev is None:
++        return sample
++    w = 1.0 - (1.0 - alpha) ** max(n, 1)
++    return (1.0 - w) * prev + w * sample
++
++
++def _finite(x: float | None) -> bool:
++    return x is not None and math.isfinite(x)
++
++
++def _ingest_signals(
++    state: EffortState, cfg: DynamicEffortConfig, ev: EffortEvent
++) -> None:
++    if state.in_think and ev.n_rows > 0 and _finite(ev.entropy) and _finite(ev.margin):
++        assert ev.entropy is not None and ev.margin is not None
++        state.h_fast = _ema(state.h_fast, ev.entropy, cfg.ema_fast_alpha, ev.n_rows)
++        state.h_slow = _ema(state.h_slow, ev.entropy, cfg.ema_slow_alpha, ev.n_rows)
++        state.margin_ema = _ema(
++            state.margin_ema, ev.margin, cfg.ema_fast_alpha, ev.n_rows
++        )
++        state.samples += ev.n_rows
++    if ev.num_draft_tokens > 0:
++        acc = ev.num_accepted_tokens / ev.num_draft_tokens
++        if state.acc_base is None:
++            state.acc_base_draft += ev.num_draft_tokens
++            state.acc_base_accepted += ev.num_accepted_tokens
++            if state.acc_base_draft >= cfg.acc_baseline_tokens:
++                state.acc_base = state.acc_base_accepted / state.acc_base_draft
++        else:
++            state.acc_ema = _ema(state.acc_ema, acc, cfg.ema_fast_alpha, 1)
++    if state.in_think and state.h_fast is not None and state.h_slow is not None:
++        rate = len(state._marker_positions) / cfg.marker_window
++        state.churn = rate > cfg.marker_max_rate and state.h_fast >= state.h_slow
++
++
++def effective_cap(state: EffortState, cfg: DynamicEffortConfig, rung: int) -> int:
++    """Rung cap after the S8 headroom rule (`max_tokens - answer_reserve`)."""
++    cap = state.ladder[rung]
++    if state.max_tokens > 0:
++        cap = min(cap, state.max_tokens - cfg.answer_reserve_tokens)
++    return cap
++
++
++def escalation_score(state: EffortState, cfg: DynamicEffortConfig) -> float | None:
++    """The §4 score, or `None` when a required signal is missing."""
++    if state.h_fast is None or state.h_slow is None or state.margin_ema is None:
++        return None
++    mean_h, std_h = cfg.calibration["entropy"]
++    mean_m, std_m = cfg.calibration["margin"]
++    z_h = (state.h_fast - mean_h) / std_h
++    z_m = (state.margin_ema - mean_m) / std_m
++    trend = 1.0 if state.h_fast >= state.h_slow else 0.0
++    acc_term = 0.0
++    if state.acc_base is not None and state.acc_ema is not None:
++        acc_term = state.acc_base - state.acc_ema
++    score = (
++        cfg.w_h * z_h
++        + cfg.w_m * (-z_m)
++        + cfg.w_t * trend
++        + cfg.w_a * acc_term
++        + state.bias
++    )
++    return score if math.isfinite(score) else None
++
++
++def _deadline_blocks(state: EffortState, ev: EffortEvent, next_cap: int) -> bool:
++    if state.deadline_ms is None or ev.now_ms is None or state.start_ms is None:
++        return False
++    elapsed = ev.now_ms - state.start_ms
++    if elapsed <= 0 or state.think_count <= 0:
++        return False
++    rate = state.think_count / elapsed  # tokens per ms
++    projected = elapsed + (next_cap - state.think_count) / rate
++    return projected > state.deadline_ms
++
++
++def _try_escalate(
++    state: EffortState,
++    cfg: DynamicEffortConfig,
++    ev: EffortEvent,
++    decision: EffortDecision,
++) -> None:
++    if not state.in_think or state.stalled or state.rung >= state.top_rung:
++        return
++    check_pt = cfg.check_at * state.cap
++    final_pt = cfg.final_check_at * state.cap
++    if not state.checked_primary and state.think_count >= check_pt:
++        state.checked_primary = True
++    elif not state.checked_final and state.think_count >= final_pt:
++        state.checked_final = True
++    else:
++        return
++    decision.checked = True
++    score = escalation_score(state, cfg)
++    next_rung = state.rung + 1
++    next_cap = effective_cap(state, cfg, next_rung)
++    vector = {
++        "rung": state.rung,
++        "think": state.think_count,
++        "cap": state.cap,
++        "h_fast": state.h_fast,
++        "h_slow": state.h_slow,
++        "margin": state.margin_ema,
++        "acc_base": state.acc_base,
++        "acc_ema": state.acc_ema,
++        "samples": state.samples,
++        "loop": state.loop_flag,
++        "churn": state.churn,
++        "batch": ev.batch_size,
++        "next_cap": next_cap,
++        "score": score,
++        "theta": state.theta[state.rung],
++    }
++    decision.vector = vector
++    decision.score = score
++    if score is None or state.samples < cfg.min_samples:
++        return
++    if state.loop_flag or state.churn:
++        return
++    if state.think_count - state.rung_entry_think < cfg.dwell_tokens:
++        return
++    if (
++        state.escalations
++        and state.think_count - state.last_escalation_think < cfg.cooldown_tokens
++    ):
++        return
++    if next_rung > cfg.max_rung_for_batch_size(ev.batch_size):
++        return
++    if next_cap <= state.cap:
++        return
++    if _deadline_blocks(state, ev, next_cap):
++        return
++    if score < state.theta[state.rung]:
++        return
++    decision.escalation = (state.rung, next_rung)
++    state.rung = next_rung
++    state.cap = next_cap
++    state.escalations += 1
++    state.rung_entry_think = state.think_count
++    state.last_escalation_think = state.think_count
++    state.checked_primary = False
++    state.checked_final = False
++    state.revision += 1
++    state.pending_is_escalation = True
++    decision.budget_update = (state.revision, state.cap)
++
++
++def step_effort(
++    state: EffortState, cfg: DynamicEffortConfig, ev: EffortEvent
++) -> EffortDecision:
++    """Advance one request by one step and return what to do.
++
++    Deterministic in `(state, cfg, ev)`; mutates `state` in place.
++    """
++    decision = EffortDecision()
++    if ev.acked_revision is not None and ev.acked_revision > state.acked_revision:
++        state.acked_revision = ev.acked_revision
++    if ev.max_tokens:
++        state.max_tokens = ev.max_tokens
++    was_late = state.late
++    _ingest_tokens(state, cfg, ev.new_token_ids)
++    _ingest_signals(state, cfg, ev)
++    if ev.repetition_evidence and state.in_think:
++        state.loop_flag = True
++    if state.late and not was_late:
++        decision.late = True
++    if state.in_think and state.loop_flag and not state.stalled:
++        state.stalled = True
++        state.cap = state.think_count + cfg.hard_stop_margin
++        state.revision += 1
++        state.pending_is_escalation = False
++        decision.stall_clamp = True
++        decision.budget_update = (state.revision, state.cap)
++        return decision
++    _try_escalate(state, cfg, ev, decision)
++    return decision
++
++
++def finish_effort(state: EffortState) -> dict[str, int]:
++    """Close the state at request finish and return the report."""
++    if state.in_think:
++        # Finished mid-think (length cap / abort): count what was thought.
++        state.reasoning_tokens += state.think_count
++        state.in_think = False
++        if state.revision > state.acked_revision and state.pending_is_escalation:
++            state.late = True
++    state.finished = True
++    return state.report
++
++
++def resolve_marker_sequences(
++    markers: Sequence[str], encode: Any
++) -> list[tuple[int, ...]]:
++    """Token sequences for the backtrack markers (bare, space and newline
++    prefixed variants); `encode(text) -> list[int]`."""
++    seqs: set[tuple[int, ...]] = set()
++    for marker in markers:
++        for variant in (marker, " " + marker, "\n" + marker):
++            ids = tuple(encode(variant))
++            if ids:
++                seqs.add(ids)
++    return sorted(seqs, key=len)
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 8782061..a8d5a65 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from functools import cached_property
+ from typing import TYPE_CHECKING
+ 
+@@ -258,6 +258,9 @@ class SchedulerOutput:
+     # CoW copies to apply after zeroing new blocks and before forward.
+     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+ 
++    # req_id -> (revision, absolute thinking budget) for dynamic effort.
++    thinking_budget_updates: dict[str, tuple[int, int]] = field(default_factory=dict)
++
+     # Producer partial-tail offload hand-off for external KV connectors:
+     # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
+     # the durable boundary block of a producer's last-prompt-boundary partial
+@@ -268,6 +271,13 @@ class SchedulerOutput:
+     # Number of spec tokens to schedule for the next step.
+     num_spec_tokens_to_schedule: int = 0
+ 
++    # req_id -> (revision, absolute thinking token budget). Applied by the
++    # model runner before this step's sampling for strictly increasing
++    # revisions only; acked via ModelRunnerOutput.thinking_budget_acks.
++    thinking_budget_updates: dict[str, tuple[int, int]] = field(
++        default_factory=dict
++    )
++
+     @classmethod
+     def make_empty(cls) -> "SchedulerOutput":
+         return cls(
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 992400f..45d6622 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -10,6 +10,7 @@ from typing import Any
+ 
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.config import KVEventsConfig, VllmConfig
++from vllm.config.reasoning import DynamicEffortConfig, ReasoningConfig
+ from vllm.distributed.ec_transfer.ec_connector.base import (
+     ECConnectorBase,
+     ECConnectorMetadata,
+@@ -32,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+ from vllm.multimodal.encoder_budget import MultiModalBudget
+ from vllm.multimodal.utils import get_mm_features_in_window
++from vllm.sampling_params import RepetitionDetectionParams
+ from vllm.v1.core.encoder_cache_manager import (
+     EncoderCacheManager,
+     EncoderDecoderCacheManager,
+@@ -39,6 +41,14 @@ from vllm.v1.core.encoder_cache_manager import (
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import KVCacheBlock
++from vllm.v1.core.sched.effort_controller import (
++    EffortEvent,
++    EffortState,
++    finish_effort,
++    new_effort_state,
++    resolve_marker_sequences,
++    step_effort,
++)
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+ from vllm.v1.core.sched.output import (
+     CachedRequestData,
+@@ -52,13 +62,18 @@ from vllm.v1.core.sched.request_queue import (
+     SchedulingPolicy,
+     create_request_queue,
+ )
+-from vllm.v1.core.sched.utils import check_stop, remove_all
++from vllm.v1.core.sched.utils import (
++    check_sequence_repetition,
++    check_stop,
++    remove_all,
++)
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
++from vllm.v1.sample.effort_signals import EffortTelemetrySink
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
+@@ -288,6 +303,23 @@ class Scheduler(SchedulerInterface):
+             and self.num_spec_tokens > 1
+         )
+         self._accepted_ema: dict[str, float] = {}
++        # Dynamic reasoning effort: per-request controller state, pending
++        # (unacked) budget updates, and relaxed repetition params.
++        self._effort: dict[str, EffortState] = {}
++        self._effort_pending: dict[str, tuple[int, int]] = {}
++        self._effort_rep_params: dict[str, RepetitionDetectionParams] = {}
++        self._effort_cfg: DynamicEffortConfig | None = None
++        self._effort_start_ids: list[int] = []
++        self._effort_end_ids: list[int] = []
++        self._effort_marker_seqs: list[tuple[int, ...]] = []
++        reasoning_config = vllm_config.reasoning_config
++        if reasoning_config is not None and reasoning_config.dynamic_effort:
++            self._init_effort_controller(reasoning_config)
++        # Optional JSONL sink for per-step effort signals (VLLM_EFFORT_TELEMETRY).
++        self.effort_sink = EffortTelemetrySink.from_env(
++            reasoning_config.reasoning_start_token_ids if reasoning_config else None,
++            reasoning_config.reasoning_end_token_ids if reasoning_config else None,
++        )
+         if speculative_config is not None:
+             if speculative_config.num_speculative_tokens_per_batch_size:
+                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+@@ -1326,6 +1358,7 @@ class Scheduler(SchedulerInterface):
+             partial_tail_offloads=pending_partial_tail_offloads,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
++            thinking_budget_updates=dict(self._effort_pending),
+         )
+ 
+         # NOTE(Kuntai): this function is designed for multiple purposes:
+@@ -1782,6 +1815,8 @@ class Scheduler(SchedulerInterface):
+         kv_connector_output = model_runner_output.kv_connector_output
+         ec_connector_output = model_runner_output.ec_connector_output
+         cudagraph_stats = model_runner_output.cudagraph_stats
++        effort_signals = model_runner_output.effort_signals
++        effort_sink = self.effort_sink if effort_signals else None
+ 
+         # Every GPU write enqueued by this and earlier steps has completed, so it is
+         # safe to return deferred-free blocks to the pool.
+@@ -1796,6 +1831,11 @@ class Scheduler(SchedulerInterface):
+         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+         spec_decoding_stats: SpecDecodingStats | None = None
+ 
++        effort_acks = model_runner_output.thinking_budget_acks
++        if effort_acks and self._effort:
++            self._ingest_effort_acks(effort_acks)
++        effort_now_ms: float | None = None
++
+         failed_kv_load_req_ids = None
+         if kv_connector_output and kv_connector_output.invalid_block_ids:
+             # These blocks contain externally computed tokens that failed to
+@@ -1868,6 +1908,9 @@ class Scheduler(SchedulerInterface):
+             scheduled_spec_token_ids = (
+                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+             )
++            effort_draft = effort_accepted = 0
++            effort_num_draft: int | None = None
++            effort_num_accepted: int | None = None
+             if scheduled_spec_token_ids and (
+                 generated_token_ids or self.num_sampled_tokens_per_step == 0
+             ):
+@@ -1875,6 +1918,8 @@ class Scheduler(SchedulerInterface):
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 num_rejected = num_draft_tokens - num_accepted
++                effort_draft, effort_accepted = num_draft_tokens, num_accepted
++                effort_num_draft, effort_num_accepted = num_draft_tokens, num_accepted
+                 if self.adaptive_draft:
+                     self._update_accepted_ema(req_id=req_id, num_accepted=num_accepted)
+                 # Rejections roll back num_computed_tokens (and, under async
+@@ -1930,6 +1975,31 @@ class Scheduler(SchedulerInterface):
+                 request.status = RequestStatus.FINISHED_STOPPED
+                 stopped = True
+ 
++            effort_state = self._effort.get(req_id) if self._effort else None
++            if effort_state is not None and new_token_ids:
++                if effort_state.deadline_ms is not None and effort_now_ms is None:
++                    effort_now_ms = time.monotonic() * 1000.0
++                self._step_effort(
++                    request,
++                    effort_state,
++                    new_token_ids,
++                    effort_signals.get(req_id) if effort_signals else None,
++                    num_draft_tokens=effort_draft,
++                    num_accepted_tokens=effort_accepted,
++                    now_ms=effort_now_ms,
++                )
++            if effort_sink is not None:
++                effort_signal = effort_signals.get(req_id)
++                if effort_signal is not None:
++                    effort_sink.record(
++                        req_id,
++                        request.output_token_ids,
++                        effort_signal,
++                        effort_num_draft,
++                        effort_num_accepted,
++                        stopped,
++                    )
++
+             if new_token_ids and self.structured_output_manager.should_advance(
+                 request, new_token_ids=new_token_ids
+             ):
+@@ -2009,12 +2079,15 @@ class Scheduler(SchedulerInterface):
+                     )
+ 
+             finish_reason = None
++            effort_report = None
+             if stopped:
+                 # Capture finish_reason BEFORE _handle_stopped_request, which may
+                 # reset the status to WAITING for streaming requests that continue.
+                 finish_reason = request.get_finished_reason()
+                 finished = self._handle_stopped_request(request)
+                 if finished:
++                    if effort_state is not None:
++                        effort_report = finish_effort(effort_state)
+                     kv_transfer_params, ec_transfer_params = self._free_request(request)
+ 
+                 if status_before_stop == RequestStatus.RUNNING:
+@@ -2061,6 +2134,7 @@ class Scheduler(SchedulerInterface):
+                         trace_headers=request.trace_headers,
+                         routed_experts=routed_experts,
+                         num_nans_in_logits=request.num_nans_in_logits,
++                        effort=effort_report,
+                     )
+                 )
+             else:
+@@ -2357,6 +2431,8 @@ class Scheduler(SchedulerInterface):
+                 request.streaming_queue = deque()
+             self._enqueue_waiting_request(request)
+             self.requests[request.request_id] = request
++            if self._effort_cfg is not None:
++                self._maybe_add_effort_state(request)
+             if self.connector is not None:
+                 self.connector.on_new_request(request)
+             if self.log_stats:
+@@ -2444,11 +2520,136 @@ class Scheduler(SchedulerInterface):
+             alpha=self.vllm_config.speculative_config.adaptive_draft_ema_alpha,
+         )
+ 
++    def _init_effort_controller(self, reasoning_config: ReasoningConfig) -> None:
++        """Resolve the token ids the dynamic-effort controller tracks."""
++        start_ids = reasoning_config.reasoning_start_token_ids
++        end_ids = reasoning_config.natural_reasoning_end_token_ids
++        if not start_ids or not end_ids:
++            logger.warning(
++                "dynamic_effort configured but reasoning token ids are not "
++                "initialized; the effort controller is disabled."
++            )
++            return
++        cfg = reasoning_config.dynamic_effort
++        assert cfg is not None
++        marker_seqs: list[tuple[int, ...]] = []
++        if cfg.backtrack_markers:
++            try:
++                from vllm.tokenizers import cached_tokenizer_from_config
++
++                tokenizer = cached_tokenizer_from_config(self.vllm_config.model_config)
++                marker_seqs = resolve_marker_sequences(
++                    cfg.backtrack_markers,
++                    lambda text: tokenizer.encode(text, add_special_tokens=False),
++                )
++            except Exception as exc:  # noqa: BLE001
++                logger.warning(
++                    "dynamic_effort: could not tokenize backtrack markers (%s); "
++                    "marker density is disabled.",
++                    exc,
++                )
++        self._effort_cfg = cfg
++        self._effort_start_ids = list(start_ids)
++        self._effort_end_ids = list(end_ids)
++        self._effort_marker_seqs = marker_seqs
++
++    def _maybe_add_effort_state(self, request: Request) -> None:
++        params = request.sampling_params
++        if params is None or not params.extra_args:
++            return
++        overrides = params.extra_args.get("dynamic_effort")
++        if not isinstance(overrides, dict):
++            return
++        assert self._effort_cfg is not None
++        now_ms = (
++            time.monotonic() * 1000.0
++            if overrides.get("deadline_ms") is not None
++            else None
++        )
++        self._effort[request.request_id] = new_effort_state(
++            request.request_id,
++            self._effort_cfg,
++            overrides,
++            self._effort_start_ids,
++            self._effort_end_ids,
++            self._effort_marker_seqs,
++            request.prompt_token_ids,
++            request.max_tokens,
++            now_ms=now_ms,
++        )
++        rep = params.repetition_detection
++        if rep is not None and rep.max_pattern_size > 0 and rep.min_count > 2:
++            # Read-only early evidence: the stop's own pattern at one repeat
++            # fewer. check_stop keeps the terminal decision.
++            self._effort_rep_params[request.request_id] = RepetitionDetectionParams(
++                max_pattern_size=rep.max_pattern_size,
++                min_pattern_size=rep.min_pattern_size,
++                min_count=rep.min_count - 1,
++            )
++
++    def _ingest_effort_acks(self, acks: dict[str, int]) -> None:
++        for req_id, revision in acks.items():
++            state = self._effort.get(req_id)
++            if state is None:
++                continue
++            if revision > state.acked_revision:
++                state.acked_revision = revision
++            pending = self._effort_pending.get(req_id)
++            if pending is not None and pending[0] <= revision:
++                del self._effort_pending[req_id]
++
++    def _step_effort(
++        self,
++        request: Request,
++        state: EffortState,
++        new_token_ids: list[int],
++        signals: tuple[float, float, int] | None,
++        num_draft_tokens: int,
++        num_accepted_tokens: int,
++        now_ms: float | None,
++    ) -> None:
++        assert self._effort_cfg is not None
++        rep_params = self._effort_rep_params.get(request.request_id)
++        event = EffortEvent(
++            new_token_ids=new_token_ids,
++            entropy=signals[0] if signals is not None else None,
++            margin=signals[1] if signals is not None else None,
++            n_rows=signals[2] if signals is not None else 0,
++            num_draft_tokens=num_draft_tokens,
++            num_accepted_tokens=num_accepted_tokens,
++            batch_size=len(self.running),
++            max_tokens=request.max_tokens,
++            now_ms=now_ms,
++            repetition_evidence=(
++                rep_params is not None
++                and check_sequence_repetition(request.output_token_ids, rep_params)
++            ),
++        )
++        decision = step_effort(state, self._effort_cfg, event)
++        if decision.budget_update is not None:
++            self._effort_pending[request.request_id] = decision.budget_update
++        if decision.checked or decision.stall_clamp or decision.late:
++            logger.debug(
++                "dynamic_effort %s: escalation=%s stall=%s late=%s update=%s %s",
++                request.request_id,
++                decision.escalation,
++                decision.stall_clamp,
++                decision.late,
++                decision.budget_update,
++                decision.vector,
++            )
++
+     def _free_request(
+         self, request: Request, delay_free_blocks: bool = False
+     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+         assert request.is_finished()
+         self._accepted_ema.pop(request.request_id, None)
++        if self._effort:
++            self._effort.pop(request.request_id, None)
++            self._effort_pending.pop(request.request_id, None)
++            self._effort_rep_params.pop(request.request_id, None)
++        if self.effort_sink is not None:
++            self.effort_sink.forget(request.request_id)
+ 
+         self._inflight_prefills.discard(request)
+         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+index d70778e..6de88fa 100644
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -222,6 +222,10 @@ class EngineCoreOutput(
+ 
+     new_sampling_mask: SamplingMaskLists | None = None
+ 
++    # Dynamic reasoning effort report, set on the finishing output only:
++    # {"rung", "escalations", "reasoning_tokens", "late", "stall_clamps"}.
++    effort: dict[str, int] | None = None
++
+     @property
+     def finished(self) -> bool:
+         return self.finish_reason is not None
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 99f60d5..09a3a42 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -175,6 +175,7 @@ class RequestState:
+         self.queue = queue
+         self.num_cached_tokens = 0
+         self.num_cache_creation_tokens = 0
++        self.effort: dict[str, int] | None = None
+ 
+         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+ 
+@@ -386,6 +387,7 @@ class RequestState:
+             num_cached_tokens=self.num_cached_tokens,
+             num_cache_creation_tokens=self.num_cache_creation_tokens,
+             metrics=self.stats,
++            effort=self.effort,
+         )
+ 
+     def _new_completion_output(
+@@ -643,6 +645,8 @@ class OutputProcessor:
+             stop_reason = engine_core_output.stop_reason
+             kv_transfer_params = engine_core_output.kv_transfer_params
+             ec_transfer_params = engine_core_output.ec_transfer_params
++            if engine_core_output.effort is not None:
++                req_state.effort = engine_core_output.effort
+             if engine_core_output.routed_experts is not None:
+                 req_state.routed_experts_chunks.append(
+                     engine_core_output.routed_experts
+@@ -841,6 +845,7 @@ class OutputProcessor:
+             max_tokens_param=req_state.max_tokens_param,
+             req_stats=req_state.stats,
+             num_cached_tokens=req_state.num_cached_tokens,
++            effort=req_state.effort,
+         )
+         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
+ 
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 692106c..2029197 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -790,6 +790,62 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+             histogram_max_tokens_request, per_engine_labelvalues
+         )
+ 
++        #
++        # Dynamic reasoning effort (labels are fixed enums; rung indices are
++        # bounded by the configured ladder length).
++        #
++        histogram_effort_final_rung = self._histogram_cls(
++            name="vllm:effort_final_rung",
++            documentation="Final ladder rung of dynamic-effort requests.",
++            buckets=[0, 1, 2, 3, 4, 5, 6, 7],
++            labelnames=labelnames,
++        )
++        self.histogram_effort_final_rung = create_metric_per_engine(
++            histogram_effort_final_rung, per_engine_labelvalues
++        )
++        histogram_reasoning_tokens = self._histogram_cls(
++            name="vllm:reasoning_tokens",
++            documentation="Reasoning tokens of dynamic-effort requests.",
++            buckets=build_1_2_5_buckets(max_model_len),
++            labelnames=labelnames,
++        )
++        self.histogram_reasoning_tokens = create_metric_per_engine(
++            histogram_reasoning_tokens, per_engine_labelvalues
++        )
++        counter_effort_escalations = self._counter_cls(
++            name="vllm:effort_escalations",
++            documentation="Dynamic-effort rung escalations by transition.",
++            labelnames=labelnames + ["from", "to"],
++        )
++        self.counter_effort_escalations = {
++            idx: {
++                r: counter_effort_escalations.labels(
++                    model_name, str(idx), str(r), str(r + 1)
++                )
++                for r in range(8)
++            }
++            for idx in engine_indexes
++        }
++        counter_effort_stall_clamps = self._counter_cls(
++            name="vllm:effort_stall_clamps",
++            documentation="Dynamic-effort requests clamped by the stall guard.",
++            labelnames=labelnames,
++        )
++        self.counter_effort_stall_clamps = create_metric_per_engine(
++            counter_effort_stall_clamps, per_engine_labelvalues
++        )
++        counter_effort_late = self._counter_cls(
++            name="vllm:effort_late",
++            documentation=(
++                "Dynamic-effort requests whose budget update was not applied "
++                "before the think block closed."
++            ),
++            labelnames=labelnames,
++        )
++        self.counter_effort_late = create_metric_per_engine(
++            counter_effort_late, per_engine_labelvalues
++        )
++
+         #
+         # Histogram of timing intervals
+         #
+@@ -1257,6 +1313,25 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+                 self.histogram_max_tokens_request[engine_idx].observe(
+                     finished_request.max_tokens_param
+                 )
++            if finished_request.effort is not None:
++                self._record_effort(engine_idx, finished_request.effort)
++
++    def _record_effort(self, engine_idx: int, effort: dict[str, int]) -> None:
++        rung = effort.get("rung", 0)
++        self.histogram_effort_final_rung[engine_idx].observe(rung)
++        self.histogram_reasoning_tokens[engine_idx].observe(
++            effort.get("reasoning_tokens", 0)
++        )
++        # Escalations climb one rung at a time, so the transitions are exactly
++        # (r, r + 1) for the last `escalations` rungs below the final one.
++        transitions = self.counter_effort_escalations[engine_idx]
++        for r in range(max(rung - effort.get("escalations", 0), 0), rung):
++            if r in transitions:
++                transitions[r].inc()
++        if effort.get("stall_clamps"):
++            self.counter_effort_stall_clamps[engine_idx].inc()
++        if effort.get("late"):
++            self.counter_effort_late[engine_idx].inc()
+ 
+     def record_sleep_state(self, sleep: int = 0, level: int = 0):
+         awake = 1
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index 3956f7e..4d101ac 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -253,6 +253,9 @@ class FinishedRequestStats:
+     mean_time_per_output_token: float = 0.0
+     is_corrupted: bool = False
+     num_cached_tokens: int = 0
++    effort: dict[str, int] | None = None
++    """Dynamic reasoning-effort report (rung, escalations, reasoning_tokens,
++    late, stall_clamps) for `reasoning_effort: "dynamic"` requests."""
+ 
+ 
+ @dataclass
+@@ -457,6 +460,7 @@ class IterationStats:
+         max_tokens_param: int | None,
+         req_stats: RequestStateStats,
+         num_cached_tokens: int = 0,
++        effort: dict[str, int] | None = None,
+     ):
+         e2e_latency = self._time_since(req_stats.arrival_time)
+ 
+@@ -496,6 +500,7 @@ class IterationStats:
+             mean_time_per_output_token=mean_time_per_output_token,
+             is_corrupted=req_stats.is_corrupted,
+             num_cached_tokens=num_cached_tokens,
++            effort=effort,
+         )
+         self.finished_requests.append(finished_req)
+ 
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 0bbee76..eafec72 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -256,6 +256,11 @@ class SamplerOutput:
+     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
+     sampled_token_ids: torch.Tensor
+     logprobs_tensors: LogprobsTensors | None
++    # [num_reqs, 3] fp32 (mean entropy, mean margin, n committed rows), only
++    # when a request in the batch opted into effort telemetry.
++    effort_signals: torch.Tensor | None = None
++    # [num_reqs] bool host mask of the opted-in requests.
++    effort_flags: np.ndarray | None = None
+ 
+ 
+ @dataclass
+@@ -349,6 +354,13 @@ class ModelRunnerOutput:
+     # ``None`` when ``return_sampling_mask`` is off.
+     sampling_masks: SamplingMaskLists | None = None
+ 
++    # req_id -> (mean normalised entropy, mean top1-top2 margin, n committed
++    # rows) for requests that opted into effort telemetry this step.
++    effort_signals: dict[str, tuple[float, float, int]] | None = None
++
++    # req_id -> revision of the thinking budget update applied this step.
++    thinking_budget_acks: dict[str, int] | None = None
++
+     @staticmethod
+     def with_kv_conn_output_only(
+         kv_connector_output: KVConnectorOutput | None,
+diff --git a/vllm/v1/sample/effort_signals.py b/vllm/v1/sample/effort_signals.py
+new file mode 100644
+index 0000000..fe04a12
+--- /dev/null
++++ b/vllm/v1/sample/effort_signals.py
+@@ -0,0 +1,344 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Effort telemetry: canonical-stage entropy / top-2 margin per sampled row.
++
++Pure torch/numpy helpers shared by the V1 and V2 samplers, the model runners
++and the scheduler-side JSONL sink. Everything here runs on CPU tensors so the
++semantics are unit-testable without a GPU.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import os
++from collections.abc import Sequence
++from typing import IO, Any
++
++import numpy as np
++import torch
++
++from vllm.sampling_params import SamplingParams
++
++# Column layout of a reduced per-request signal row.
++ENTROPY, MARGIN, NUM_ROWS = 0, 1, 2
++
++# ``SamplingParams.extra_args`` keys that opt a request into the telemetry.
++_OPT_IN_KEYS = ("effort_telemetry", "dynamic_effort")
++
++
++def wants_effort_signals(sampling_params: SamplingParams | None) -> bool:
++    """True when the request opted into effort telemetry via ``extra_args``."""
++    if sampling_params is None:
++        return False
++    extra_args = sampling_params.extra_args
++    if not extra_args:
++        return False
++    return any(bool(extra_args.get(key)) for key in _OPT_IN_KEYS)
++
++
++def effort_row_signals(logits: torch.Tensor) -> torch.Tensor:
++    """Per-row normalised entropy and top1-top2 margin.
++
++    Args:
++        logits: ``[rows, vocab]`` canonical-stage logits (any float dtype).
++
++    Returns:
++        ``[rows, 2]`` fp32: entropy / ``log(vocab)`` in ``[0, 1]`` and the
++        top1-top2 margin in logit units.
++    """
++    z = logits.float()
++    vocab = z.shape[-1]
++    lse = torch.logsumexp(z, dim=-1)
++    probs = torch.softmax(z, dim=-1)
++    # ``0 * -inf`` is nan; masked entries carry zero mass and zero entropy.
++    pz = torch.where(probs > 0, probs * z, torch.zeros_like(z))
++    entropy = (lse - pz.sum(dim=-1)) / math.log(vocab)
++    top2 = z.topk(2, dim=-1).values
++    margin = top2[:, 0] - top2[:, 1]
++    out = torch.stack((entropy, margin), dim=-1)
++    return torch.nan_to_num(out, nan=0.0)
++
++
++def effort_row_signals_scattered(
++    logits: torch.Tensor,
++    row_indices: torch.Tensor | None,
++) -> torch.Tensor:
++    """Row signals for a subset of rows, zero elsewhere.
++
++    Args:
++        logits: ``[rows, vocab]`` logits.
++        row_indices: int64 row indices to compute, or ``None`` for all rows.
++
++    Returns:
++        ``[rows, 2]`` fp32 with computed rows filled and other rows zero.
++    """
++    if row_indices is None:
++        return effort_row_signals(logits)
++    out = torch.zeros((logits.shape[0], 2), dtype=torch.float32, device=logits.device)
++    if row_indices.numel() == 0:
++        return out
++    row_indices = row_indices.to(device=logits.device)
++    out.index_copy_(0, row_indices, effort_row_signals(logits[row_indices]))
++    return out
++
++
++def reduce_committed(
++    row_signals: torch.Tensor,
++    cu_num_rows: torch.Tensor,
++    num_committed: torch.Tensor,
++    row_mask: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Per-request means over the committed prefix of each request's rows.
++
++    Rows of request ``i`` are ``cu_num_rows[i]:cu_num_rows[i+1]`` in commit
++    order; only the first ``num_committed[i]`` rows (bonus / accepted
++    positions) contribute. No host sync: all shapes come from
++    ``row_signals.shape[0]`` and ``cu_num_rows.shape[0]``.
++
++    Args:
++        row_signals: ``[rows, 2]`` per-row signals.
++        cu_num_rows: ``[num_reqs + 1]`` int cumulative row counts.
++        num_committed: ``[num_reqs]`` int committed row count per request.
++        row_mask: optional ``[rows]`` bool; rows with ``False`` are excluded.
++
++    Returns:
++        ``[num_reqs, 3]`` fp32: mean entropy, mean margin, committed row count.
++    """
++    num_reqs = cu_num_rows.shape[0] - 1
++    num_rows = row_signals.shape[0]
++    device = row_signals.device
++    if num_reqs == 0 or num_rows == 0:
++        return torch.zeros((num_reqs, 3), dtype=torch.float32, device=device)
++    counts = (cu_num_rows[1:] - cu_num_rows[:-1]).long()
++    req_of_row = torch.repeat_interleave(
++        torch.arange(num_reqs, device=device), counts, output_size=num_rows
++    )
++    local_pos = torch.arange(num_rows, device=device) - cu_num_rows[req_of_row].long()
++    committed = local_pos < num_committed.long()[req_of_row]
++    if row_mask is not None:
++        committed = committed & row_mask
++    weight = committed.to(torch.float32)
++    sums = torch.zeros((num_reqs, 2), dtype=torch.float32, device=device)
++    sums.index_add_(0, req_of_row, row_signals.float() * weight[:, None])
++    n_rows = torch.zeros(num_reqs, dtype=torch.float32, device=device)
++    n_rows.index_add_(0, req_of_row, weight)
++    means = sums / n_rows.clamp(min=1.0)[:, None]
++    return torch.cat((means, n_rows[:, None]), dim=-1)
++
++
++def commit_order_permutation(num_draft_tokens: Sequence[int]) -> np.ndarray:
++    """Row permutation from ``[target rows..., bonus rows...]`` to commit order.
++
++    V1 spec decode keeps target rows (all requests' draft positions) and bonus
++    rows (one per request) in two blocks. Commit order per request is its draft
++    positions followed by its bonus row.
++
++    Args:
++        num_draft_tokens: per-request draft counts.
++
++    Returns:
++        int64 index array of length ``sum(num_draft_tokens) + len(...)``.
++    """
++    d = np.asarray(num_draft_tokens, dtype=np.int64)
++    num_reqs = d.shape[0]
++    total_draft = int(d.sum())
++    cu = np.zeros(num_reqs + 1, dtype=np.int64)
++    np.cumsum(d, out=cu[1:])
++    perm = np.empty(total_draft + num_reqs, dtype=np.int64)
++    out_start = cu + np.arange(num_reqs + 1, dtype=np.int64)
++    for i in range(num_reqs):
++        perm[out_start[i] : out_start[i] + d[i]] = np.arange(cu[i], cu[i + 1])
++        perm[out_start[i] + d[i]] = total_draft + i
++    return perm
++
++
++def flagged_row_indices(
++    flags: np.ndarray, num_rows_per_req: np.ndarray | None = None
++) -> np.ndarray:
++    """Row indices belonging to flagged requests.
++
++    Args:
++        flags: ``[num_reqs]`` bool.
++        num_rows_per_req: rows per request in row order; ``None`` means one.
++
++    Returns:
++        int64 row indices (empty when nothing is flagged).
++    """
++    if num_rows_per_req is None:
++        return np.flatnonzero(flags).astype(np.int64)
++    return np.flatnonzero(np.repeat(flags, num_rows_per_req)).astype(np.int64)
++
++
++def signals_to_dict(
++    req_ids: Sequence[str],
++    signals: np.ndarray,
++    flags: np.ndarray | None,
++) -> dict[str, tuple[float, float, int]]:
++    """Build ``ModelRunnerOutput.effort_signals`` for flagged requests only.
++
++    Args:
++        req_ids: batch-ordered request ids.
++        signals: ``[num_reqs, 3]`` host array (entropy, margin, n_rows).
++        flags: ``[num_reqs]`` bool opt-in mask; ``None`` means all flagged.
++
++    Returns:
++        req_id -> (mean entropy, mean margin, n committed rows).
++    """
++    out: dict[str, tuple[float, float, int]] = {}
++    for i, req_id in enumerate(req_ids):
++        if flags is not None and not flags[i]:
++            continue
++        row = signals[i]
++        out[req_id] = (float(row[ENTROPY]), float(row[MARGIN]), int(row[NUM_ROWS]))
++    return out
++
++
++class ThinkTracker:
++    """Incremental "inside a think block" detector over a growing token list.
++
++    Same rule as ``ThinkingBudgetStateHolder``: the last start sequence after
++    the last end sequence means thinking. Missing start/end ids -> unknown.
++    """
++
++    def __init__(
++        self,
++        start_ids: Sequence[int] | None,
++        end_ids: Sequence[int] | None,
++    ):
++        self.start_ids = list(start_ids or [])
++        self.end_ids = list(end_ids or [])
++        self.enabled = bool(self.start_ids and self.end_ids)
++        self._overlap = max(len(self.start_ids), len(self.end_ids)) - 1
++        self._scanned = 0
++        self._last_start = -1
++        self._last_end = -1
++
++    @staticmethod
++    def _last_index(tokens: Sequence[int], pattern: list[int], base: int) -> int:
++        n = len(pattern)
++        for i in range(len(tokens) - n, -1, -1):
++            if list(tokens[i : i + n]) == pattern:
++                return base + i
++        return -1
++
++    def update(self, token_ids: Sequence[int]) -> bool | None:
++        """Scan tokens appended since the last call; return in-think state."""
++        if not self.enabled:
++            return None
++        n = len(token_ids)
++        if n < self._scanned:
++            self._scanned, self._last_start, self._last_end = 0, -1, -1
++        base = max(0, self._scanned - self._overlap)
++        window = token_ids[base:]
++        s = self._last_index(window, self.start_ids, base)
++        e = self._last_index(window, self.end_ids, base)
++        if s > self._last_start:
++            self._last_start = s
++        if e > self._last_end:
++            self._last_end = e
++        self._scanned = n
++        return self._last_start > self._last_end
++
++
++def format_sink_record(
++    req_id: str,
++    step: int,
++    num_output_tokens: int,
++    signal: tuple[float, float, int],
++    num_draft_tokens: int | None,
++    num_accepted: int | None,
++    in_think: bool | None,
++) -> str:
++    """One JSONL line for the effort telemetry sink."""
++    rec: dict[str, Any] = {
++        "req_id": req_id,
++        "step": step,
++        "num_output_tokens": num_output_tokens,
++        "entropy": signal[ENTROPY],
++        "margin": signal[MARGIN],
++        "n_rows": signal[NUM_ROWS],
++        "num_draft_tokens": num_draft_tokens,
++        "num_accepted": num_accepted,
++        "in_think": in_think,
++    }
++    return json.dumps(rec, separators=(",", ":"))
++
++
++class EffortTelemetrySink:
++    """Buffered JSONL writer keyed by request; flushes every N lines."""
++
++    FLUSH_EVERY = 256
++
++    def __init__(
++        self,
++        path: str,
++        start_ids: Sequence[int] | None,
++        end_ids: Sequence[int] | None,
++        stream: IO[str] | None = None,
++    ):
++        self.path = path
++        self._start_ids = start_ids
++        self._end_ids = end_ids
++        self._file = stream if stream is not None else open(path, "a")  # noqa: SIM115
++        self._buffer: list[str] = []
++        self._steps: dict[str, int] = {}
++        self._trackers: dict[str, ThinkTracker] = {}
++
++    @classmethod
++    def from_env(
++        cls,
++        start_ids: Sequence[int] | None,
++        end_ids: Sequence[int] | None,
++    ) -> EffortTelemetrySink | None:
++        path = os.environ.get("VLLM_EFFORT_TELEMETRY")
++        if not path:
++            return None
++        return cls(path, start_ids, end_ids)
++
++    def record(
++        self,
++        req_id: str,
++        output_token_ids: Sequence[int],
++        signal: tuple[float, float, int],
++        num_draft_tokens: int | None,
++        num_accepted: int | None,
++        finished: bool,
++    ) -> None:
++        tracker = self._trackers.get(req_id)
++        if tracker is None:
++            tracker = ThinkTracker(self._start_ids, self._end_ids)
++            self._trackers[req_id] = tracker
++        step = self._steps.get(req_id, 0) + 1
++        self._steps[req_id] = step
++        self._buffer.append(
++            format_sink_record(
++                req_id,
++                step,
++                len(output_token_ids),
++                signal,
++                num_draft_tokens,
++                num_accepted,
++                tracker.update(output_token_ids),
++            )
++        )
++        if finished:
++            self.forget(req_id)
++            self.flush()
++        elif len(self._buffer) >= self.FLUSH_EVERY:
++            self.flush()
++
++    def forget(self, req_id: str) -> None:
++        self._steps.pop(req_id, None)
++        self._trackers.pop(req_id, None)
++
++    def flush(self) -> None:
++        if not self._buffer:
++            return
++        self._file.write("\n".join(self._buffer) + "\n")
++        self._file.flush()
++        self._buffer.clear()
++
++    def close(self) -> None:
++        self.flush()
++        self._file.close()
+diff --git a/vllm/v1/sample/metadata.py b/vllm/v1/sample/metadata.py
+index fa4ceac..d6377aa 100644
+--- a/vllm/v1/sample/metadata.py
++++ b/vllm/v1/sample/metadata.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ 
++import numpy as np
+ import torch
+ 
+ from vllm.v1.sample.logits_processor import LogitsProcessors
+@@ -53,3 +54,6 @@ class SamplingMetadata:
+     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
+     # thinking-token-budget logits (holder may exist with an empty tracking set).
+     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
++    # [num_reqs] host bool mask of requests that opted into effort telemetry;
++    # ``None`` when no request in the batch did (no extra sampler work).
++    effort_mask: np.ndarray | None = None
+diff --git a/vllm/v1/sample/rejection_sampler.py b/vllm/v1/sample/rejection_sampler.py
+index a1baf0a..99a7470 100644
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -13,7 +13,14 @@ import torch.nn as nn
+ from vllm.config.model import PROCESSED_LOGPROBS_MODES
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
++from vllm.v1.sample.effort_signals import (
++    commit_order_permutation,
++    effort_row_signals_scattered,
++    flagged_row_indices,
++    reduce_committed,
++)
+ from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+ from vllm.v1.sample.metadata import SamplingMetadata
+ from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
+@@ -73,6 +80,9 @@ class RejectionSampler(nn.Module):
+             "raw_logits",
+             "processed_logits",
+         )
++        # [num_draft_total, 2] target-row effort signals of the last
++        # ``apply_logits_processors`` call; None when no request opted in.
++        self._effort_target_rows: torch.Tensor | None = None
+ 
+         self.synthetic_conditional_rates: torch.Tensor | None = None
+         if (
+@@ -161,6 +171,7 @@ class RejectionSampler(nn.Module):
+         target_logits = self.apply_logits_processors(
+             target_logits, sampling_metadata, metadata
+         )
++        effort_target_rows, self._effort_target_rows = self._effort_target_rows, None
+         # [num_tokens, vocab_size]
+         # NOTE(woosuk): `target_logits` can be updated in place inside the
+         # `apply_sampling_constraints` function.
+@@ -195,11 +206,52 @@ class RejectionSampler(nn.Module):
+                 output_token_ids,
+             )
+ 
++        effort_signals = None
++        if effort_target_rows is not None:
++            assert bonus_sampler_output.effort_signals is not None
++            effort_signals = self._reduce_effort_signals(
++                effort_target_rows,
++                bonus_sampler_output.effort_signals[:, :2],
++                metadata.num_draft_tokens,
++                output_token_ids,
++            )
++
+         return SamplerOutput(
+             sampled_token_ids=output_token_ids,
+             logprobs_tensors=logprobs_tensors,
++            effort_signals=effort_signals,
++            effort_flags=sampling_metadata.effort_mask,
+         )
+ 
++    @staticmethod
++    def _reduce_effort_signals(
++        target_rows: torch.Tensor,
++        bonus_rows: torch.Tensor,
++        num_draft_tokens: list[int],
++        output_token_ids: torch.Tensor,
++    ) -> torch.Tensor:
++        """Per-request means over committed rows (accepted drafts + bonus).
++
++        Args:
++            target_rows: ``[num_draft_total, 2]`` target-row signals.
++            bonus_rows: ``[num_reqs, 2]`` bonus-row signals.
++            num_draft_tokens: per-request draft counts.
++            output_token_ids: ``[num_reqs, max_spec_len + 1]`` sampled ids;
++                rejected positions hold ``PLACEHOLDER_TOKEN_ID``.
++
++        Returns:
++            ``[num_reqs, 3]`` (mean entropy, mean margin, n committed rows).
++        """
++        device = target_rows.device
++        perm = async_tensor_h2d(commit_order_permutation(num_draft_tokens), device)
++        rows = torch.cat((target_rows, bonus_rows), dim=0)[perm]
++        counts = torch.tensor(num_draft_tokens, dtype=torch.int64) + 1
++        cu_num_rows = torch.zeros(len(num_draft_tokens) + 1, dtype=torch.int64)
++        torch.cumsum(counts, dim=0, out=cu_num_rows[1:])
++        cu_num_rows = async_tensor_h2d(cu_num_rows, device)
++        num_committed = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum(dim=-1)
++        return reduce_committed(rows, cu_num_rows, num_committed)
++
+     def _get_logprobs_tensors(
+         self,
+         max_num_logprobs: int,
+@@ -336,6 +388,15 @@ class RejectionSampler(nn.Module):
+                 logits = processor.apply_with_spec_decode(
+                     logits, metadata.num_draft_tokens
+                 )
++        # Canonical effort-telemetry stage for the target rows: after penalties
++        # and bad words, before the thinking-budget force and temperature.
++        effort_mask = sampling_metadata.effort_mask
++        self._effort_target_rows = None
++        if effort_mask is not None:
++            rows = flagged_row_indices(effort_mask, metadata.num_draft_tokens)
++            self._effort_target_rows = effort_row_signals_scattered(
++                logits, async_tensor_h2d(rows, device=logits.device)
++            )
+         holder = sampling_metadata.thinking_budget_state_holder
+         if holder is not None and holder.has_tracked_requests():
+             logits = holder.apply_to_logits(
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 3efaf33..038b0e3 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -7,8 +7,12 @@ import torch.nn as nn
+ 
+ from vllm.config.model import LogprobsMode
+ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+-from vllm.utils.torch_utils import PIN_MEMORY
++from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
+ from vllm.v1.outputs import LogprobsTensors, SamplerOutput
++from vllm.v1.sample.effort_signals import (
++    effort_row_signals_scattered,
++    flagged_row_indices,
++)
+ from vllm.v1.sample.metadata import SamplingMetadata
+ from vllm.v1.sample.ops.bad_words import apply_bad_words
+ from vllm.v1.sample.ops.logprobs import batched_count_greater_than
+@@ -69,6 +73,9 @@ class Sampler(nn.Module):
+         self.pin_memory = PIN_MEMORY
+         self.logprobs_mode = logprobs_mode
+         self.use_fp64_gumbel = use_fp64_gumbel
++        # [num_reqs, 2] canonical-stage effort signals of the last
++        # ``apply_logits_processors`` call; None when no request opted in.
++        self._effort_rows: torch.Tensor | None = None
+ 
+     def forward(
+         self,
+@@ -99,6 +106,7 @@ class Sampler(nn.Module):
+         logits = self.apply_logits_processors(
+             logits, sampling_metadata, predict_bonus_token
+         )
++        effort_rows, self._effort_rows = self._effort_rows, None
+         # Sample the next token.
+         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
+         if processed_logprobs is not None:
+@@ -139,6 +147,15 @@ class Sampler(nn.Module):
+         # Use int32 to reduce the tensor size.
+         sampled = sampled.to(torch.int32)
+ 
++        effort_signals = None
++        if effort_rows is not None:
++            # One committed row per request; flagged rows count 1, others 0.
++            n_rows = async_tensor_h2d(
++                sampling_metadata.effort_mask.astype("float32"),
++                device=effort_rows.device,
++            )
++            effort_signals = torch.cat((effort_rows, n_rows[:, None]), dim=-1)
++
+         # These are GPU tensors.
+         sampler_output = SamplerOutput(
+             # The sampled tokens are expanded to 2D tensor with shape
+@@ -146,6 +163,8 @@ class Sampler(nn.Module):
+             # token per request.
+             sampled_token_ids=sampled.unsqueeze(-1),
+             logprobs_tensors=logprobs_tensors,
++            effort_signals=effort_signals,
++            effort_flags=sampling_metadata.effort_mask,
+         )
+         return sampler_output
+ 
+@@ -403,6 +422,15 @@ class Sampler(nn.Module):
+ 
+         # Apply penalties (e.g., freq_penalties).
+         logits = self.apply_penalties(logits, sampling_metadata, output_token_ids)
++        # Canonical effort-telemetry stage: after penalties, before the
++        # thinking-budget force and temperature (one row per request here).
++        effort_mask = sampling_metadata.effort_mask
++        self._effort_rows = None
++        if effort_mask is not None:
++            rows = flagged_row_indices(effort_mask)
++            self._effort_rows = effort_row_signals_scattered(
++                logits, async_tensor_h2d(rows, device=logits.device)
++            )
+         holder = sampling_metadata.thinking_budget_state_holder
+         if holder is not None and holder.has_tracked_requests():
+             # Committed outputs only; spec drafts live in ``spec_token_ids``.
+diff --git a/vllm/v1/sample/thinking_budget_state.py b/vllm/v1/sample/thinking_budget_state.py
+index efac011..f467b51 100644
+--- a/vllm/v1/sample/thinking_budget_state.py
++++ b/vllm/v1/sample/thinking_budget_state.py
+@@ -111,6 +111,23 @@ class ThinkingBudgetStateHolder:
+                 if state is not None:
+                     self._state[i2] = state
+ 
++    def update_budget(self, index: int, revision: int, budget: int) -> bool:
++        """Apply a versioned budget update to a tracked request.
++
++        Only strictly increasing revisions are applied. The remaining-budget
++        countdown is shifted by the budget delta; a request already forcing
++        the end sequence keeps forcing (the update landed late).
++        """
++        state = self._state.get(index)
++        if state is None or revision <= state["budget_revision"]:
++            return False
++        state["budget_revision"] = revision
++        budget = max(budget, 0)
++        delta = budget - state["thinking_token_budget"]
++        state["thinking_token_budget"] = budget
++        state["check_count_down"] += delta
++        return True
++
+     def update_state(
+         self,
+         output_token_ids: list[list[int]],
+@@ -216,6 +233,7 @@ class ThinkingBudgetStateHolder:
+             "prompt_tok_ids": prompt_tok_ids,
+             "output_tok_ids": [],
+             "thinking_token_budget": thinking_token_budget,
++            "budget_revision": -1,
+             "prev_output_length": 0,
+             "spec_token_ids": [],
+             "force_index": [],
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index ba0a66d..41ba49f 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -17,6 +17,7 @@ from vllm.v1.outputs import (
+     PoolerOutput,
+     RoutedExpertsTensors,
+ )
++from vllm.v1.sample.effort_signals import signals_to_dict
+ from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
+ from vllm.v1.worker.utils import raise_if_nan_logits
+ 
+@@ -147,6 +148,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
+             if sampler_output.num_nans is not None:
+                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
+             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
++            self.effort_signals_np: np.ndarray | None = None
++            if sampler_output.effort_signals is not None:
++                self.effort_signals_np = async_copy_to_np(sampler_output.effort_signals)
+             self.sampling_mask_tensors: SamplingMaskTensors | None = None
+             if sampler_output.sampling_mask_tensors is not None:
+                 self.sampling_mask_tensors = (
+@@ -189,6 +193,13 @@ class AsyncOutput(AsyncModelRunnerOutput):
+             if envs.VLLM_RAISE_ON_LOGIT_NANS:
+                 raise_if_nan_logits(self.model_runner_output.num_nans_in_logits)
+ 
++        if self.effort_signals_np is not None:
++            self.model_runner_output.effort_signals = signals_to_dict(
++                self.model_runner_output.req_ids,
++                self.effort_signals_np,
++                self.sampler_output.effort_flags,
++            )
++
+         if self.logprobs_tensors is not None:
+             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
+         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b412d46..109c520 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -293,6 +293,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Samplers and decode_query_len created in load_model() after
+         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
+         self.sampler: Sampler | None = None
++        # Thinking budget update acks not yet returned in a ModelRunnerOutput.
++        self.pending_thinking_budget_acks: dict[str, int] = {}
+         self.rejection_sampler: RejectionSampler | None = None
+         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
+         self.structured_outputs_worker: StructuredOutputsWorker | None = None
+@@ -908,6 +910,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         req_idx = self.req_states.remove_request(req_id)
+         if req_idx is None:
+             return False
++        self.pending_thinking_budget_acks.pop(req_id, None)
+         if self.pooling_runner is not None:
+             self.pooling_runner.remove_request(req_idx)
+         if self.pp_handler is not None:
+@@ -999,8 +1002,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.req_states.apply_staged_writes()
+             self.model_state.apply_staged_writes()
+         if self.sampler is not None:
++            self.update_thinking_budgets(scheduler_output)
+             self.sampler.apply_staged_writes()
+ 
++    def update_thinking_budgets(self, scheduler_output: SchedulerOutput) -> None:
++        updates = scheduler_output.thinking_budget_updates
++        if not updates:
++            return
++        assert self.sampler is not None
++        acks = self.sampler.thinking_budget_state.update_budgets(
++            updates, self.req_states.req_id_to_index
++        )
++        self.pending_thinking_budget_acks.update(acks)
++
++    def take_thinking_budget_acks(self) -> dict[str, int] | None:
++        if not self.pending_thinking_budget_acks:
++            return None
++        acks = self.pending_thinking_budget_acks
++        self.pending_thinking_budget_acks = {}
++        return acks
++
+     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+         # Add new blocks and update num_computed_tokens for the existing requests.
+         reqs = scheduler_output.scheduled_cached_reqs
+@@ -1756,6 +1777,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
+             sampled_token_ids=None,  # type: ignore
+             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
++            thinking_budget_acks=self.take_thinking_budget_acks(),
+         )
+         # Start async output copy here so that it can overlap with speculator proposal.
+         async_output = AsyncOutput(
+diff --git a/vllm/v1/worker/gpu/sample/effort.py b/vllm/v1/worker/gpu/sample/effort.py
+new file mode 100644
+index 0000000..f5630ab
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/effort.py
+@@ -0,0 +1,112 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Model Runner V2 state for per-request effort telemetry (entropy / margin)."""
++
++import numpy as np
++import torch
++
++from vllm.sampling_params import SamplingParams
++from vllm.utils.torch_utils import async_tensor_h2d
++from vllm.v1.sample.effort_signals import (
++    effort_row_signals,
++    effort_row_signals_scattered,
++    flagged_row_indices,
++    reduce_committed,
++    wants_effort_signals,
++)
++from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
++
++
++class EffortState:
++    """Opt-in flags plus the per-step row-signal accumulator.
++
++    ``begin`` arms the state for a batch, ``compute`` is called once per logits
++    chunk at the canonical stage (after penalties / bad words, before the
++    thinking-budget force and temperature) and ``finish`` reduces the rows to
++    per-request means over the committed prefix once ``num_sampled`` is known.
++    """
++
++    def __init__(self, max_num_reqs: int, device: torch.device):
++        self.max_num_reqs = max_num_reqs
++        self.device = device
++        self.use_effort = np.zeros(max_num_reqs, dtype=bool)
++        # req_state_idx -> 1 when flagged; read on GPU for expanded rows.
++        self.flags = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
++        self._flags_dirty = False
++        self._active = False
++        self._pending: list[torch.Tensor] = []
++        self._pending_mask: list[torch.Tensor] = []
++
++    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
++        flagged = wants_effort_signals(sampling_params)
++        self.use_effort[req_idx] = flagged
++        if bool(self.flags.np[req_idx]) != flagged:
++            self.flags.np[req_idx] = int(flagged)
++            self._flags_dirty = True
++
++    def apply_staged_writes(self) -> None:
++        if self._flags_dirty:
++            self.flags.copy_to_uva()
++            self._flags_dirty = False
++
++    def batch_flags(self, idx_mapping_np: np.ndarray) -> np.ndarray:
++        return self.use_effort[idx_mapping_np]
++
++    def begin(self, idx_mapping_np: np.ndarray) -> bool:
++        """Arm for a batch; returns whether any request in it opted in."""
++        self._pending.clear()
++        self._pending_mask.clear()
++        self._active = bool(np.any(self.use_effort[idx_mapping_np]))
++        return self._active
++
++    def compute(
++        self,
++        logits: torch.Tensor,
++        expanded_idx_mapping: torch.Tensor,
++        idx_mapping_np: np.ndarray,
++    ) -> None:
++        """Append canonical-stage row signals for one logits chunk."""
++        if not self._active:
++            return
++        num_rows = logits.shape[0]
++        device = logits.device
++        chunk_flags = self.use_effort[idx_mapping_np]
++        if not np.any(chunk_flags):
++            sig = torch.zeros((num_rows, 2), dtype=torch.float32, device=device)
++            row_flags = torch.zeros(num_rows, dtype=torch.bool, device=device)
++        elif num_rows == idx_mapping_np.shape[0]:
++            # One row per request: exact host-side row selection.
++            rows = flagged_row_indices(chunk_flags)
++            sig = effort_row_signals_scattered(
++                logits, async_tensor_h2d(rows, device=device)
++            )
++            row_flags = async_tensor_h2d(chunk_flags, device=device)
++        else:
++            # Spec-decode rows: the exact per-request layout only exists on
++            # the GPU (adaptive verification compacts drafts), so compute the
++            # chunk and zero the rows of requests that did not opt in.
++            row_flags = self.flags.gpu[expanded_idx_mapping] != 0
++            sig = effort_row_signals(logits) * row_flags.to(torch.float32)[:, None]
++        self._pending.append(sig)
++        self._pending_mask.append(row_flags)
++
++    def finish(
++        self,
++        cu_num_logits: torch.Tensor,
++        num_sampled: torch.Tensor,
++    ) -> torch.Tensor | None:
++        """Reduce the accumulated rows to ``[num_reqs, 3]`` per-request means."""
++        if not self._active:
++            return None
++        self._active = False
++        if not self._pending:
++            return None
++        rows = self._pending[0] if len(self._pending) == 1 else torch.cat(self._pending)
++        mask = (
++            self._pending_mask[0]
++            if len(self._pending_mask) == 1
++            else torch.cat(self._pending_mask)
++        )
++        self._pending.clear()
++        self._pending_mask.clear()
++        return reduce_committed(rows, cu_num_logits, num_sampled, row_mask=mask)
+diff --git a/vllm/v1/worker/gpu/sample/output.py b/vllm/v1/worker/gpu/sample/output.py
+index 02e86cc..da24553 100644
+--- a/vllm/v1/worker/gpu/sample/output.py
++++ b/vllm/v1/worker/gpu/sample/output.py
+@@ -20,6 +20,11 @@ class SamplerOutput:
+     num_sampled: torch.Tensor | None
+     num_rejected: torch.Tensor | None = None
+     sampling_mask_tensors: SamplingMaskTensors | None = None
++    # [num_reqs, 3] fp32 (mean entropy, mean margin, n committed rows), only
++    # when a request in the batch opted into effort telemetry.
++    effort_signals: torch.Tensor | None = None
++    # [num_reqs] bool host mask of the opted-in requests.
++    effort_flags: np.ndarray | None = None
+ 
+ 
+ @triton.jit
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index bb7dc40..792f42f 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -16,6 +16,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
+ from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
+ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+ from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
++from vllm.v1.worker.gpu.sample.effort import EffortState
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+ from vllm.v1.worker.gpu.sample.logprob import (
+@@ -53,6 +54,7 @@ class Sampler:
+         self.bad_words_state = BadWordsState(req_states)
+         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
+         self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
++        self.effort_state = EffortState(max_num_reqs, device)
+         self.num_speculative_tokens = num_speculative_tokens
+         self.return_sampling_mask = return_sampling_mask
+         self.use_flashinfer = (
+@@ -68,6 +70,7 @@ class Sampler:
+         self.bad_words_state.add_request(req_idx, sampling_params)
+         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
+         self.thinking_budget_state.add_request(req_idx, sampling_params)
++        self.effort_state.add_request(req_idx, sampling_params)
+ 
+     def apply_staged_writes(self) -> None:
+         self.sampling_states.apply_staged_writes()
+@@ -76,6 +79,7 @@ class Sampler:
+         self.bad_words_state.apply_staged_writes()
+         self.logprob_token_ids_state.apply_staged_writes()
+         self.thinking_budget_state.apply_staged_writes()
++        self.effort_state.apply_staged_writes()
+ 
+     def __call__(
+         self,
+@@ -100,6 +104,7 @@ class Sampler:
+         )
+         return_logprobs = max_num_logprobs != NO_LOGPROBS or max_per_req_token_ids > 0
+ 
++        self.effort_state.begin(idx_mapping_np)
+         sampled, processed_logits = self.sample(
+             logits,
+             expanded_idx_mapping,
+@@ -147,6 +152,15 @@ class Sampler:
+                 processed_logits, num_sampled
+             )
+ 
++        effort_signals = self.effort_state.finish(
++            input_batch.cu_num_logits, num_sampled
++        )
++        effort_flags = (
++            self.effort_state.batch_flags(idx_mapping_np)
++            if effort_signals is not None
++            else None
++        )
++
+         # These are GPU tensors.
+         sampler_output = SamplerOutput(
+             # The sampled tokens are expanded to 2D tensor with shape
+@@ -158,6 +172,8 @@ class Sampler:
+             num_sampled=num_sampled,
+             num_rejected=num_rejected,
+             sampling_mask_tensors=sampling_mask_tensors,
++            effort_signals=effort_signals,
++            effort_flags=effort_flags,
+         )
+         return sampler_output
+ 
+@@ -173,6 +189,8 @@ class Sampler:
+         skip_top_k_top_p: bool = False,
+     ) -> torch.Tensor:
+         if not self._requires_logits_processing(idx_mapping_np):
++            # Nothing modifies the logits: they are already canonical-stage.
++            self.effort_state.compute(logits, expanded_idx_mapping, idx_mapping_np)
+             return logits
+ 
+         # Copy logits to a new FP32 tensor.
+@@ -201,6 +219,10 @@ class Sampler:
+             expanded_local_pos,
+         )
+ 
++        # Canonical effort-telemetry stage: after penalties and bad words,
++        # before the thinking-budget force and temperature.
++        self.effort_state.compute(logits, expanded_idx_mapping, idx_mapping_np)
++
+         # Force the reasoning end marker once a request's thinking budget is
+         # reached; applied before temperature so the forced token is always kept.
+         self.thinking_budget_state.apply(
+@@ -235,6 +257,8 @@ class Sampler:
+             return True
+         if np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] > 0):
+             return True
++        if self.thinking_budget_state.requires_logits_processing(idx_mapping_np):
++            return True
+ 
+         states = self.sampling_states
+         temperatures = states.temperature.np[idx_mapping_np]
+diff --git a/vllm/v1/worker/gpu/sample/thinking_budget.py b/vllm/v1/worker/gpu/sample/thinking_budget.py
+index eca7929..a8dd350 100644
+--- a/vllm/v1/worker/gpu/sample/thinking_budget.py
++++ b/vllm/v1/worker/gpu/sample/thinking_budget.py
+@@ -1,5 +1,22 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-request thinking token budgets for Model Runner V2.
++
++State per batch slot: the (versioned) budget plus a cache of the last
++reasoning start/end marker positions in the committed token history. Each
++step, ``apply`` forces the reasoning end sequence on every target logits row
++whose effective prefix (committed tokens plus the draft tokens before that
++row) is inside a think block that has reached the budget. The rules match the
++V1 ``ThinkingBudgetStateHolder``: the first over-budget row forces the first
++end token, later rows in the same draft window force the next end tokens
++while the drafts follow the sequence, and a rejected draft simply re-forces
++next step because the decision is recomputed from committed tokens.
++
++``apply_thinking_budget`` dispatches to Triton kernels on CUDA and to a pure
++torch reference (``apply_thinking_budget_torch``) on other devices; the
++reference is the CPU-testable specification of the semantics.
++"""
++
+ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+@@ -16,6 +33,7 @@ if TYPE_CHECKING:
+ 
+ _INT32_MAX = np.iinfo(np.int32).max
+ _COLD_SCAN_BLOCK = 1024
++NO_REVISION = -1
+ 
+ 
+ class ThinkingBudgetState:
+@@ -46,6 +64,7 @@ class ThinkingBudgetState:
+             else reasoning_config.natural_reasoning_end_token_ids or []
+         )
+         self.enabled = bool(start_ids and end_ids and natural_end_ids)
++        self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
+         if not self.enabled:
+             return
+ 
+@@ -54,7 +73,8 @@ class ThinkingBudgetState:
+         )
+         self.thinking_token_budget.np.fill(-1)
+         self.thinking_token_budget.copy_to_uva()
+-        self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
++        # Revision of the last applied budget update per slot (CPU only).
++        self.budget_revision = np.full(self.max_num_reqs, NO_REVISION, dtype=np.int64)
+ 
+         self.cached_last_start = torch.full(
+             (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
+@@ -83,6 +103,7 @@ class ThinkingBudgetState:
+             return
+         budget = sampling_params.thinking_token_budget
+         self.use_thinking_budget[req_idx] = budget is not None
++        self.budget_revision[req_idx] = NO_REVISION
+         if budget is None:
+             budget = -1
+         else:
+@@ -92,6 +113,34 @@ class ThinkingBudgetState:
+             self.thinking_token_budget.np[req_idx] = budget
+             self._budget_dirty = True
+ 
++    def update_budgets(
++        self,
++        updates: dict[str, tuple[int, int]],
++        req_id_to_index: dict[str, int],
++    ) -> dict[str, int]:
++        """Apply versioned budget updates; return req_id -> revision applied.
++
++        Only requests that opted into a budget at ``add_request`` and only
++        strictly increasing revisions are applied. The staged budget tensor
++        is flushed by ``apply_staged_writes``.
++        """
++        if not self.enabled or not updates:
++            return {}
++        acks: dict[str, int] = {}
++        for req_id, (revision, budget) in updates.items():
++            req_idx = req_id_to_index.get(req_id)
++            if req_idx is None or not self.use_thinking_budget[req_idx]:
++                continue
++            if revision <= self.budget_revision[req_idx]:
++                continue
++            self.budget_revision[req_idx] = revision
++            budget = min(max(budget, 0), _INT32_MAX)
++            if self.thinking_token_budget.np[req_idx] != budget:
++                self.thinking_token_budget.np[req_idx] = budget
++                self._budget_dirty = True
++            acks[req_id] = revision
++        return acks
++
+     def apply_staged_writes(self) -> None:
+         if not self.enabled:
+             return
+@@ -107,6 +156,9 @@ class ThinkingBudgetState:
+             self.thinking_token_budget.copy_to_uva()
+             self._budget_dirty = False
+ 
++    def requires_logits_processing(self, idx_mapping_np: np.ndarray) -> bool:
++        return self.enabled and bool(np.any(self.use_thinking_budget[idx_mapping_np]))
++
+     def apply(
+         self,
+         logits: torch.Tensor,
+@@ -116,7 +168,7 @@ class ThinkingBudgetState:
+         input_ids: torch.Tensor,
+         expanded_local_pos: torch.Tensor,
+     ) -> None:
+-        if not self.enabled or not np.any(self.use_thinking_budget[idx_mapping_np]):
++        if not self.requires_logits_processing(idx_mapping_np):
+             return
+ 
+         apply_thinking_budget(
+@@ -369,6 +421,179 @@ def _thinking_budget_kernel(
+     tl.store(logits_ptr + token_idx * logits_stride + force_token_id, 1.0e9)
+ 
+ 
++def find_last_marker(tokens: torch.Tensor, marker: torch.Tensor, lo: int = 0) -> int:
++    """Largest ``i >= lo`` with ``tokens[i:i+len(marker)] == marker``, else -1."""
++    n = marker.numel()
++    if n == 0 or tokens.numel() - lo < n:
++        return -1
++    hits = (tokens[lo:].unfold(0, n, 1) == marker).all(dim=1)
++    if not bool(hits.any()):
++        return -1
++    return lo + int(hits.nonzero()[-1].item())
++
++
++def update_marker_cache_torch(
++    req_ids: torch.Tensor,
++    thinking_token_budget: torch.Tensor,
++    all_token_ids: torch.Tensor,
++    total_len: torch.Tensor,
++    cached_last_start: torch.Tensor,
++    cached_last_end: torch.Tensor,
++    cached_scan_pos: torch.Tensor,
++    reasoning_start_token_ids: torch.Tensor,
++    natural_reasoning_end_token_ids: torch.Tensor,
++) -> None:
++    """Torch reference of ``_update_committed_marker_cache_kernel``.
++
++    Refreshes the cached last start / natural-end marker positions of each
++    budgeted request from its committed tokens, scanning only what the
++    previous scan could not have covered.
++    """
++    max_len = max(
++        reasoning_start_token_ids.numel(), natural_reasoning_end_token_ids.numel()
++    )
++    for req_idx in req_ids.tolist():
++        if int(thinking_token_budget[req_idx]) < 0:
++            continue
++        seq_len = int(total_len[req_idx])
++        scan_pos = int(cached_scan_pos[req_idx])
++        last_start = int(cached_last_start[req_idx])
++        last_end = int(cached_last_end[req_idx])
++        if scan_pos > seq_len:
++            scan_pos, last_start, last_end = 0, -1, -1
++        lo = 0 if (scan_pos == 0 and last_start < 0 and last_end < 0) else scan_pos
++        tokens = all_token_ids[req_idx, :seq_len]
++        last_start = max(
++            last_start, find_last_marker(tokens, reasoning_start_token_ids, lo)
++        )
++        last_end = max(
++            last_end, find_last_marker(tokens, natural_reasoning_end_token_ids, lo)
++        )
++        cached_last_start[req_idx] = last_start
++        cached_last_end[req_idx] = last_end
++        cached_scan_pos[req_idx] = max(0, seq_len - (max_len - 1))
++
++
++def forced_end_tokens_torch(
++    expanded_idx_mapping: torch.Tensor,
++    thinking_token_budget: torch.Tensor,
++    all_token_ids: torch.Tensor,
++    total_len: torch.Tensor,
++    input_ids: torch.Tensor,
++    expanded_local_pos: torch.Tensor,
++    cached_last_start: torch.Tensor,
++    cached_last_end: torch.Tensor,
++    reasoning_start_token_ids: torch.Tensor,
++    natural_reasoning_end_token_ids: torch.Tensor,
++    reasoning_end_token_ids: torch.Tensor,
++) -> tuple[list[int], list[int]]:
++    """Torch reference of ``_thinking_budget_kernel``'s decision.
++
++    Returns the ``(row, token_id)`` pairs to force. Row ``t`` of request ``r``
++    at local position ``p`` sees the effective prefix = committed tokens plus
++    ``input_ids[t-p+1 : t+1]`` (the drafts before it); it is forced when that
++    prefix is inside a think block holding at least ``budget`` tokens, to the
++    end-sequence token following the longest end-sequence prefix the effective
++    prefix already ends with.
++    """
++    start_len = reasoning_start_token_ids.numel()
++    natural_end_len = natural_reasoning_end_token_ids.numel()
++    end_len = reasoning_end_token_ids.numel()
++    rows: list[int] = []
++    force_tokens: list[int] = []
++    for row, (req_idx, local_pos) in enumerate(
++        zip(expanded_idx_mapping.tolist(), expanded_local_pos.tolist())
++    ):
++        budget = int(thinking_token_budget[req_idx])
++        if budget < 0:
++            continue
++        seq_len = int(total_len[req_idx])
++        first_row = row - local_pos
++        effective = torch.cat(
++            [
++                all_token_ids[req_idx, :seq_len].to(torch.int64),
++                input_ids[first_row + 1 : first_row + local_pos + 1].to(torch.int64),
++            ]
++        )
++        effective_len = seq_len + local_pos
++        last_start = max(
++            int(cached_last_start[req_idx]),
++            find_last_marker(
++                effective, reasoning_start_token_ids, max(0, seq_len - start_len + 1)
++            ),
++        )
++        last_end = max(
++            int(cached_last_end[req_idx]),
++            find_last_marker(
++                effective,
++                natural_reasoning_end_token_ids,
++                max(0, seq_len - natural_end_len + 1),
++            ),
++        )
++        if last_start < 0 or last_start <= last_end:
++            continue
++        if effective_len - (last_start + start_len) < budget:
++            continue
++        end_prefix_len = 0
++        for prefix_len in range(1, min(end_len - 1, effective_len) + 1):
++            if torch.equal(
++                effective[effective_len - prefix_len :],
++                reasoning_end_token_ids[:prefix_len].to(torch.int64),
++            ):
++                end_prefix_len = prefix_len
++        rows.append(row)
++        force_tokens.append(int(reasoning_end_token_ids[end_prefix_len]))
++    return rows, force_tokens
++
++
++def apply_thinking_budget_torch(
++    logits: torch.Tensor,
++    req_ids: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    thinking_token_budget: torch.Tensor,
++    all_token_ids: torch.Tensor,
++    total_len: torch.Tensor,
++    input_ids: torch.Tensor,
++    expanded_local_pos: torch.Tensor,
++    cached_last_start: torch.Tensor,
++    cached_last_end: torch.Tensor,
++    cached_scan_pos: torch.Tensor,
++    reasoning_start_token_ids: torch.Tensor,
++    natural_reasoning_end_token_ids: torch.Tensor,
++    reasoning_end_token_ids: torch.Tensor,
++) -> None:
++    """Torch reference of ``apply_thinking_budget`` (runs on CPU tensors)."""
++    update_marker_cache_torch(
++        req_ids,
++        thinking_token_budget,
++        all_token_ids,
++        total_len,
++        cached_last_start,
++        cached_last_end,
++        cached_scan_pos,
++        reasoning_start_token_ids,
++        natural_reasoning_end_token_ids,
++    )
++    rows, force_tokens = forced_end_tokens_torch(
++        expanded_idx_mapping,
++        thinking_token_budget,
++        all_token_ids,
++        total_len,
++        input_ids,
++        expanded_local_pos,
++        cached_last_start,
++        cached_last_end,
++        reasoning_start_token_ids,
++        natural_reasoning_end_token_ids,
++        reasoning_end_token_ids,
++    )
++    if rows:
++        logits[
++            torch.tensor(rows, dtype=torch.int64, device=logits.device),
++            torch.tensor(force_tokens, dtype=torch.int64, device=logits.device),
++        ] = 1.0e9
++
++
+ def apply_thinking_budget(
+     logits: torch.Tensor,
+     req_ids: torch.Tensor,
+@@ -385,6 +610,25 @@ def apply_thinking_budget(
+     natural_reasoning_end_token_ids: torch.Tensor,
+     reasoning_end_token_ids: torch.Tensor,
+ ) -> None:
++    if logits.device.type != "cuda":
++        apply_thinking_budget_torch(
++            logits,
++            req_ids,
++            expanded_idx_mapping,
++            thinking_token_budget,
++            all_token_ids,
++            total_len,
++            input_ids,
++            expanded_local_pos,
++            cached_last_start,
++            cached_last_end,
++            cached_scan_pos,
++            reasoning_start_token_ids,
++            natural_reasoning_end_token_ids,
++            reasoning_end_token_ids,
++        )
++        return
++
+     num_tokens = logits.shape[0]
+     start_len = reasoning_start_token_ids.shape[0]
+     natural_end_len = natural_reasoning_end_token_ids.shape[0]
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 8410b6c..e54a401 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -263,6 +263,8 @@ class RejectionSampler:
+             input_batch.idx_mapping_np
+         )
+         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
++        effort_state = self.sampler.effort_state
++        effort_state.begin(input_batch.idx_mapping_np)
+         sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+             logits,
+             input_batch,
+@@ -281,10 +283,19 @@ class RejectionSampler:
+             self.sampler.req_states.prefill_len.gpu,
+         )
+ 
++        effort_signals = effort_state.finish(input_batch.cu_num_logits, num_sampled)
++        effort_flags = (
++            effort_state.batch_flags(input_batch.idx_mapping_np)
++            if effort_signals is not None
++            else None
++        )
++
+         return SamplerOutput(
+             sampled_token_ids=sampled,
+             logprobs_tensors=logprobs_tensors,
+             num_nans=num_nans,
+             num_sampled=num_sampled,
+             num_rejected=num_rejected,
++            effort_signals=effort_signals,
++            effort_flags=effort_flags,
+         )
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index 0b805fc..a395297 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -18,6 +18,7 @@ from vllm.utils.collection_utils import swap_dict_values
+ from vllm.utils.torch_utils import PIN_MEMORY
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
++from vllm.v1.sample.effort_signals import wants_effort_signals
+ from vllm.v1.sample.logits_processor import (
+     BatchUpdateBuilder,
+     LogitsProcessors,
+@@ -117,6 +118,8 @@ class InputBatch:
+             PIN_MEMORY,
+         )
+         self.thinking_token_budget_reqs: set[str] = set()
++        # Requests that opted into effort telemetry (entropy / margin).
++        self.effort_telemetry_reqs: set[str] = set()
+         self.is_pooling_model = is_pooling_model
+         self.max_num_reqs = max_num_reqs
+         self.max_model_len = max_model_len
+@@ -470,6 +473,9 @@ class InputBatch:
+                 self.bad_words_token_ids[req_index] = (
+                     sampling_params.bad_words_token_ids
+                 )
++
++            if wants_effort_signals(sampling_params):
++                self.effort_telemetry_reqs.add(req_id)
+         elif pooling_params := request.pooling_params:
+             pooling_states = request.pooling_states
+             assert pooling_states is not None
+@@ -581,6 +587,7 @@ class InputBatch:
+             self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
+         self.bad_words_token_ids.pop(req_index, None)
+         self.thinking_token_budget_reqs.discard(req_id)
++        self.effort_telemetry_reqs.discard(req_id)
+         return req_index
+ 
+     def swap_states(self, i1: int, i2: int) -> None:
+@@ -940,6 +947,17 @@ class InputBatch:
+                     req_index = self.req_id_to_index[req_id]
+                     logprob_token_ids_by_index[req_index] = token_ids
+ 
++        effort_mask: np.ndarray | None = None
++        if self.effort_telemetry_reqs:
++            effort_mask = np.fromiter(
++                (
++                    req_id in self.effort_telemetry_reqs
++                    for req_id in self.req_ids[:num_reqs]
++                ),
++                dtype=bool,
++                count=num_reqs,
++            )
++
+         return SamplingMetadata(
+             temperature=temperature,
+             all_greedy=self.all_greedy,
+@@ -960,6 +978,7 @@ class InputBatch:
+             bad_words_token_ids=self.bad_words_token_ids,
+             logitsprocs=self.logitsprocs,
+             thinking_budget_state_holder=self.thinking_budget_state_holder,
++            effort_mask=effort_mask,
+         )
+ 
+     def get_pooling_params(self) -> list[PoolingParams]:
+@@ -1139,6 +1158,23 @@ class InputBatch:
+             and len(self.repetition_penalties_reqs) == 0
+         )
+ 
++    def update_thinking_budgets(
++        self, updates: dict[str, tuple[int, int]]
++    ) -> dict[str, int]:
++        """Apply versioned thinking budget updates; return req_id -> revision.
++
++        Must run after ``refresh_metadata`` so holder indices match the batch.
++        """
++        holder = self.thinking_budget_state_holder
++        if holder is None or not updates:
++            return {}
++        acks: dict[str, int] = {}
++        for req_id, (revision, budget) in updates.items():
++            index = self.req_id_to_index.get(req_id)
++            if index is not None and holder.update_budget(index, revision, budget):
++                acks[req_id] = revision
++        return acks
++
+     @property
+     def no_thinking_budget(self) -> bool:
+         return (
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index f42310f..6d9cf0d 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -187,6 +187,7 @@ from vllm.v1.outputs import (
+ )
+ from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
+ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
++from vllm.v1.sample.effort_signals import signals_to_dict
+ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
+ from vllm.v1.sample.metadata import SamplingMetadata
+@@ -301,6 +302,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+         routed_experts: RoutedExpertsTensors | None = None,
+         check_ep_fault: bool = False,
+         num_nans: torch.Tensor | None = None,
++        effort_signals: torch.Tensor | None = None,
++        effort_flags: np.ndarray | None = None,
+     ):
+         self._model_runner_output = model_runner_output
+         self._invalid_req_indices = invalid_req_indices
+@@ -316,6 +319,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+         self._logprobs_tensors = logprobs_tensors
+         self._routed_experts = routed_experts
+         self._num_nans = num_nans
++        self._effort_signals = effort_signals
++        self._effort_flags = effort_flags
+         self._has_fault: torch.Tensor | None = None
+ 
+         # Initiate the copy on a separate stream, but do not synchronize it.
+@@ -340,6 +345,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+                 if self._num_nans is not None
+                 else None
+             )
++            self._effort_signals_cpu = (
++                self._effort_signals.to("cpu", non_blocking=True)
++                if self._effort_signals is not None
++                else None
++            )
+             if check_ep_fault:
+                 has_fault = get_ep_all2all_manager().query_fault()
+                 self._has_fault = has_fault.to("cpu", non_blocking=True)
+@@ -387,6 +397,12 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+                 raise_if_nan_logits(output.num_nans_in_logits)
+         del self._num_nans
+ 
++        if self._effort_signals_cpu is not None:
++            output.effort_signals = signals_to_dict(
++                output.req_ids, self._effort_signals_cpu.numpy(), self._effort_flags
++            )
++        del self._effort_signals
++
+         if self._has_fault is not None and self._has_fault.item():
+             mask = get_ep_all2all_manager().query_active_mask()
+             raise RuntimeError(
+@@ -751,6 +767,8 @@ class GPUModelRunner(
+         self._init_kernel_block_sizes = [placeholder_block_size]
+         self._init_max_num_blocks = [placeholder_max_num_blocks]
+         self._init_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT]
++        # Thinking budget update acks not yet returned in a ModelRunnerOutput.
++        self.pending_thinking_budget_acks: dict[str, int] = {}
+         self.input_batch = InputBatch(
+             max_num_reqs=self.max_num_reqs,
+             # We need to use the encoder length for encoder-decoder
+@@ -952,6 +970,13 @@ class GPUModelRunner(
+             device="cpu",
+             pin_memory=PIN_MEMORY,
+         )
++        # Sync-scheduling D2H target for per-request effort signals.
++        self.effort_signals_pinned_cpu = torch.empty(
++            (self.max_num_reqs, 3),
++            dtype=torch.float32,
++            device="cpu",
++            pin_memory=PIN_MEMORY,
++        )
+ 
+         # Pre-allocated tensor for copying valid sampled token counts to CPU,
+         # with dedicated stream for overlapping and event for coordination.
+@@ -1239,6 +1264,13 @@ class GPUModelRunner(
+         for mm_hash in scheduler_output.free_encoder_mm_hashes:
+             self.encoder_cache.pop(mm_hash, None)
+ 
++    def take_thinking_budget_acks(self) -> dict[str, int] | None:
++        if not self.pending_thinking_budget_acks:
++            return None
++        acks = self.pending_thinking_budget_acks
++        self.pending_thinking_budget_acks = {}
++        return acks
++
+     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
+         """Update the cached states and the persistent batch with the scheduler
+         output.
+@@ -1568,6 +1600,12 @@ class GPUModelRunner(
+         self._may_reorder_batch(scheduler_output)
+         # Refresh batch metadata with any pending updates.
+         self.input_batch.refresh_metadata()
++        if scheduler_output.thinking_budget_updates:
++            self.pending_thinking_budget_acks.update(
++                self.input_batch.update_thinking_budgets(
++                    scheduler_output.thinking_budget_updates
++                )
++            )
+ 
+         # Incrementally update ngram_gpu tensors after batch is stable
+         if is_ngram_gpu:
+@@ -3805,6 +3843,7 @@ class GPUModelRunner(
+         list[str],
+         dict[str, int],
+         list[int],
++        dict[str, tuple[float, float, int]] | None,
+     ]:
+         num_nans: torch.Tensor | None = None
+         num_nans_in_logits: dict[str, int] = {}
+@@ -3833,6 +3872,8 @@ class GPUModelRunner(
+         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
+         sampled_token_ids = sampler_output.sampled_token_ids
+         logprobs_tensors = sampler_output.logprobs_tensors
++        effort_signals_gpu = sampler_output.effort_signals
++        effort_signals: dict[str, tuple[float, float, int]] | None = None
+         invalid_req_indices = []
+         logprobs_lists = None
+         if not self.use_async_scheduling:
+@@ -3850,6 +3891,12 @@ class GPUModelRunner(
+                     self.routed_experts_slot_mapping_device[:total],
+                     non_blocking=True,
+                 )
++            if effort_signals_gpu is not None:
++                # Same coverage as the routed-experts D2H above: ``_to_list``
++                # synchronizes the transfer event after this enqueue.
++                self.effort_signals_pinned_cpu[:num_reqs].copy_(
++                    effort_signals_gpu, non_blocking=True
++                )
+             with gpu_sync_allowed():
+                 # Get the valid generated tokens.
+                 max_gen_len = sampled_token_ids.shape[-1]
+@@ -3872,6 +3919,12 @@ class GPUModelRunner(
+                             logprobs_tensors=logprobs_tensors,
+                         )
+                     )
++                if effort_signals_gpu is not None:
++                    effort_signals = signals_to_dict(
++                        req_ids_output_copy,
++                        self.effort_signals_pinned_cpu[:num_reqs].numpy(),
++                        sampler_output.effort_flags,
++                    )
+         else:
+             valid_sampled_token_ids = []
+             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+@@ -3938,6 +3991,7 @@ class GPUModelRunner(
+             req_ids_output_copy,
+             req_id_to_index_output_copy,
+             invalid_req_indices,
++            effort_signals,
+         )
+ 
+     @contextmanager
+@@ -4850,6 +4904,7 @@ class GPUModelRunner(
+                 req_ids_output_copy,
+                 req_id_to_index_output_copy,
+                 invalid_req_indices,
++                effort_signals,
+             ) = self._bookkeeping_sync(
+                 scheduler_output,
+                 sampler_output,
+@@ -4905,6 +4960,8 @@ class GPUModelRunner(
+                 num_nans_in_logits=num_nans_in_logits,
+                 cudagraph_stats=cudagraph_stats,
+                 routed_experts=None,
++                thinking_budget_acks=self.take_thinking_budget_acks(),
++                effort_signals=effort_signals,
+             )
+ 
+         if not self.use_async_scheduling:
+@@ -4947,6 +5004,8 @@ class GPUModelRunner(
+                 routed_experts=routed_experts_snapshot,
+                 check_ep_fault=self.check_ep_fault,
+                 num_nans=num_nans_device,
++                effort_signals=sampler_output.effort_signals,
++                effort_flags=sampler_output.effort_flags,
+             )
+         with record_function_or_nullcontext(
+             "gpu_model_runner: set_async_sampled_token_ids"
