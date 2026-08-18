@@ -20,9 +20,12 @@ works, in a way every client parser ignores:
   warning; after an SSE commit the JSON error body is wrapped as one
   ``data:`` event so the stream stays well-formed). This is strictly better
   than the certain 524.
-* Telemetry: OTEL counters ``vllm.keepalive.pings`` /
-  ``vllm.keepalive.early_commits`` (label content_type = sse|json) and the
-  same as prometheus ``vllm_keepalive_*_total`` on vLLM's ``/metrics``.
+* Telemetry: OTEL counters ``vllm.keepalive.pings``,
+  ``vllm.keepalive.early_commits``, ``vllm.keepalive.late_errors`` (label
+  content_type = sse|json) and ``vllm.keepalive.peek_fallbacks`` (label
+  reason), mirrored as prometheus ``vllm_keepalive_*_total`` on vLLM's
+  ``/metrics``. Pings and commits are late by at most one poll period
+  (``min(1 s, ping_interval/2, json_commit_after/2)``).
 
 Enable with ``--middleware vllm_keepalive.KeepAliveMiddleware`` and put this
 directory on PYTHONPATH. Env overrides: VLLM_KEEPALIVE_PING_INTERVAL (s),
@@ -53,6 +56,8 @@ _JSON_PING = b"\n"
 # Bytes of request body kept while looking for "stream": true; larger bodies
 # (a full 262k-token chat is ~2 MiB) fall back to the JSON commit path.
 _MAX_PEEK_BYTES = 8 * 1024 * 1024
+# Upper bound on how often the ping loop wakes (seconds).
+_MAX_POLL_PERIOD = 1.0
 
 # Telemetry: OTEL counters (exported when the operator wires an OTEL metrics
 # SDK) mirrored to the prometheus registry vLLM already serves at /metrics.
@@ -73,18 +78,40 @@ _prom_early_commits = Counter(
     "responses committed before the app started them",
     ["content_type"],
 )
+_otel_late_errors = _meter.create_counter(
+    "vllm.keepalive.late_errors",
+    description="app error statuses that arrived after an early commit",
+)
+_prom_late_errors = Counter(
+    "vllm_keepalive_late_errors_total",
+    "app error statuses that arrived after an early commit (client saw 200)",
+    ["content_type"],
+)
+_otel_peek_fallbacks = _meter.create_counter(
+    "vllm.keepalive.peek_fallbacks",
+    description="request bodies whose stream flag could not be read",
+)
+_prom_peek_fallbacks = Counter(
+    "vllm_keepalive_peek_fallbacks_total",
+    "request bodies whose stream flag could not be read (treated as JSON)",
+    ["reason"],
+)
 
 
 def _body_requests_stream(body: bytes) -> bool:
     """True when a JSON request body asks for a streaming response."""
     if len(body) > _MAX_PEEK_BYTES:
         logger.debug("keepalive: body peek skipped (%d bytes)", len(body))
+        _otel_peek_fallbacks.add(1, {"reason": "too_large"})
+        _prom_peek_fallbacks.labels(reason="too_large").inc()
         return False
     try:
         return bool(json.loads(body).get("stream"))
     except (ValueError, AttributeError):
         # Not JSON, or JSON that is not an object: no streaming request.
         logger.debug("keepalive: body peek found no stream flag")
+        _otel_peek_fallbacks.add(1, {"reason": "not_json_object"})
+        _prom_peek_fallbacks.labels(reason="not_json_object").inc()
         return False
 
 
@@ -101,11 +128,15 @@ class KeepAliveMiddleware:
             ping_interval or os.environ.get("VLLM_KEEPALIVE_PING_INTERVAL", 15)
         )
         self.json_commit_after = float(
-            json_commit_after
-            or os.environ.get("VLLM_KEEPALIVE_JSON_COMMIT_AFTER", 40)
+            json_commit_after or os.environ.get("VLLM_KEEPALIVE_JSON_COMMIT_AFTER", 40)
         )
         self.path_prefix = path_prefix or os.environ.get(
             "VLLM_KEEPALIVE_PATH_PREFIX", "/v1/"
+        )
+        # The ping loop wakes this often; pings/commits are late by at most one
+        # period, so it follows the smaller of the two intervals.
+        self.poll_period = min(
+            _MAX_POLL_PERIOD, self.ping_interval / 2, self.json_commit_after / 2
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -189,6 +220,9 @@ class _KeepAliveResponder:
                         b"text/event-stream"
                     )
                     if message.get("status", 200) >= 300:
+                        label = "sse" if self.is_sse else "json"
+                        _otel_late_errors.add(1, {"content_type": label})
+                        _prom_late_errors.labels(content_type=label).inc()
                         logger.warning(
                             "keepalive: app responded %s after early commit "
                             "on %s; client will see 200 with the error body",
@@ -222,7 +256,7 @@ class _KeepAliveResponder:
         interval = self.cfg.ping_interval
         try:
             while not self.finished:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(self.cfg.poll_period)
                 now = time.monotonic()
                 async with self.lock:
                     if self.finished:
@@ -233,7 +267,8 @@ class _KeepAliveResponder:
                         # No response yet: commit early with the content type
                         # the client asked for (SSE for stream=true, else JSON).
                         ctype = (
-                            b"text/event-stream" if self.expect_sse
+                            b"text/event-stream"
+                            if self.expect_sse
                             else b"application/json"
                         )
                         await self.send(
