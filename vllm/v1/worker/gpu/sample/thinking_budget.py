@@ -1,5 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Per-request thinking token budgets for Model Runner V2.
+
+State per batch slot: the (versioned) budget plus a cache of the last
+reasoning start/end marker positions in the committed token history. Each
+step, ``apply`` forces the reasoning end sequence on every target logits row
+whose effective prefix (committed tokens plus the draft tokens before that
+row) is inside a think block that has reached the budget. The rules match the
+V1 ``ThinkingBudgetStateHolder``: the first over-budget row forces the first
+end token, later rows in the same draft window force the next end tokens
+while the drafts follow the sequence, and a rejected draft simply re-forces
+next step because the decision is recomputed from committed tokens.
+
+``apply_thinking_budget`` dispatches to Triton kernels on CUDA and to a pure
+torch reference (``apply_thinking_budget_torch``) on other devices; the
+reference is the CPU-testable specification of the semantics.
+"""
+
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -16,6 +33,7 @@ if TYPE_CHECKING:
 
 _INT32_MAX = np.iinfo(np.int32).max
 _COLD_SCAN_BLOCK = 1024
+NO_REVISION = -1
 
 
 class ThinkingBudgetState:
@@ -46,6 +64,7 @@ class ThinkingBudgetState:
             else reasoning_config.natural_reasoning_end_token_ids or []
         )
         self.enabled = bool(start_ids and end_ids and natural_end_ids)
+        self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
         if not self.enabled:
             return
 
@@ -54,7 +73,8 @@ class ThinkingBudgetState:
         )
         self.thinking_token_budget.np.fill(-1)
         self.thinking_token_budget.copy_to_uva()
-        self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
+        # Revision of the last applied budget update per slot (CPU only).
+        self.budget_revision = np.full(self.max_num_reqs, NO_REVISION, dtype=np.int64)
 
         self.cached_last_start = torch.full(
             (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
@@ -83,6 +103,7 @@ class ThinkingBudgetState:
             return
         budget = sampling_params.thinking_token_budget
         self.use_thinking_budget[req_idx] = budget is not None
+        self.budget_revision[req_idx] = NO_REVISION
         if budget is None:
             budget = -1
         else:
@@ -91,6 +112,34 @@ class ThinkingBudgetState:
         if self.thinking_token_budget.np[req_idx] != budget:
             self.thinking_token_budget.np[req_idx] = budget
             self._budget_dirty = True
+
+    def update_budgets(
+        self,
+        updates: dict[str, tuple[int, int]],
+        req_id_to_index: dict[str, int],
+    ) -> dict[str, int]:
+        """Apply versioned budget updates; return req_id -> revision applied.
+
+        Only requests that opted into a budget at ``add_request`` and only
+        strictly increasing revisions are applied. The staged budget tensor
+        is flushed by ``apply_staged_writes``.
+        """
+        if not self.enabled or not updates:
+            return {}
+        acks: dict[str, int] = {}
+        for req_id, (revision, budget) in updates.items():
+            req_idx = req_id_to_index.get(req_id)
+            if req_idx is None or not self.use_thinking_budget[req_idx]:
+                continue
+            if revision <= self.budget_revision[req_idx]:
+                continue
+            self.budget_revision[req_idx] = revision
+            budget = min(max(budget, 0), _INT32_MAX)
+            if self.thinking_token_budget.np[req_idx] != budget:
+                self.thinking_token_budget.np[req_idx] = budget
+                self._budget_dirty = True
+            acks[req_id] = revision
+        return acks
 
     def apply_staged_writes(self) -> None:
         if not self.enabled:
@@ -107,6 +156,9 @@ class ThinkingBudgetState:
             self.thinking_token_budget.copy_to_uva()
             self._budget_dirty = False
 
+    def requires_logits_processing(self, idx_mapping_np: np.ndarray) -> bool:
+        return self.enabled and bool(np.any(self.use_thinking_budget[idx_mapping_np]))
+
     def apply(
         self,
         logits: torch.Tensor,
@@ -116,7 +168,7 @@ class ThinkingBudgetState:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
     ) -> None:
-        if not self.enabled or not np.any(self.use_thinking_budget[idx_mapping_np]):
+        if not self.requires_logits_processing(idx_mapping_np):
             return
 
         apply_thinking_budget(
@@ -369,6 +421,179 @@ def _thinking_budget_kernel(
     tl.store(logits_ptr + token_idx * logits_stride + force_token_id, 1.0e9)
 
 
+def find_last_marker(tokens: torch.Tensor, marker: torch.Tensor, lo: int = 0) -> int:
+    """Largest ``i >= lo`` with ``tokens[i:i+len(marker)] == marker``, else -1."""
+    n = marker.numel()
+    if n == 0 or tokens.numel() - lo < n:
+        return -1
+    hits = (tokens[lo:].unfold(0, n, 1) == marker).all(dim=1)
+    if not bool(hits.any()):
+        return -1
+    return lo + int(hits.nonzero()[-1].item())
+
+
+def update_marker_cache_torch(
+    req_ids: torch.Tensor,
+    thinking_token_budget: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    total_len: torch.Tensor,
+    cached_last_start: torch.Tensor,
+    cached_last_end: torch.Tensor,
+    cached_scan_pos: torch.Tensor,
+    reasoning_start_token_ids: torch.Tensor,
+    natural_reasoning_end_token_ids: torch.Tensor,
+) -> None:
+    """Torch reference of ``_update_committed_marker_cache_kernel``.
+
+    Refreshes the cached last start / natural-end marker positions of each
+    budgeted request from its committed tokens, scanning only what the
+    previous scan could not have covered.
+    """
+    max_len = max(
+        reasoning_start_token_ids.numel(), natural_reasoning_end_token_ids.numel()
+    )
+    for req_idx in req_ids.tolist():
+        if int(thinking_token_budget[req_idx]) < 0:
+            continue
+        seq_len = int(total_len[req_idx])
+        scan_pos = int(cached_scan_pos[req_idx])
+        last_start = int(cached_last_start[req_idx])
+        last_end = int(cached_last_end[req_idx])
+        if scan_pos > seq_len:
+            scan_pos, last_start, last_end = 0, -1, -1
+        lo = 0 if (scan_pos == 0 and last_start < 0 and last_end < 0) else scan_pos
+        tokens = all_token_ids[req_idx, :seq_len]
+        last_start = max(
+            last_start, find_last_marker(tokens, reasoning_start_token_ids, lo)
+        )
+        last_end = max(
+            last_end, find_last_marker(tokens, natural_reasoning_end_token_ids, lo)
+        )
+        cached_last_start[req_idx] = last_start
+        cached_last_end[req_idx] = last_end
+        cached_scan_pos[req_idx] = max(0, seq_len - (max_len - 1))
+
+
+def forced_end_tokens_torch(
+    expanded_idx_mapping: torch.Tensor,
+    thinking_token_budget: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    total_len: torch.Tensor,
+    input_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    cached_last_start: torch.Tensor,
+    cached_last_end: torch.Tensor,
+    reasoning_start_token_ids: torch.Tensor,
+    natural_reasoning_end_token_ids: torch.Tensor,
+    reasoning_end_token_ids: torch.Tensor,
+) -> tuple[list[int], list[int]]:
+    """Torch reference of ``_thinking_budget_kernel``'s decision.
+
+    Returns the ``(row, token_id)`` pairs to force. Row ``t`` of request ``r``
+    at local position ``p`` sees the effective prefix = committed tokens plus
+    ``input_ids[t-p+1 : t+1]`` (the drafts before it); it is forced when that
+    prefix is inside a think block holding at least ``budget`` tokens, to the
+    end-sequence token following the longest end-sequence prefix the effective
+    prefix already ends with.
+    """
+    start_len = reasoning_start_token_ids.numel()
+    natural_end_len = natural_reasoning_end_token_ids.numel()
+    end_len = reasoning_end_token_ids.numel()
+    rows: list[int] = []
+    force_tokens: list[int] = []
+    for row, (req_idx, local_pos) in enumerate(
+        zip(expanded_idx_mapping.tolist(), expanded_local_pos.tolist())
+    ):
+        budget = int(thinking_token_budget[req_idx])
+        if budget < 0:
+            continue
+        seq_len = int(total_len[req_idx])
+        first_row = row - local_pos
+        effective = torch.cat(
+            [
+                all_token_ids[req_idx, :seq_len].to(torch.int64),
+                input_ids[first_row + 1 : first_row + local_pos + 1].to(torch.int64),
+            ]
+        )
+        effective_len = seq_len + local_pos
+        last_start = max(
+            int(cached_last_start[req_idx]),
+            find_last_marker(
+                effective, reasoning_start_token_ids, max(0, seq_len - start_len + 1)
+            ),
+        )
+        last_end = max(
+            int(cached_last_end[req_idx]),
+            find_last_marker(
+                effective,
+                natural_reasoning_end_token_ids,
+                max(0, seq_len - natural_end_len + 1),
+            ),
+        )
+        if last_start < 0 or last_start <= last_end:
+            continue
+        if effective_len - (last_start + start_len) < budget:
+            continue
+        end_prefix_len = 0
+        for prefix_len in range(1, min(end_len - 1, effective_len) + 1):
+            if torch.equal(
+                effective[effective_len - prefix_len :],
+                reasoning_end_token_ids[:prefix_len].to(torch.int64),
+            ):
+                end_prefix_len = prefix_len
+        rows.append(row)
+        force_tokens.append(int(reasoning_end_token_ids[end_prefix_len]))
+    return rows, force_tokens
+
+
+def apply_thinking_budget_torch(
+    logits: torch.Tensor,
+    req_ids: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    thinking_token_budget: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    total_len: torch.Tensor,
+    input_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    cached_last_start: torch.Tensor,
+    cached_last_end: torch.Tensor,
+    cached_scan_pos: torch.Tensor,
+    reasoning_start_token_ids: torch.Tensor,
+    natural_reasoning_end_token_ids: torch.Tensor,
+    reasoning_end_token_ids: torch.Tensor,
+) -> None:
+    """Torch reference of ``apply_thinking_budget`` (runs on CPU tensors)."""
+    update_marker_cache_torch(
+        req_ids,
+        thinking_token_budget,
+        all_token_ids,
+        total_len,
+        cached_last_start,
+        cached_last_end,
+        cached_scan_pos,
+        reasoning_start_token_ids,
+        natural_reasoning_end_token_ids,
+    )
+    rows, force_tokens = forced_end_tokens_torch(
+        expanded_idx_mapping,
+        thinking_token_budget,
+        all_token_ids,
+        total_len,
+        input_ids,
+        expanded_local_pos,
+        cached_last_start,
+        cached_last_end,
+        reasoning_start_token_ids,
+        natural_reasoning_end_token_ids,
+        reasoning_end_token_ids,
+    )
+    if rows:
+        logits[
+            torch.tensor(rows, dtype=torch.int64, device=logits.device),
+            torch.tensor(force_tokens, dtype=torch.int64, device=logits.device),
+        ] = 1.0e9
+
+
 def apply_thinking_budget(
     logits: torch.Tensor,
     req_ids: torch.Tensor,
@@ -385,6 +610,25 @@ def apply_thinking_budget(
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
 ) -> None:
+    if logits.device.type != "cuda":
+        apply_thinking_budget_torch(
+            logits,
+            req_ids,
+            expanded_idx_mapping,
+            thinking_token_budget,
+            all_token_ids,
+            total_len,
+            input_ids,
+            expanded_local_pos,
+            cached_last_start,
+            cached_last_end,
+            cached_scan_pos,
+            reasoning_start_token_ids,
+            natural_reasoning_end_token_ids,
+            reasoning_end_token_ids,
+        )
+        return
+
     num_tokens = logits.shape[0]
     start_len = reasoning_start_token_ids.shape[0]
     natural_end_len = natural_reasoning_end_token_ids.shape[0]

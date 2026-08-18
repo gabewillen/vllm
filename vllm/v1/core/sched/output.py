@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -267,6 +267,13 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # req_id -> (revision, absolute thinking token budget). Applied by the
+    # model runner before this step's sampling for strictly increasing
+    # revisions only; acked via ModelRunnerOutput.thinking_budget_acks.
+    thinking_budget_updates: dict[str, tuple[int, int]] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

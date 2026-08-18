@@ -235,6 +235,8 @@ class Sampler:
             return True
         if np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] > 0):
             return True
+        if self.thinking_budget_state.requires_logits_processing(idx_mapping_np):
+            return True
 
         states = self.sampling_states
         temperatures = states.temperature.np[idx_mapping_np]

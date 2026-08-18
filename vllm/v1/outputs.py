@@ -349,6 +349,13 @@ class ModelRunnerOutput:
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 
+    # req_id -> (mean normalised entropy, mean top1-top2 margin, n committed
+    # rows) for requests that opted into effort telemetry this step.
+    effort_signals: dict[str, tuple[float, float, int]] | None = None
+
+    # req_id -> revision of the thinking budget update applied this step.
+    thinking_budget_acks: dict[str, int] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

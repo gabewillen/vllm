@@ -751,6 +751,8 @@ class GPUModelRunner(
         self._init_kernel_block_sizes = [placeholder_block_size]
         self._init_max_num_blocks = [placeholder_max_num_blocks]
         self._init_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT]
+        # Thinking budget update acks not yet returned in a ModelRunnerOutput.
+        self.pending_thinking_budget_acks: dict[str, int] = {}
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
@@ -1239,6 +1241,13 @@ class GPUModelRunner(
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
 
+    def take_thinking_budget_acks(self) -> dict[str, int] | None:
+        if not self.pending_thinking_budget_acks:
+            return None
+        acks = self.pending_thinking_budget_acks
+        self.pending_thinking_budget_acks = {}
+        return acks
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1568,6 +1577,12 @@ class GPUModelRunner(
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
+        if scheduler_output.thinking_budget_updates:
+            self.pending_thinking_budget_acks.update(
+                self.input_batch.update_thinking_budgets(
+                    scheduler_output.thinking_budget_updates
+                )
+            )
 
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
@@ -4905,6 +4920,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                thinking_budget_acks=self.take_thinking_budget_acks(),
             )
 
         if not self.use_async_scheduling:
