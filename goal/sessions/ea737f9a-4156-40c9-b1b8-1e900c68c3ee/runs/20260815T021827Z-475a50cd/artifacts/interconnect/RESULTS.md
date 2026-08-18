@@ -25,3 +25,24 @@ Implications: (1) moving GPU0/GPU1 to x16 slots (or fixing bifurcation) is the o
 speed the 4-way ring; (2) TP2 x PP2 with the x16 pair {2,3} as one stage would cut per-chunk
 comm ~6x at the cost of single-stream decode; (3) kernel fusion addresses only the ~35%
 compute share of prefill and the ~88% non-comm share of the decode step.
+
+## Update 2026-08-18 (later): P2P crash root-caused and P2P deployed
+
+Bisection (all with NCCL_P2P_LEVEL=SYS, 128x1k/1k batch): plain TP4 -> stable, **620 tok/s** (+30%);
+any MTP config -> CUDA illegal-memory-access, regardless of IOMMU (off), ACS (cleared on host),
+memlock (unlimited), NCCL_P2P_DIRECT_DISABLE / CUMEM / LOCAL_REGISTER / GRAPH_REGISTER / PROTO,
+eager mode, async scheduling, offload on/off, dynamic vs static K, draft TP1 vs TP4. Only
+CUDA_LAUNCH_BLOCKING=1 hid it (race). GPU core dump (CUDA_ENABLE_COREDUMP_ON_EXCEPTION +
+lightweight flags, read with cuda-gdb `info cuda kernels`) names the faulting kernel:
+`flashinfer::PersistentVariableLengthMergeStatesKernel` on device 1 — FlashInfer's split-KV merge on
+the spec-decode verify path (multi-query-token). Fix: `attention-backend: TRITON_ATTN` for the target
+AND `"attention_backend": "TRITON_ATTN"` in speculative-config (the draft layer picks its own backend
+and stayed FlashInfer). With that MTP K=7 + P2P is stable (128/128, several runs).
+
+Deployed (unit Environment=NCCL_P2P_LEVEL=SYS, git next): single-stream reason/prose/write/edit
+46/40/68/103 -> 51/42/80/115 tok/s; cold ~90k prefill 61 -> 42 s. Costs: Triton attention pool
+1.39M -> 1.21M tokens; batch aggregate at K=7 313 tok/s because MTP on this hybrid needs (K+1)
+GDN state checkpoints per request = (K+1) x 1600-token blocks x 3 GDN groups (K=7 -> max 34
+concurrent, K=2 -> 88 on the same pool; measured, matches the arithmetic). Irrelevant at <=8 agents.
+Host prerequisites the user set: amd_iommu=off iommu=off; ACS cleared via setpci on
+00:03.1 20:03.1 40:03.1 60:03.1 03:00.0 (runtime — re-apply after a host reboot); memlock unlimited.

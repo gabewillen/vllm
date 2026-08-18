@@ -25,6 +25,7 @@ Environment=HOME=/home/gwillen
 # across restarts or the disk tier can never hit after a service restart.
 Environment=PYTHONHASHSEED=8012
 Environment=PYTHONPATH=/shared/vllm/serve-configs/middleware
+Environment=NCCL_P2P_LEVEL=SYS
 
 [Install]
 WantedBy=multi-user.target
