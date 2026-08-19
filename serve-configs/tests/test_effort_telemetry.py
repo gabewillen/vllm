@@ -57,7 +57,7 @@ def test_row_signals_match_numpy_reference(dtype):
     logits = (torch.randn(16, 257) * 3).to(dtype)
     got = effort_row_signals(logits)
     h_ref, m_ref = _np_reference(logits.float().numpy())
-    assert got.dtype == torch.float32 and got.shape == (16, 2)
+    assert got.dtype == torch.float32 and got.shape == (16, 3)
     np.testing.assert_allclose(got[:, ENTROPY].numpy(), h_ref, atol=1e-5)
     np.testing.assert_allclose(got[:, MARGIN].numpy(), m_ref, atol=1e-5)
 
@@ -88,19 +88,19 @@ def test_row_signals_scattered_only_touches_selected_rows(monkeypatch):
     calls: list[int] = []
     real = es.effort_row_signals
 
-    def spy(logits):
+    def spy(logits, end_token_id=None):
         calls.append(logits.shape[0])
-        return real(logits)
+        return real(logits, end_token_id)
 
     monkeypatch.setattr(es, "effort_row_signals", spy)
     logits = torch.randn(6, 32)
     rows = torch.tensor([1, 4])
     out = effort_row_signals_scattered(logits, rows)
     assert calls == [2]
-    assert torch.equal(out[[0, 2, 3, 5]], torch.zeros(4, 2))
+    assert torch.equal(out[[0, 2, 3, 5]], torch.zeros(4, 3))
     torch.testing.assert_close(out[rows], real(logits[rows]))
     empty = effort_row_signals_scattered(logits, torch.zeros(0, dtype=torch.long))
-    assert calls == [2] and torch.equal(empty, torch.zeros(6, 2))
+    assert calls == [2] and torch.equal(empty, torch.zeros(6, 3))
 
 
 # --------------------------------------------------------------------------
@@ -113,30 +113,30 @@ def test_reduce_committed_mixed_acceptance():
     torch.manual_seed(2)
     k = 3
     num_reqs = 4
-    rows = torch.rand(num_reqs * (k + 1), 2)
+    rows = torch.rand(num_reqs * (k + 1), 3)
     cu = torch.arange(num_reqs + 1) * (k + 1)
     committed = torch.tensor([1, 2, 4, 3])  # 0..K accepted (+1 bonus/recovery)
     out = reduce_committed(rows, cu, committed)
-    assert out.shape == (num_reqs, 3)
+    assert out.shape == (num_reqs, 4)
     for i in range(num_reqs):
         n = int(committed[i])
         seg = rows[i * (k + 1) : i * (k + 1) + n]
         assert out[i, NUM_ROWS] == n
-        torch.testing.assert_close(out[i, :2], seg.mean(0))
+        torch.testing.assert_close(out[i, :3], seg.mean(0))
 
 
 def test_reduce_committed_zero_rows_and_ragged():
-    rows = torch.tensor([[0.2, 1.0], [0.4, 3.0], [0.9, 9.0]])
+    rows = torch.tensor([[0.2, 1.0, 0.1], [0.4, 3.0, 0.2], [0.9, 9.0, 0.3]])
     cu = torch.tensor([0, 2, 3])
     out = reduce_committed(rows, cu, torch.tensor([0, 1]))
-    assert out[0].tolist() == [0.0, 0.0, 0.0]
-    assert out[1].tolist() == pytest.approx([0.9, 9.0, 1.0])
+    assert out[0].tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert out[1].tolist() == pytest.approx([0.9, 9.0, 0.3, 1.0])
     masked = reduce_committed(
         rows, cu, torch.tensor([2, 1]), row_mask=torch.tensor([True, False, True])
     )
-    assert masked[0].tolist() == pytest.approx([0.2, 1.0, 1.0])
-    empty = reduce_committed(torch.zeros(0, 2), torch.tensor([0]), torch.zeros(0))
-    assert empty.shape == (0, 3)
+    assert masked[0].tolist() == pytest.approx([0.2, 1.0, 0.1, 1.0])
+    empty = reduce_committed(torch.zeros(0, 3), torch.tensor([0]), torch.zeros(0))
+    assert empty.shape == (0, 4)
 
 
 def test_commit_order_permutation_and_flagged_rows():
@@ -180,9 +180,9 @@ def test_v1_sampler_emits_flagged_rows_only_and_keeps_tokens(monkeypatch):
     calls: list[int] = []
     real = es.effort_row_signals
 
-    def spy(logits):
+    def spy(logits, end_token_id=None):
         calls.append(logits.shape[0])
-        return real(logits)
+        return real(logits, end_token_id)
 
     monkeypatch.setattr(es, "effort_row_signals", spy)
     torch.manual_seed(3)
@@ -193,9 +193,9 @@ def test_v1_sampler_emits_flagged_rows_only_and_keeps_tokens(monkeypatch):
     assert calls == [2]
     assert torch.equal(out.sampled_token_ids.view(-1).long(), logits.argmax(-1))
     sig = out.effort_signals
-    assert sig is not None and sig.shape == (4, 3)
+    assert sig is not None and sig.shape == (4, 4)
     ref = real(logits[[0, 2]])
-    torch.testing.assert_close(sig[[0, 2], :2], ref)
+    torch.testing.assert_close(sig[[0, 2], :3], ref)
     assert sig[:, NUM_ROWS].tolist() == [1.0, 0.0, 1.0, 0.0]
     assert out.effort_flags is mask
     d = signals_to_dict(["a", "b", "c", "d"], sig.numpy(), mask)
@@ -213,9 +213,9 @@ def test_v1_rejection_target_rows_and_committed_reduction(monkeypatch):
     calls: list[int] = []
     real = es.effort_row_signals
 
-    def spy(logits):
+    def spy(logits, end_token_id=None):
         calls.append(logits.shape[0])
-        return real(logits)
+        return real(logits, end_token_id)
 
     monkeypatch.setattr(es, "effort_row_signals", spy)
     torch.manual_seed(4)
@@ -289,9 +289,9 @@ def test_v2_effort_state_paths(monkeypatch):
     calls: list[int] = []
     real = es.effort_row_signals
 
-    def spy(logits):
+    def spy(logits, end_token_id=None):
         calls.append(logits.shape[0])
-        return real(logits)
+        return real(logits, end_token_id)
 
     monkeypatch.setattr(es, "effort_row_signals", spy)
     monkeypatch.setattr(v2_effort, "effort_row_signals", spy)
@@ -362,7 +362,7 @@ def test_think_tracker_rules():
 
 
 def test_sink_record_schema_and_flush():
-    line = format_sink_record("r1", 3, 17, (0.5, 2.25, 4), 7, 3, True)
+    line = format_sink_record("r1", 3, 17, (0.5, 2.25, 0.125, 4), 7, 3, True)
     rec = json.loads(line)
     assert list(rec) == [
         "req_id",
@@ -370,6 +370,7 @@ def test_sink_record_schema_and_flush():
         "num_output_tokens",
         "entropy",
         "margin",
+        "p_end",
         "n_rows",
         "num_draft_tokens",
         "num_accepted",
@@ -381,6 +382,7 @@ def test_sink_record_schema_and_flush():
         "num_output_tokens": 17,
         "entropy": 0.5,
         "margin": 2.25,
+        "p_end": 0.125,
         "n_rows": 4,
         "num_draft_tokens": 7,
         "num_accepted": 3,
@@ -390,18 +392,18 @@ def test_sink_record_schema_and_flush():
     buf = io.StringIO()
     sink = EffortTelemetrySink("unused", [10], [20], stream=buf)
     sink.FLUSH_EVERY = 3
-    sink.record("a", [10, 1], (0.1, 1.0, 1), None, None, False)
-    sink.record("b", [2], (0.2, 2.0, 1), 3, 1, False)
+    sink.record("a", [10, 1], (0.1, 1.0, 0.0, 1), None, None, False)
+    sink.record("b", [2], (0.2, 2.0, 0.0, 1), 3, 1, False)
     assert buf.getvalue() == ""  # buffered
-    sink.record("a", [10, 1, 2], (0.3, 3.0, 2), None, None, False)
+    sink.record("a", [10, 1, 2], (0.3, 3.0, 0.0, 2), None, None, False)
     lines = [json.loads(x) for x in buf.getvalue().splitlines()]
     assert [(r["req_id"], r["step"]) for r in lines] == [("a", 1), ("b", 1), ("a", 2)]
     assert lines[0]["in_think"] is True and lines[1]["in_think"] is False
     assert lines[1]["num_draft_tokens"] == 3 and lines[0]["num_accepted"] is None
     # Finish flushes immediately and forgets the per-request state.
-    sink.record("b", [2, 20], (0.4, 4.0, 1), 3, 0, True)
+    sink.record("b", [2, 20], (0.4, 4.0, 0.0, 1), 3, 0, True)
     assert json.loads(buf.getvalue().splitlines()[-1])["step"] == 2
-    sink.record("b", [5], (0.5, 5.0, 1), None, None, True)
+    sink.record("b", [5], (0.5, 5.0, 0.0, 1), None, None, True)
     assert json.loads(buf.getvalue().splitlines()[-1])["step"] == 1
 
 
@@ -412,7 +414,7 @@ def test_sink_from_env(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_EFFORT_TELEMETRY", str(path))
     sink = EffortTelemetrySink.from_env([1], [2])
     assert sink is not None
-    sink.record("x", [1, 3], (0.9, 0.1, 1), None, None, True)
+    sink.record("x", [1, 3], (0.9, 0.1, 0.0, 1), None, None, True)
     sink.close()
     assert json.loads(path.read_text().strip())["in_think"] is True
 

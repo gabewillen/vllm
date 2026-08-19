@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contract tests for dynamic reasoning effort (P2 controller + frontend)."""
+"""CPU contract tests for dynamic reasoning effort (P2 controller + frontend).
+
+The controller tests here pin the pre-P6 `rule="score"` path, which stays
+selectable; the P6 rank rule, novelty churn, p(end) grace, quantile sketches
+and worker-side evaluation are covered by `test_effort_p6.py`.
+"""
 
 import itertools
 import math
@@ -37,8 +42,10 @@ LADDER = [100, 400, 1600]
 
 def _cfg(**kw) -> DynamicEffortConfig:
     base = dict(
+        rule="score",
         ladder=LADDER,
         theta=[0.0, 0.5],
+        p_uncertain=[0.75, 0.85],
         min_samples=8,
         dwell_tokens=0,
         calibration={"entropy": (0.5, 0.2), "margin": (0.5, 0.2)},
@@ -54,6 +61,8 @@ def test_config_defaults_and_theta():
     cfg = DynamicEffortConfig()
     assert cfg.ladder == [1024, 4096, 16384, 65536]
     assert cfg.theta == [0.0, 0.5, 1.0]
+    assert cfg.p_uncertain == [0.75, 0.85, 0.92]
+    assert cfg.rule == "rank" and cfg.evaluation == "worker"
     assert cfg.check_at == 0.75 and cfg.final_check_at == 0.9
     assert cfg.loop_ngram == 16 and cfg.loop_repeats == 3 and cfg.loop_window == 512
     assert cfg.floor_enabled is False
@@ -488,6 +497,7 @@ def test_late_detection_and_ack():
         "reasoning_tokens": 76,
         "late": 1,
         "stall_clamps": 0,
+        "grace_tokens": 0,
     }
     # Acked before the close: not late.
     st = _state(cfg)
@@ -527,7 +537,7 @@ def test_marker_sequences_and_churn_veto():
     seqs = resolve_marker_sequences(["Wait", "Hmm"], lambda t: [ord(c) for c in t])
     assert (ord("W"), ord("a"), ord("i"), ord("t")) in seqs
     assert (ord(" "), ord("H"), ord("m"), ord("m")) in seqs
-    cfg = _cfg(marker_window=64, marker_max_rate=0.05)
+    cfg = _cfg(marker_window=64, marker_max_rate=0.05, backtrack_marker_weight=1.0)
     st = new_effort_state("r", cfg, {}, [START], [END], [(50,)], None, 100_000)
     # A marker every 8 tokens (rate 0.125) with a flat-high entropy = churn.
     tokens = [START] + [50 if i % 8 == 0 else 100 + i for i in range(100)]
@@ -576,6 +586,7 @@ def test_effort_report_shape():
         "reasoning_tokens",
         "late",
         "stall_clamps",
+        "grace_tokens",
     }
     assert all(isinstance(v, int) for v in rep.values())
     assert not math.isnan(rep["rung"])
@@ -595,6 +606,11 @@ def _bare_scheduler(cfg):
     sched._effort_start_ids = [START]
     sched._effort_end_ids = [END]
     sched._effort_marker_seqs = []
+    sched._effort_sketches = None
+    sched._effort_policy = None
+    sched._effort_policy_age = 0
+    sched._effort_worker_eval = False
+    sched._effort_worker_reqs = set()
     sched.running = []
     return sched
 
@@ -625,7 +641,7 @@ def test_scheduler_glue_add_step_ack_free():
     sched.running = [dyn, plain]
     for tok in _think_tokens(75):
         dyn.append_output_token_ids(tok)
-        sched._step_effort(dyn, st, [tok], (0.9, 0.1, 1), 0, 0, None)
+        sched._step_effort(dyn, st, [tok], (0.9, 0.1, 0.0, 1), 0, 0, None)
     assert sched._effort_pending == {"dyn": (1, 400)}
     # Unacked updates are re-sent until the worker acks the revision.
     sched._ingest_effort_acks({"dyn": 0, "other": 3})
@@ -661,5 +677,5 @@ def test_scheduler_glue_reuses_repetition_params_relaxed():
     sched.running = [req]
     for tok in [7, 8, 7, 8]:  # 2 repeats of a 2-gram: evidence, not a stop
         req.append_output_token_ids(tok)
-        sched._step_effort(req, st, [tok], (0.5, 0.5, 1), 0, 0, None)
+        sched._step_effort(req, st, [tok], (0.5, 0.5, 0.0, 1), 0, 0, None)
     assert st.stalled and sched._effort_pending["rep"] == (1, st.think_count + 32)
