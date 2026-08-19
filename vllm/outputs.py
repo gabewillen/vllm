@@ -123,7 +123,8 @@ class RequestOutput:
         kv_transfer_params: The params for remote K/V transfer.
         ec_transfer_params: The params for remote encoder-cache transfer.
         effort: Dynamic reasoning-effort report (rung, escalations,
-            reasoning_tokens, late, stall_clamps), set on the final output.
+            reasoning_tokens, late, stall_clamps, grace_tokens, close_kind),
+            set on the final output.
     """
 
     def __init__(

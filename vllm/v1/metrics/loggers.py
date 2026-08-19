@@ -5,6 +5,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -28,6 +29,7 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
+from vllm.v1.sample.soft_limit import CLOSE_FORCED, CLOSE_NATURAL, CLOSE_SOFT
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
 
 logger = init_logger(__name__)
@@ -845,6 +847,21 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.counter_effort_late = create_metric_per_engine(
             counter_effort_late, per_engine_labelvalues
         )
+        counter_effort_close_kind = self._counter_cls(
+            name="vllm:effort_close",
+            documentation=(
+                "How dynamic-effort think blocks ended: natural (before the "
+                "cap), soft (inside the soft-limit ramp) or forced."
+            ),
+            labelnames=labelnames + ["kind"],
+        )
+        self.counter_effort_close_kind = {
+            idx: {
+                kind: counter_effort_close_kind.labels(model_name, str(idx), kind)
+                for kind in (CLOSE_NATURAL, CLOSE_SOFT, CLOSE_FORCED)
+            }
+            for idx in engine_indexes
+        }
 
         #
         # Histogram of timing intervals
@@ -1316,7 +1333,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             if finished_request.effort is not None:
                 self._record_effort(engine_idx, finished_request.effort)
 
-    def _record_effort(self, engine_idx: int, effort: dict[str, int]) -> None:
+    def _record_effort(self, engine_idx: int, effort: dict[str, Any]) -> None:
         rung = effort.get("rung", 0)
         self.histogram_effort_final_rung[engine_idx].observe(rung)
         self.histogram_reasoning_tokens[engine_idx].observe(
@@ -1332,6 +1349,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_effort_stall_clamps[engine_idx].inc()
         if effort.get("late"):
             self.counter_effort_late[engine_idx].inc()
+        close_kind = effort.get("close_kind")
+        counters = self.counter_effort_close_kind[engine_idx]
+        if close_kind in counters:
+            counters[close_kind].inc()
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1

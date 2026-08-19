@@ -5,6 +5,9 @@ Drives the pure torch reference (``apply_thinking_budget_torch`` and the
 ``ThinkingBudgetState`` slot logic) on CPU tensors through a scripted target
 model plus a greedy rejection sampler, and cross-checks the committed token
 streams against the V1 ``ThinkingBudgetStateHolder`` on the same drafts.
+
+The sims here are also the harness ``test_effort_soft_limit`` reuses; both
+accept an optional :class:`SoftLimit` and record the ramp bias they wrote.
 """
 
 from types import SimpleNamespace
@@ -12,11 +15,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample import thinking_budget_state as v1_module
 from vllm.v1.sample.logits_processor.interface import BatchUpdate
+from vllm.v1.sample.soft_limit import SoftLimit
 from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
 from vllm.v1.worker.gpu.sample import thinking_budget as v2_module
 from vllm.v1.worker.gpu.sample.thinking_budget import (
@@ -54,7 +59,16 @@ def _script(n: int) -> int:
 class V2Sim:
     """CPU mirror of the V2 per-slot tensors, driven through the torch path."""
 
-    def __init__(self, max_num_reqs=4, start=START, end=END, natural_end=None):
+    def __init__(
+        self,
+        max_num_reqs=4,
+        start=START,
+        end=END,
+        natural_end=None,
+        soft_limit: SoftLimit | None = None,
+    ):
+        self.soft_limit = soft_limit
+        self.last_bias: dict[int, dict[int, float]] = {}
         self.max_num_reqs = max_num_reqs
         self.all_token_ids = torch.zeros((max_num_reqs, MAX_LEN), dtype=torch.int32)
         self.total_len = torch.zeros(max_num_reqs, dtype=torch.int32)
@@ -118,25 +132,48 @@ class V2Sim:
             self.start_ids,
             self.natural_end_ids,
             self.end_ids,
+            self.soft_limit,
         )
         out: dict[int, dict[int, int]] = {r: {} for r, _ in batch}
         rows, toks = (logits == FORCE).nonzero(as_tuple=True)
         for row, tok in zip(rows.tolist(), toks.tolist()):
             out[eim[row]][elp[row]] = tok
         assert int((logits == FORCE).sum()) == len(rows)
+        self.last_bias = {r: {} for r, _ in batch}
+        soft_token = int(self.natural_end_ids[0])
+        for row in range(logits.shape[0]):
+            value = float(logits[row, soft_token])
+            if 0.0 < value < FORCE:
+                self.last_bias[eim[row]][elp[row]] = value
         return out
 
 
 class V1Sim:
     """The V1 holder driven exactly like the V1 sampler / rejection sampler."""
 
-    def __init__(self, num_spec_tokens: int, max_num_reqs=4, start=START, end=END):
+    def __init__(
+        self,
+        num_spec_tokens: int,
+        max_num_reqs=4,
+        start=START,
+        end=END,
+        natural_end=None,
+        soft_limit: SoftLimit | None = None,
+    ):
+        natural = list(natural_end if natural_end is not None else end)
         cfg = SimpleNamespace(
-            reasoning_start_token_ids=start, reasoning_end_token_ids=end
+            reasoning_start_token_ids=start,
+            reasoning_end_token_ids=end,
+            natural_reasoning_end_token_ids=natural,
+            dynamic_effort=(
+                None if soft_limit is None else SimpleNamespace(soft_limit=soft_limit)
+            ),
         )
         self.holder = ThinkingBudgetStateHolder(
             cfg, max_num_reqs, num_spec_tokens, torch.device("cpu"), False
         )
+        self.soft_token = natural[0]
+        self.last_bias: dict[int, dict[int, float]] = {}
         self.outputs: dict[int, list[int]] = {}
         self.max_num_reqs = max_num_reqs
 
@@ -152,6 +189,9 @@ class V1Sim:
             )
         )
 
+    def output(self, req_idx: int) -> list[int]:
+        return self.outputs[req_idx]
+
     def commit(self, req_idx: int, tokens: list[int]) -> None:
         self.outputs[req_idx].extend(tokens)
 
@@ -162,6 +202,7 @@ class V1Sim:
         for r, drafts in batch:
             specs[r] = list(drafts)
         out: dict[int, dict[int, int]] = {r: {} for r, _ in batch}
+        self.last_bias = {r: {} for r, _ in batch}
         if self.holder.in_spec_mode and any(specs):
             # Rejection-sampler step: bonus rows first, then the target rows.
             self.holder.update_state(outputs, specs)
@@ -173,12 +214,15 @@ class V1Sim:
                 hit = (bonus[r] == FORCE).nonzero()
                 if len(hit):
                     out[r][len(drafts)] = int(hit[0])
+                self._record_bias(bonus[r], r, len(drafts))
             cu = 0
             for i in range(n):
                 for p in range(len(specs[i])):
                     hit = (target[cu + p] == FORCE).nonzero()
                     if len(hit):
                         out[i][p] = int(hit[0])
+                    if i in self.last_bias:
+                        self._record_bias(target[cu + p], i, p)
                 cu += len(specs[i])
         else:
             # Plain sampler step (no drafts this step, e.g. right after prefill).
@@ -189,7 +233,13 @@ class V1Sim:
                 hit = (logits[r] == FORCE).nonzero()
                 if len(hit):
                     out[r][0] = int(hit[0])
+                self._record_bias(logits[r], r, 0)
         return out
+
+    def _record_bias(self, row: torch.Tensor, req_idx: int, local_pos: int) -> None:
+        value = float(row[self.soft_token])
+        if 0.0 < value < FORCE:
+            self.last_bias[req_idx][local_pos] = value
 
 
 def _verify(n_out: int, drafts: list[int], forced: dict[int, int]) -> list[int]:
@@ -232,10 +282,15 @@ def _run(sim, req_idx, budget, drafts_fn, steps):
 class _Paired:
     """V1 + V2 running in lock-step on identical drafts."""
 
-    def __init__(self, k: int, start=START, end=END):
+    def __init__(self, k: int, start=START, end=END, soft_limit=None, natural_end=None):
         self.k = k
-        self.v1 = V1Sim(k, start=start, end=end)
-        self.v2 = V2Sim(start=start, end=end)
+        self.v1 = V1Sim(
+            k, start=start, end=end, natural_end=natural_end, soft_limit=soft_limit
+        )
+        self.v2 = V2Sim(
+            start=start, end=end, natural_end=natural_end, soft_limit=soft_limit
+        )
+        self.last_bias: dict[int, dict[int, float]] = {}
 
     def add(self, req_idx, prompt, budget):
         self.v1.add(req_idx, prompt, budget)
@@ -258,6 +313,11 @@ class _Paired:
                 assert f1[r][first] == f2[r][first], (f1, f2)
             else:
                 assert not f2[r], (f1, f2)
+            b1, b2 = self.v1.last_bias.get(r, {}), self.v2.last_bias.get(r, {})
+            assert set(b1) == set(b2), (b1, b2)
+            for pos, value in b1.items():
+                assert value == pytest.approx(b2[pos]), (b1, b2)
+        self.last_bias = dict(self.v2.last_bias)
         return f2
 
 

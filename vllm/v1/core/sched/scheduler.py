@@ -78,6 +78,7 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sample.effort_policy import EffortPolicy
 from vllm.v1.sample.effort_signals import EffortTelemetrySink
+from vllm.v1.sample.soft_limit import SoftLimit, soft_limit_from_config
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -321,6 +322,7 @@ class Scheduler(SchedulerInterface):
         self._effort_policy_age = 0
         self._effort_worker_eval = False
         self._effort_worker_reqs: set[str] = set()
+        self._effort_soft_limit = SoftLimit(enabled=False)
         reasoning_config = vllm_config.reasoning_config
         if reasoning_config is not None and reasoning_config.dynamic_effort:
             self._init_effort_controller(reasoning_config)
@@ -2591,6 +2593,8 @@ class Scheduler(SchedulerInterface):
                 "dynamic_effort: could not load %s (%s)", cfg.quantile_path, exc
             )
             warmed = False
+        soft = soft_limit_from_config(cfg.soft_limit)
+        self._effort_soft_limit = soft
         logger.info(
             "dynamic_effort: rule=%s evaluation=%s sketches=%s (%s)",
             cfg.rule,
@@ -2598,6 +2602,23 @@ class Scheduler(SchedulerInterface):
             "warm" if warmed else "cold",
             cfg.quantile_path or "in-memory",
         )
+        if soft.active:
+            logger.info(
+                "dynamic_effort: soft-limit close active - the reasoning end "
+                "token is biased up to %+.1f logits over the %d tokens after "
+                "the cap (curve %.2f), the hard force fires at cap+%d; the "
+                "p(end) grace window is subsumed by the ramp.",
+                soft.max_bias,
+                soft.ramp_tokens,
+                soft.curve,
+                soft.ramp_tokens,
+            )
+        else:
+            logger.info(
+                "dynamic_effort: soft-limit close off - the end sequence is "
+                "forced at the cap; p(end) grace window %d tokens.",
+                cfg.grace_tokens,
+            )
         # Worker-side evaluation needs the V2 runner's escalation tensors.
         self._effort_worker_eval = cfg.evaluation == "worker" and bool(
             envs.VLLM_USE_V2_MODEL_RUNNER
@@ -2691,7 +2712,9 @@ class Scheduler(SchedulerInterface):
                 baseline_rise=cfg.baseline_rise,
                 min_signal_rows=cfg.min_samples,
                 dwell_tokens=cfg.dwell_tokens,
-                grace_tokens=cfg.grace_tokens,
+                # The soft-limit ramp already grants every request room past
+                # the cap, so a second, p(end)-gated window would double it.
+                grace_tokens=0 if self._effort_soft_limit.active else cfg.grace_tokens,
                 p_end_rise_eps=cfg.p_end_rise_eps,
                 acc_veto_rank=cfg.acc_veto_rank,
                 warm=sketches.warm("entropy") and sketches.warm("margin"),

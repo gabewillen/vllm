@@ -12,6 +12,11 @@ from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.sample.effort_policy import DEFAULT_P_UNCERTAIN
+from vllm.v1.sample.soft_limit import (
+    DEFAULT_CURVE,
+    DEFAULT_MAX_BIAS,
+    DEFAULT_RAMP_TOKENS,
+)
 
 logger = init_logger(__name__)
 
@@ -27,6 +32,36 @@ QWEN_GRACEFUL_FORCE_END_STR = (
 )
 """Qwen's own budget-forcing transition (docs/dynamic-reasoning.claude.md §5).
 Forcing this instead of a bare `</think>` keeps the close in-distribution."""
+
+
+@config
+class SoftLimitConfig:
+    """Soft-limit close: a ramped bias on the reasoning end token at the cap.
+
+    Instead of forcing the end sequence the moment a request reaches its
+    thinking cap, the first token of the *natural* end marker gets a bias that
+    rises from 0 at the cap to `max_bias` `ramp_tokens` later, where the hard
+    force takes over. Applies to dynamic and to static `thinking_token_budget`
+    requests alike (docs/dynamic-reasoning.claude.md §5).
+    """
+
+    enabled: bool = True
+    """Ramp the close instead of cutting at the cap. Off restores the pre-soft
+    behaviour: the end sequence is forced at the cap itself."""
+    ramp_tokens: int = Field(default=DEFAULT_RAMP_TOKENS, ge=0)
+    """Think tokens between the cap and the hard force. The model has this many
+    tokens to close on its own under a rising bias; 0 disables the ramp."""
+    max_bias: float = Field(default=DEFAULT_MAX_BIAS, ge=0.0)
+    """Logits added to the end token at the far end of the ramp. 10 makes the
+    close overwhelmingly likely without being a hard mask, so a model that is
+    mid-word can still finish it."""
+    curve: float = Field(default=DEFAULT_CURVE, gt=0.0)
+    """Exponent of the ramp: 1.0 linear, >1 keeps the bias small until late,
+    <1 pushes early."""
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.max_bias) or not math.isfinite(self.curve):
+            raise ValueError("soft_limit.max_bias and curve must be finite")
 
 
 @config
@@ -47,6 +82,10 @@ class DynamicEffortConfig:
     """`rank` (default, P6): ordinal percentile-rank rule fed by the
     scheduler's running quantile sketches. `score`: the pre-P6 weighted
     z-score against the fixed `calibration` table (deprecated)."""
+    soft_limit: SoftLimitConfig = field(default_factory=SoftLimitConfig)
+    """Ramped close at the cap instead of a hard cut; see `SoftLimitConfig`.
+    Honoured by both actuators and by static `thinking_token_budget`
+    requests."""
     evaluation: str = "worker"
     """Where the escalation rule runs. `worker` (default) evaluates it in the
     V2 sampler next to the cap actuator, so a decision can never arrive late;
@@ -81,8 +120,11 @@ class DynamicEffortConfig:
     """Uncertainty-rank rise over the request's own baseline required to
     escalate."""
     grace_tokens: int = Field(default=256, ge=0)
-    """Think tokens granted once, near the cap, when p(reasoning end) is
-    rising - the model is wrapping up, so it is not cut off mid-sentence."""
+    """Pre-soft-limit P6 mechanism: think tokens granted once, near the cap,
+    when p(reasoning end) is rising. The soft-limit ramp grants the same room
+    *unconditionally* and biases the close on top, so it subsumes this window;
+    the scheduler zeroes `grace_tokens` while `soft_limit` is active and this
+    setting only takes effect with `soft_limit.enabled = false`."""
     p_end_rise_eps: float = Field(default=0.0, ge=0.0)
     """How much the fast p(end) EMA must exceed the slow one to count as
     rising."""
@@ -139,7 +181,11 @@ class DynamicEffortConfig:
     hash_window: int = Field(default=32, ge=2)
     """Length of the rolling token windows hashed for the loop detector."""
     hard_stop_margin: int = Field(default=32, ge=1)
-    """Tokens of thinking left after a stall clamp (`cap = think + margin`)."""
+    """Tokens of thinking left after a stall clamp. The clamp aims the
+    actuator's *force point*, so with `soft_limit` on the cap is set to
+    `think + margin - ramp_tokens` and the close still lands `margin` tokens
+    out (floored: a loop found inside the first ramp closes at
+    `ramp_tokens`)."""
     backtrack_markers: list[str] = field(
         default_factory=lambda: ["Wait", "Hmm", "Actually", "Let me re-check"]
     )
@@ -151,7 +197,9 @@ class DynamicEffortConfig:
     Only consulted when `backtrack_marker_weight > 0`."""
     answer_reserve_tokens: int = Field(default=256, ge=0)
     """Tokens kept free below `max_tokens` for the answer after thinking;
-    a rung whose cap cannot leave this reserve is never entered."""
+    a rung whose cap cannot leave this reserve is never entered. The
+    `soft_limit` ramp is thinking too, so it is subtracted from the same
+    headroom."""
     max_rung_by_batch_size: list[tuple[int, int, int]] | None = None
     """`(range_start, range_end, max_rung)` with inclusive batch-size ranges;
     the top rung is withheld under load. Batch sizes outside every range

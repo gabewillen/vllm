@@ -12,11 +12,13 @@ rows (S2/S3/P6) with fast/slow EMAs (S4), MTP acceptance (S6, corroboration
 only), loop / n-gram-novelty evidence (S7), max_tokens headroom (S8),
 batch-size rung cap (S11) and a client deadline (S12).
 
-Decisions (§P6): a hard-stop clamp on a degenerate loop; a one-rung
+Decisions (§11, §12): a hard-stop clamp on a degenerate loop; a one-rung
 escalation at the `check_at` / `final_check_at` points of the cap whenever the
-*ordinal* rule in `vllm/v1/sample/effort_policy.py` fires; and, near the cap,
-a one-shot grace window when p(reasoning end) is rising so a model that is
-already wrapping up is not cut off mid-sentence.
+rule in `vllm/v1/sample/effort_policy.py` fires; and, near the cap, a one-shot
+grace window when p(reasoning end) is rising so a model that is already
+wrapping up is not cut off mid-sentence. The grace window is superseded by the
+soft-limit ramp (`vllm/v1/sample/soft_limit.py`), which grants the same room
+unconditionally; the scheduler zeroes `grace_tokens` while it is active.
 
 This module is the V1-runner path and the reference for the V2 worker-side
 evaluation in `vllm/v1/worker/gpu/sample/effort_escalation.py`.
@@ -35,6 +37,11 @@ from vllm.v1.sample.effort_policy import (
     escalation_verdict,
     rank_from_edges,
     uncertainty_rank,
+)
+from vllm.v1.sample.soft_limit import (
+    CLOSE_NATURAL,
+    classify_close,
+    soft_limit_from_config,
 )
 
 
@@ -99,6 +106,8 @@ class EffortState:
     deadline_ms: float | None = None
     start_ms: float | None = None
     max_tokens: int = 0
+    soft_ramp: int = 0
+    """Soft-limit ramp in force for this request; 0 when it is off."""
 
     rung: int = 0
     cap: int = 0
@@ -132,6 +141,8 @@ class EffortState:
 
     grace_used: bool = False
     grace_granted: int = 0
+    close_kind: str = CLOSE_NATURAL
+    """How the last think block ended: natural / soft / forced."""
 
     loop_flag: bool = False
     churn: bool = False
@@ -165,7 +176,7 @@ class EffortState:
         return len(self.ladder) - 1
 
     @property
-    def report(self) -> dict[str, int]:
+    def report(self) -> dict[str, Any]:
         return {
             "rung": self.rung,
             "escalations": self.escalations,
@@ -173,6 +184,7 @@ class EffortState:
             "late": int(self.late),
             "stall_clamps": int(self.stalled),
             "grace_tokens": self.grace_granted,
+            "close_kind": self.close_kind,
         }
 
 
@@ -217,6 +229,7 @@ def new_effort_state(
         deadline_ms=overrides.get("deadline_ms"),
         start_ms=now_ms,
         max_tokens=max_tokens,
+        soft_ramp=soft_limit_from_config(cfg.soft_limit).ramp,
     )
     if prompt_token_ids:
         last_start = _rfind(prompt_token_ids, start_ids)
@@ -256,6 +269,7 @@ def _leave_think(state: EffortState) -> None:
     state.in_think = False
     # The end sequence itself is not reasoning content.
     state.think_count = max(state.think_count - len(state.end_ids), 0)
+    state.close_kind = classify_close(state.think_count, state.cap, state.soft_ramp)
     state.reasoning_tokens += state.think_count
     if state.revision > state.acked_revision and state.pending_is_escalation:
         state.late = True
@@ -416,9 +430,14 @@ def effective_cap(state: EffortState, cfg: DynamicEffortConfig, rung: int) -> in
 
 
 def cap_limit(state: EffortState, cfg: DynamicEffortConfig, cap: int) -> int:
-    """Clamp a candidate cap to the request's `max_tokens` headroom (S8)."""
+    """Clamp a candidate cap to the request's `max_tokens` headroom (S8).
+
+    The actuator forces at `cap + soft_ramp`, so the ramp comes out of the
+    headroom too - otherwise a request could ramp straight through the answer
+    reserve it was given to write its answer in.
+    """
     if state.max_tokens > 0:
-        cap = min(cap, state.max_tokens - cfg.answer_reserve_tokens)
+        cap = min(cap, state.max_tokens - cfg.answer_reserve_tokens - state.soft_ramp)
     return cap
 
 
@@ -650,7 +669,15 @@ def step_effort(
         decision.late = True
     if state.in_think and state.loop_flag and not state.stalled:
         state.stalled = True
-        state.cap = state.think_count + cfg.hard_stop_margin
+        # The clamp is a hard stop, so it aims the *force point*, not the cap:
+        # the actuator forces at `cap + soft_ramp`, so the cap goes one ramp
+        # back and the bias is already saturated on the way there. A cap cannot
+        # be negative, so the close lands at
+        # `max(think + hard_stop_margin, soft_ramp)` - only a loop detected
+        # inside the first `soft_ramp` think tokens sees the second term, and
+        # the request's own repetition_detection stop (which this never
+        # weakens) is still the terminal guarantee.
+        state.cap = max(state.think_count + cfg.hard_stop_margin - state.soft_ramp, 0)
         state.revision += 1
         state.pending_is_escalation = False
         decision.stall_clamp = True
@@ -661,10 +688,11 @@ def step_effort(
     return decision
 
 
-def finish_effort(state: EffortState) -> dict[str, int]:
+def finish_effort(state: EffortState) -> dict[str, Any]:
     """Close the state at request finish and return the report."""
     if state.in_think:
         # Finished mid-think (length cap / abort): count what was thought.
+        state.close_kind = classify_close(state.think_count, state.cap, state.soft_ramp)
         state.reasoning_tokens += state.think_count
         state.in_think = False
         if state.revision > state.acked_revision and state.pending_is_escalation:

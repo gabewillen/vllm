@@ -370,15 +370,21 @@ def test_min_samples_gate():
     assert all(d.budget_update is None for d in decisions)
 
 
-def test_hard_stop_on_repeated_ngram():
-    cfg = _cfg()
+@pytest.mark.parametrize("ramp", [0, 8, 256])
+def test_hard_stop_on_repeated_ngram(ramp):
+    cfg = _cfg(soft_limit={"enabled": bool(ramp), "ramp_tokens": ramp or 1})
     st = _state(cfg)
     gram = list(range(200, 216))  # 16 tokens
     decisions = _run(st, cfg, [START] + gram * 3, entropy=0.5, margin=0.5)
     stalls = [d for d in decisions if d.stall_clamp]
     assert len(stalls) == 1
     assert st.stalled and st.loop_flag
-    assert stalls[0].budget_update == (1, 48 + 32)  # third repeat completes at 48
+    # The clamp aims the actuator's force point (cap + ramp), so it stays
+    # hard_stop_margin tokens from the third repeat at 48 - except when the
+    # ramp itself is longer than that, which the cap floor at 0 bounds.
+    revision, cap = stalls[0].budget_update
+    assert revision == 1
+    assert cap + st.soft_ramp == max(48 + 32, st.soft_ramp)
     # No escalation after a stall, even with an uncertain signal.
     more = _run(st, cfg, _think_tokens(100), entropy=0.9, margin=0.1)
     assert all(d.budget_update is None for d in more)
@@ -403,7 +409,11 @@ def test_hard_stop_on_repeated_hash_window_and_repetition_evidence():
         cfg,
         EffortEvent(new_token_ids=[111], repetition_evidence=True, max_tokens=1000),
     )
-    assert d.stall_clamp and d.budget_update == (1, st2.think_count + 32)
+    assert d.stall_clamp
+    assert d.budget_update[0] == 1
+    assert d.budget_update[1] + st2.soft_ramp == max(
+        st2.think_count + 32, st2.soft_ramp
+    )
 
 
 def test_respects_max_rung_by_batch_size():
@@ -420,14 +430,22 @@ def test_respects_max_rung_by_batch_size():
     assert any(d.budget_update for d in decisions)
 
 
-def test_respects_max_tokens_headroom():
-    cfg = _cfg(answer_reserve_tokens=256)
+@pytest.mark.parametrize("ramp", [0, 8])
+def test_respects_max_tokens_headroom(ramp):
+    # The ramp is thinking too, so it comes out of the same headroom: the
+    # forced close (cap + ramp) must still leave the answer reserve free.
+    cfg = _cfg(
+        answer_reserve_tokens=256,
+        soft_limit={"enabled": bool(ramp), "ramp_tokens": ramp or 1},
+    )
     st = _state(cfg, max_tokens=300)  # 300 - 256 = 44 < cap 100: no room
     decisions = _run(st, cfg, [START] + _think_tokens(100), entropy=0.9, margin=0.1)
     assert all(d.budget_update is None for d in decisions)
-    st = _state(cfg, max_tokens=500)  # next cap = min(400, 244)
+    st = _state(cfg, max_tokens=500)  # next cap = min(400, 244 - ramp)
     decisions = _run(st, cfg, [START] + _think_tokens(80), entropy=0.9, margin=0.1)
-    assert [d.budget_update for d in decisions if d.budget_update] == [(1, 244)]
+    updates = [d.budget_update for d in decisions if d.budget_update]
+    assert updates == [(1, 244 - st.soft_ramp)]
+    assert updates[0][1] + st.soft_ramp == 500 - 256
 
 
 def test_deadline_blocks_escalation():
@@ -499,6 +517,7 @@ def test_late_detection_and_ack():
         "late": 1,
         "stall_clamps": 0,
         "grace_tokens": 0,
+        "close_kind": "natural",
     }
     # Acked before the close: not late.
     st = _state(cfg)
@@ -588,8 +607,11 @@ def test_effort_report_shape():
         "late",
         "stall_clamps",
         "grace_tokens",
+        "close_kind",
     }
-    assert all(isinstance(v, int) for v in rep.values())
+    counters = {k: v for k, v in rep.items() if k != "close_kind"}
+    assert all(isinstance(v, int) for v in counters.values())
+    assert rep["close_kind"] in ("natural", "soft", "forced")
     assert not math.isnan(rep["rung"])
 
 
@@ -679,4 +701,7 @@ def test_scheduler_glue_reuses_repetition_params_relaxed():
     for tok in [7, 8, 7, 8]:  # 2 repeats of a 2-gram: evidence, not a stop
         req.append_output_token_ids(tok)
         sched._step_effort(req, st, [tok], (0.5, 0.5, 0.0, 1), 0, 0, None)
-    assert st.stalled and sched._effort_pending["rep"] == (1, st.think_count + 32)
+    assert st.stalled
+    revision, cap = sched._effort_pending["rep"]
+    assert revision == 1
+    assert cap + st.soft_ramp == max(st.think_count + 32, st.soft_ramp)

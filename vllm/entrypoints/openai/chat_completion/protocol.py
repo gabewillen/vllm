@@ -51,6 +51,11 @@ from vllm.sampling_params import (
     ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
+from vllm.v1.sample.soft_limit import (
+    CLOSE_FORCED,
+    CLOSE_NATURAL,
+    CLOSE_SOFT,
+)
 
 logger = init_logger(__name__)
 
@@ -131,16 +136,24 @@ class EffortInfo(OpenAIBaseModel):
     escalations: int
     reasoning_tokens: int
     late: bool = False
+    close_kind: Literal["natural", "soft", "forced"] = "natural"
+    """How the think block ended: `natural` before the cap, `soft` inside the
+    soft-limit ramp (the biased end token won, nothing was forced) or `forced`
+    at the end of the ramp."""
 
     @classmethod
-    def from_report(cls, report: dict[str, int] | None) -> "EffortInfo | None":
+    def from_report(cls, report: dict[str, Any] | None) -> "EffortInfo | None":
         if report is None:
             return None
+        close_kind = report.get("close_kind", CLOSE_NATURAL)
+        if close_kind not in (CLOSE_NATURAL, CLOSE_SOFT, CLOSE_FORCED):
+            close_kind = CLOSE_NATURAL
         return cls(
             rung=report.get("rung", 0),
             escalations=report.get("escalations", 0),
             reasoning_tokens=report.get("reasoning_tokens", 0),
             late=bool(report.get("late", 0)),
+            close_kind=close_kind,
         )
 
 
