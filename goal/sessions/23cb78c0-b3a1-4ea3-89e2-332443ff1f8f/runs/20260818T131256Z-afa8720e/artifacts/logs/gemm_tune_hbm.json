@@ -1,0 +1,552 @@
+{
+ "qkvz(4096x5120)": {
+  "8": {
+   "default_us": 96.73262502474245,
+   "best_us": 86.86572922063836,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "16": {
+   "default_us": 96.41264584085245,
+   "best_us": 86.85218745085876,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "32": {
+   "default_us": 96.24502081351238,
+   "best_us": 87.74489591208597,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "64": {
+   "default_us": 96.60843746435906,
+   "best_us": 91.19595839971832,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "96": {
+   "default_us": 98.63995834772747,
+   "best_us": 94.99352078516192,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "128": {
+   "default_us": 99.20183326054637,
+   "best_us": 98.23064571416278,
+   "best": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 8,
+    "num_stages": 4
+   }
+  },
+  "192": {
+   "default_us": 100.49070836733638,
+   "best_us": 100.49070836733638,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 32,
+    "num_warps": 4,
+    "num_stages": 2
+   }
+  },
+  "256": {
+   "default_us": 152.9879167113298,
+   "best_us": 130.62172911304515,
+   "best": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "8192": {
+   "default_us": 3532.0192497844496,
+   "best_us": 3236.7994166027834,
+   "best": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 8,
+    "num_stages": 3
+   }
+  }
+ },
+ "gate_up(8704x5120)": {
+  "8": {
+   "default_us": 199.03737499286459,
+   "best_us": 185.5234583369262,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "16": {
+   "default_us": 198.42852088913787,
+   "best_us": 187.30366673480603,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "32": {
+   "default_us": 198.98602082927633,
+   "best_us": 190.29864582383502,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "64": {
+   "default_us": 199.30183346635508,
+   "best_us": 198.42581256549843,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 2
+   }
+  },
+  "96": {
+   "default_us": 245.5355832656399,
+   "best_us": 200.94179171792348,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "128": {
+   "default_us": 249.8092291413438,
+   "best_us": 212.29687490631477,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 2
+   }
+  },
+  "192": {
+   "default_us": 227.42341661796672,
+   "best_us": 227.42341661796672,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 32,
+    "num_warps": 4,
+    "num_stages": 2
+   }
+  },
+  "256": {
+   "default_us": 300.66899989833473,
+   "best_us": 285.0527707778383,
+   "best": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 8,
+    "num_stages": 3
+   }
+  },
+  "8192": {
+   "default_us": 8763.210666681212,
+   "best_us": 8122.501666851653,
+   "best": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 8,
+    "num_stages": 3
+   }
+  }
+ },
+ "down(5120x4352)": {
+  "8": {
+   "default_us": 101.87018748789949,
+   "best_us": 92.84195827300816,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "16": {
+   "default_us": 100.5702498938869,
+   "best_us": 92.4291042186572,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "32": {
+   "default_us": 100.7954583656101,
+   "best_us": 92.74387502955506,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "64": {
+   "default_us": 100.5335208598505,
+   "best_us": 96.99206248114933,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "96": {
+   "default_us": 101.89481251169734,
+   "best_us": 101.18954166197607,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "128": {
+   "default_us": 102.29245829881013,
+   "best_us": 102.29245829881013,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 32,
+    "num_warps": 4,
+    "num_stages": 2
+   }
+  },
+  "192": {
+   "default_us": 143.11833335038196,
+   "best_us": 135.85364573979555,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "256": {
+   "default_us": 158.66212500744345,
+   "best_us": 144.68210414027757,
+   "best": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 4
+   }
+  },
+  "8192": {
+   "default_us": 3342.3886670789216,
+   "best_us": 3342.3886670789216,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 32,
+    "num_warps": 4,
+    "num_stages": 2
+   }
+  }
+ },
+ "out(5120x1536)": {
+  "8": {
+   "default_us": 40.993499927329445,
+   "best_us": 35.28441675371141,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "16": {
+   "default_us": 37.898312560476676,
+   "best_us": 35.0068332105972,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "32": {
+   "default_us": 37.91937494194523,
+   "best_us": 35.24812503504412,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "64": {
+   "default_us": 38.33183336610091,
+   "best_us": 36.171520908586295,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "96": {
+   "default_us": 38.45204173558159,
+   "best_us": 38.45204173558159,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 32,
+    "num_warps": 4,
+    "num_stages": 2
+   }
+  },
+  "128": {
+   "default_us": 38.763041781445885,
+   "best_us": 38.763041781445885,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 32,
+    "num_warps": 4,
+    "num_stages": 2
+   }
+  },
+  "192": {
+   "default_us": 55.082270894975714,
+   "best_us": 48.8591041782153,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "256": {
+   "default_us": 62.623312563421976,
+   "best_us": 50.001458324307656,
+   "best": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "8192": {
+   "default_us": 1200.690583573305,
+   "best_us": 1200.690583573305,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 32,
+    "num_warps": 4,
+    "num_stages": 2
+   }
+  }
+ },
+ "attn_qkv(3584x5120)": {
+  "8": {
+   "default_us": 90.59712495703327,
+   "best_us": 77.07985423621722,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "16": {
+   "default_us": 85.76952086514211,
+   "best_us": 76.89447920711245,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "32": {
+   "default_us": 85.77222918878154,
+   "best_us": 76.31549988218467,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "64": {
+   "default_us": 85.84672923461767,
+   "best_us": 77.91664575051982,
+   "best": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "96": {
+   "default_us": 86.02414573033457,
+   "best_us": 80.22429165066569,
+   "best": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "128": {
+   "default_us": 86.16004167076123,
+   "best_us": 85.17256249736722,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 8,
+    "num_stages": 3
+   }
+  },
+  "192": {
+   "default_us": 94.13127084674973,
+   "best_us": 93.36754161874221,
+   "best": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "256": {
+   "default_us": 100.28577086510874,
+   "best_us": 96.68002091226906,
+   "best": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3
+   }
+  },
+  "8192": {
+   "default_us": 3107.5189169011232,
+   "best_us": 2838.950083363064,
+   "best": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 8,
+    "num_stages": 3
+   }
+  }
+ }
+}

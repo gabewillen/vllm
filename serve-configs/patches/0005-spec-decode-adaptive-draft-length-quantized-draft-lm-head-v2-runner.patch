@@ -1,0 +1,947 @@
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -910,7 +910,10 @@
+         speculative_config = self.speculative_config
+         if (
+             speculative_config is None
+-            or not speculative_config.uses_dynamic_speculative_decoding()
++            or not (
++                speculative_config.uses_dynamic_speculative_decoding()
++                or speculative_config.adaptive_draft_length
++            )
+             or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+             or self.use_v2_model_runner
+         ):
+@@ -927,11 +930,18 @@
+ 
+     def _maybe_disable_dynamic_sd_for_data_parallel(self) -> None:
+         speculative_config = self.speculative_config
+-        if (
+-            speculative_config is None
+-            or not speculative_config.uses_dynamic_speculative_decoding()
+-            or self.parallel_config.data_parallel_size <= 1
+-        ):
++        if speculative_config is None or self.parallel_config.data_parallel_size <= 1:
++            return
++        if speculative_config.adaptive_draft_length:
++            # Same divergence hazard as the batch-size schedule: each DP rank's
++            # scheduler would pick its own draft length.
++            logger.warning_once(
++                "Adaptive draft length is not supported with data parallelism "
++                "(ranks would draft different lengths); disabling "
++                "adaptive_draft_length."
++            )
++            speculative_config.adaptive_draft_length = False
++        if not speculative_config.uses_dynamic_speculative_decoding():
+             return
+ 
+         logger.warning_once(
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -185,6 +185,27 @@
+     inclusive batch-size range.
+     """
+ 
++    draft_lm_head_dtype: Literal["auto", "fp8", "int4"] = "auto"
++    """Storage dtype of the drafter's copy of a *shared* target lm_head (MTP /
++    EAGLE without own head). ``fp8`` keeps a per-channel FP8 copy, ``int4`` a
++    group-128 Marlin W4A16 copy, for the draft argmax only; the target head is
++    untouched. Cuts draft-step memory traffic on large-vocab models."""
++    adaptive_draft_length: bool = False
++    """Adapt the number of draft tokens per step to recent acceptance. The
++    scheduler keeps a per-request EMA of accepted draft tokens and drafts
++    ``ceil(max_ema + adaptive_draft_margin)`` tokens for the batch (capped at
++    ``num_speculative_tokens`` / the batch-size schedule). Cheap drafters that
++    are memory-bound per step (e.g. MTP heads reading a large shared LM head)
++    stop paying for draft positions that are almost never accepted."""
++    adaptive_draft_ema_alpha: float = Field(default=0.7, ge=0.0, lt=1.0)
++    """Weight of the previous EMA value when updating the per-request accepted
++    draft-token average (higher = smoother, slower to react)."""
++    adaptive_draft_margin: float = Field(default=2.0, ge=0.0)
++    """Extra draft tokens beyond the EMA so the schedule can grow again when
++    acceptance improves."""
++    adaptive_draft_min_tokens: int = Field(default=1, ge=1)
++    """Lower bound on the adaptive draft length."""
++
+     # params generated in the post-init stage
+     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
+     """The configuration of the draft model initialized internal."""
+@@ -1362,6 +1383,19 @@
+                 f"than zero ({self.num_speculative_tokens})."
+             )
+ 
++        if self.adaptive_draft_length:
++            if self.num_speculative_tokens < 2:
++                raise ValueError(
++                    "adaptive_draft_length needs num_speculative_tokens >= 2 "
++                    f"(got {self.num_speculative_tokens})."
++                )
++            if self.adaptive_draft_min_tokens > self.num_speculative_tokens:
++                raise ValueError(
++                    "adaptive_draft_min_tokens "
++                    f"({self.adaptive_draft_min_tokens}) must not exceed "
++                    f"num_speculative_tokens ({self.num_speculative_tokens})."
++                )
++
+         if self.rejection_sample_method == "synthetic":
+             # Consolidate to per-position rates
+             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import math
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -66,6 +67,31 @@
+ logger = init_logger(__name__)
+ 
+ 
++def adaptive_num_spec_tokens(
++    emas: list[float | None],
++    max_tokens: int,
++    min_tokens: int,
++    margin: float,
++) -> int:
++    """Draft length for a batch from its requests' accepted-token EMAs.
++
++    A request without history (fresh decode) keeps the full length so its
++    first steps are not starved; otherwise the batch drafts
++    ``ceil(max_ema + margin)`` clamped to ``[min_tokens, max_tokens]``.
++    """
++    if not emas or any(ema is None for ema in emas):
++        return max_tokens
++    num = math.ceil(max(ema for ema in emas if ema is not None) + margin)
++    return max(min_tokens, min(max_tokens, num))
++
++
++def update_accepted_ema(prev: float | None, num_accepted: int, alpha: float) -> float:
++    """EMA of accepted draft tokens; the first observation seeds it."""
++    if prev is None:
++        return float(num_accepted)
++    return alpha * prev + (1.0 - alpha) * num_accepted
++
++
+ class Scheduler(SchedulerInterface):
+     def __init__(
+         self,
+@@ -255,6 +281,13 @@
+         # reserve between a chunk boundary and the prefill end.
+         self.num_prefill_lookahead = 0
+         self.dynamic_sd_lookup: list[int] | None = None
++        # Adaptive draft length: per-request EMA of accepted draft tokens.
++        self.adaptive_draft = (
++            speculative_config is not None
++            and speculative_config.adaptive_draft_length
++            and self.num_spec_tokens > 1
++        )
++        self._accepted_ema: dict[str, float] = {}
+         if speculative_config is not None:
+             if speculative_config.num_speculative_tokens_per_batch_size:
+                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+@@ -1257,6 +1290,11 @@
+             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                 len(num_scheduled_tokens)
+             ]
++        if self.adaptive_draft and num_spec_tokens_to_schedule > 1:
++            num_spec_tokens_to_schedule = min(
++                num_spec_tokens_to_schedule,
++                self._adaptive_num_spec_tokens(scheduled_running_reqs),
++            )
+ 
+         scheduled_encoder_input_stats = None
+         if (
+@@ -1837,6 +1875,8 @@
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 num_rejected = num_draft_tokens - num_accepted
++                if self.adaptive_draft:
++                    self._update_accepted_ema(req_id=req_id, num_accepted=num_accepted)
+                 # Rejections roll back num_computed_tokens (and, under async
+                 # scheduling, num_output_placeholders, which covers the spec
+                 # tokens). A stale rejection count predates the preemption
+@@ -2385,10 +2425,30 @@
+ 
+         return valid_requests
+ 
++    def _adaptive_num_spec_tokens(self, running_reqs: list[Request]) -> int:
++        """Draft length for this step from the per-request acceptance EMAs."""
++        assert self.vllm_config.speculative_config is not None
++        cfg = self.vllm_config.speculative_config
++        return adaptive_num_spec_tokens(
++            emas=[self._accepted_ema.get(req.request_id) for req in running_reqs],
++            max_tokens=self.num_spec_tokens,
++            min_tokens=cfg.adaptive_draft_min_tokens,
++            margin=cfg.adaptive_draft_margin,
++        )
++
++    def _update_accepted_ema(self, req_id: str, num_accepted: int) -> None:
++        assert self.vllm_config.speculative_config is not None
++        self._accepted_ema[req_id] = update_accepted_ema(
++            prev=self._accepted_ema.get(req_id),
++            num_accepted=num_accepted,
++            alpha=self.vllm_config.speculative_config.adaptive_draft_ema_alpha,
++        )
++
+     def _free_request(
+         self, request: Request, delay_free_blocks: bool = False
+     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+         assert request.is_finished()
++        self._accepted_ema.pop(request.request_id, None)
+ 
+         self._inflight_prefills.discard(request)
+         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+--- a/vllm/v1/spec_decode/draft_lm_head.py
++++ b/vllm/v1/spec_decode/draft_lm_head.py
+@@ -0,0 +1,197 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Quantized copies of a shared target lm_head for speculative drafters.
++
++MTP / EAGLE drafters that share the target's lm_head re-read the whole
++(vocab / tp) x hidden shard on every draft step for one argmax. On
++memory-bound GPUs that read dominates the draft step, so the drafter gets
++its own fp8 (per-channel) or int4 (Marlin, group-128) copy. The target still
++verifies with its unquantized head, so the output distribution is unchanged.
++"""
++
++import torch
++import torch.nn as nn
++from vllm import _custom_ops as ops
++from vllm.logger import init_logger
++from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++    apply_gptq_marlin_linear,
++    check_marlin_supported,
++    marlin_make_workspace_new,
++    marlin_permute_scales,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    get_pack_factor,
++    quantize_weights,
++)
++from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
++    cutlass_fp8_supported,
++)
++from vllm.scalar_type import scalar_types
++
++logger = init_logger(__name__)
++
++MARLIN_GROUP_SIZE = 128
++MARLIN_WEIGHT_TYPE = scalar_types.uint4b8
++
++
++class _Fp8DraftHeadMethod:
++    """quant_method shim: dynamic per-token FP8 activations x per-channel FP8
++    weights through the CUTLASS scaled_mm (SM89+)."""
++
++    def apply(
++        self,
++        layer: "QuantizedDraftLMHead",
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        x2d = x.reshape(-1, x.shape[-1])
++        x_q, x_s = ops.scaled_fp8_quant(x2d, use_per_token_if_dynamic=True)
++        out = ops.cutlass_scaled_mm(
++            x_q,
++            layer.weight_fp8_t,
++            scale_a=x_s,
++            scale_b=layer.weight_scale,
++            out_dtype=x.dtype,
++            bias=bias,
++        )
++        return out.view(*x.shape[:-1], out.shape[-1])
++
++
++class _Int4DraftHeadMethod:
++    """quant_method shim: bf16 activations x group-128 INT4 weights through the
++    Marlin W4A16 kernel."""
++
++    def apply(
++        self,
++        layer: "QuantizedDraftLMHead",
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        return apply_gptq_marlin_linear(
++            input=x,
++            weight=layer.marlin_qweight,
++            weight_scale=layer.marlin_scales,
++            weight_zp=layer.marlin_zp,
++            g_idx=layer.marlin_g_idx,
++            g_idx_sort_indices=layer.marlin_sort_indices,
++            workspace=layer.marlin_workspace,
++            wtype=MARLIN_WEIGHT_TYPE,
++            output_size_per_partition=layer.output_size,
++            input_size_per_partition=layer.input_size,
++            is_k_full=True,
++            bias=bias,
++        )
++
++
++def _pack_rows_gptq(q_w: torch.Tensor, num_bits: int) -> torch.Tensor:
++    """Pack unpacked [K, N] integer weights into GPTQ int32 rows [K/pack, N]."""
++    pack_factor = get_pack_factor(num_bits)
++    size_k, size_n = q_w.shape
++    if size_k % pack_factor:
++        raise ValueError(f"K={size_k} is not a multiple of {pack_factor}")
++    q_w = q_w.to(torch.int32)
++    packed = torch.zeros(
++        (size_k // pack_factor, size_n), dtype=torch.int32, device=q_w.device
++    )
++    for i in range(pack_factor):
++        packed |= q_w[i::pack_factor, :] << (num_bits * i)
++    return packed
++
++
++class QuantizedDraftLMHead(nn.Module):
++    """Quantized (fp8 per-channel or int4 group-128) copy of the target lm_head
++    shard, used only by the drafter. Everything except the weights delegates
++    to the target head, so vocab-parallel argmax and logits code work
++    unchanged."""
++
++    def __init__(self, target_head: nn.Module, dtype: str = "fp8"):
++        super().__init__()
++        object.__setattr__(self, "_target_head", target_head)
++        w = target_head.weight.data
++        self.output_size, self.input_size = w.shape
++        if dtype == "fp8":
++            if not cutlass_fp8_supported():
++                raise ValueError(
++                    "draft_lm_head_dtype='fp8' needs CUTLASS FP8 scaled_mm "
++                    "support (SM89+) on this device."
++                )
++            self._init_fp8(w)
++            self.quant_method = _Fp8DraftHeadMethod()
++        elif dtype == "int4":
++            if not check_marlin_supported(
++                quant_type=MARLIN_WEIGHT_TYPE, group_size=MARLIN_GROUP_SIZE
++            ):
++                raise ValueError(
++                    "draft_lm_head_dtype='int4' needs Marlin uint4b8 group-128 "
++                    "support on this device."
++                )
++            self._init_int4(w)
++            self.quant_method = _Int4DraftHeadMethod()
++        else:
++            raise ValueError(f"unsupported draft_lm_head_dtype {dtype!r}")
++
++    def _init_fp8(self, w: torch.Tensor) -> None:
++        finfo = torch.finfo(torch.float8_e4m3fn)
++        amax = w.abs().amax(dim=1, keepdim=True).float().clamp(min=1e-12)
++        weight_scale = amax / finfo.max
++        w_fp8 = (
++            (w.float() / weight_scale)
++            .clamp(finfo.min, finfo.max)
++            .to(torch.float8_e4m3fn)
++        )
++        # cutlass_scaled_mm wants B as [K, N] column-major = [N, K].t()
++        self.weight_fp8_t = w_fp8.contiguous().t()
++        self.weight_scale = weight_scale.contiguous()
++
++    def _init_int4(self, w: torch.Tensor) -> None:
++        # Round-to-nearest symmetric group quantization ([K, N] layout), then
++        # the same GPTQ pack -> Marlin repack path the GPTQ-Marlin loader uses.
++        size_n, size_k = w.shape
++        _, q_w, scales, _ = quantize_weights(
++            w=w.t().contiguous().float(),
++            quant_type=MARLIN_WEIGHT_TYPE,
++            group_size=MARLIN_GROUP_SIZE,
++        )
++        empty = torch.empty(0, dtype=torch.int32, device=w.device)
++        self.marlin_qweight = ops.gptq_marlin_repack(
++            b_q_weight=_pack_rows_gptq(q_w=q_w, num_bits=MARLIN_WEIGHT_TYPE.size_bits),
++            perm=empty,
++            size_k=size_k,
++            size_n=size_n,
++            num_bits=MARLIN_WEIGHT_TYPE.size_bits,
++        )
++        self.marlin_scales = marlin_permute_scales(
++            s=scales.to(w.dtype),
++            size_k=size_k,
++            size_n=size_n,
++            group_size=MARLIN_GROUP_SIZE,
++        )
++        self.marlin_zp = empty
++        self.marlin_g_idx = empty
++        self.marlin_sort_indices = empty
++        self.marlin_workspace = marlin_make_workspace_new(w.device)
++
++    def __getattr__(self, name: str):
++        try:
++            return super().__getattr__(name)
++        except AttributeError:
++            return getattr(object.__getattribute__(self, "_target_head"), name)
++
++
++def maybe_quantize_shared_lm_head(
++    draft_model: nn.Module, target_lm_head: nn.Module, dtype: str
++) -> None:
++    """Replace ``draft_model.lm_head`` (shared with the target) by a quantized
++    copy when ``dtype`` asks for one. No-op for ``auto``. Callers that
++    re-point per-layer ``shared_head.head`` copies must do so after this call
++    and point them at ``draft_model.lm_head``."""
++    if dtype == "auto":
++        return
++    draft_model.lm_head = QuantizedDraftLMHead(target_head=target_lm_head, dtype=dtype)
++    logger.info(
++        "Draft lm_head: %s copy of the target lm_head shard %s for the "
++        "drafter; the target keeps %s.",
++        dtype,
++        tuple(target_lm_head.weight.shape),
++        target_lm_head.weight.dtype,
++    )
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -49,6 +49,7 @@
+     sample_with_exponential_noise,
+ )
+ from vllm.v1.sample.sampler import _SAMPLING_EPS
++from vllm.v1.spec_decode.draft_lm_head import maybe_quantize_shared_lm_head
+ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+ from vllm.v1.spec_decode.utils import (
+     PADDING_SLOT_ID,
+@@ -1558,6 +1559,12 @@
+                     "Detected EAGLE model with distinct lm_head weights. "
+                     "Keeping separate lm_head weights from the target model."
+                 )
++                if self.speculative_config.draft_lm_head_dtype != "auto":
++                    logger.warning(
++                        "draft_lm_head_dtype=%s only applies to a shared "
++                        "target lm_head; the drafter keeps its own head.",
++                        self.speculative_config.draft_lm_head_dtype,
++                    )
+         else:
+             # MTP model
+             share_lm_head = True
+@@ -1570,6 +1577,11 @@
+             if hasattr(self.model, "lm_head"):
+                 del self.model.lm_head
+             self.model.lm_head = target_language_model.lm_head
++            maybe_quantize_shared_lm_head(
++                draft_model=self.model,
++                target_lm_head=target_language_model.lm_head,
++                dtype=self.speculative_config.draft_lm_head_dtype,
++            )
+ 
+             # MTP models call compute_logits via shared_head.head (a
+             # ParallelLMHead inside each MTP layer), not self.model.lm_head.
+@@ -1584,7 +1596,7 @@
+                     sh = getattr(layer, "shared_head", None)
+                     if sh is not None and hasattr(sh, "head"):
+                         del sh.head
+-                        sh.head = target_language_model.lm_head
++                        sh.head = self.model.lm_head
+                         logger.info(
+                             "Shared target model lm_head with MTP shared_head.head."
+                         )
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+@@ -5,8 +5,12 @@
+ 
+ from vllm.config import VllmConfig, replace
+ from vllm.distributed.parallel_state import get_pp_group
++from vllm.logger import init_logger
+ from vllm.lora.layers.base import BaseLayerWithLoRA
+ from vllm.model_executor.model_loader import get_model
++from vllm.v1.spec_decode.draft_lm_head import maybe_quantize_shared_lm_head
++
++logger = init_logger(__name__)
+ 
+ 
+ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
+@@ -82,12 +86,30 @@
+ 
+     target_lm_head = get_target_lm_head(target_model, target_language_model)
+     draft_lm_head = getattr(eagle_model, "lm_head", None)
+-    if target_lm_head is not None and _should_share(
++    share_lm_head = target_lm_head is not None and _should_share(
+         eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head
++    )
++    spec_cfg = vllm_config.speculative_config
++    if (
++        not share_lm_head
++        and spec_cfg is not None
++        and spec_cfg.draft_lm_head_dtype != "auto"
+     ):
++        logger.warning(
++            "draft_lm_head_dtype=%s only applies to a shared target lm_head; "
++            "the drafter keeps its own head.",
++            spec_cfg.draft_lm_head_dtype,
++        )
++    if share_lm_head:
+         if draft_lm_head is not None:
+             del eagle_model.lm_head
+         eagle_model.lm_head = target_lm_head
++        if spec_cfg is not None:
++            maybe_quantize_shared_lm_head(
++                draft_model=eagle_model,
++                target_lm_head=target_lm_head,
++                dtype=spec_cfg.draft_lm_head_dtype,
++            )
+ 
+         # MTP layers route logits through layer.shared_head.head, not
+         # eagle_model.lm_head, so the per-layer copies need fixing up too.
+@@ -98,7 +120,7 @@
+                 sh = getattr(layer, "shared_head", None)
+                 if sh is not None and hasattr(sh, "head"):
+                     del sh.head
+-                    sh.head = target_lm_head
++                    sh.head = eagle_model.lm_head
+ 
+     # MTP shares topk_indices_buffer with the target model. We update
+     # every module in the draft that holds a buffer reference so that
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -15,7 +15,7 @@
+     is_breakable_cudagraph_enabled,
+ )
+ from vllm.compilation.counter import compilation_counter
+-from vllm.config import VllmConfig
++from vllm.config import SpeculativeConfig, VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
+ from vllm.distributed.parallel_state import (
+@@ -40,6 +40,68 @@
+ logger = init_logger(__name__)
+ 
+ 
++RangedQueryLens = list[tuple[int, int, set[int]]]
++
++
++def decode_query_lens_for_spec(
++    speculative_config: SpeculativeConfig,
++    decode_query_len: int,
++    max_num_reqs: int,
++) -> tuple[list[int], RangedQueryLens]:
++    """Uniform-decode query lengths to capture for a spec-decode target manager.
++
++    Returns the schedule-derived lengths (captured for every batch size, as
++    upstream) plus, when adaptive draft length is on, one
++    ``(range_start, range_end, query_lens)`` entry per schedule range so the
++    adaptive lengths ``min_tokens..K_range`` are captured only for the batch
++    sizes that can use them.
++    """
++    # decode_query_len = num_speculative_steps + num_new_sampled_tokens_per_step;
++    # a manager whose query does not cover the verify tokens (draft decode,
++    # decode_query_len == 1) has nothing to vary.
++    num_new_sampled_tokens_per_step = (
++        decode_query_len - speculative_config.num_speculative_tokens
++    )
++    if num_new_sampled_tokens_per_step < 1 or not (
++        speculative_config.uses_dynamic_speculative_decoding()
++        or speculative_config.adaptive_draft_length
++    ):
++        return [decode_query_len], []
++    schedule = speculative_config.num_speculative_tokens_per_batch_size or [
++        (1, max_num_reqs, speculative_config.num_speculative_tokens)
++    ]
++    decode_query_lens = [x[2] + num_new_sampled_tokens_per_step for x in schedule]
++    ranged_query_lens: RangedQueryLens = []
++    if speculative_config.adaptive_draft_length:
++        k_min = speculative_config.adaptive_draft_min_tokens
++        for start, end, k_range in schedule:
++            if k_range > 1:
++                qlens = {
++                    k + num_new_sampled_tokens_per_step
++                    for k in range(k_min, k_range + 1)
++                }
++                ranged_query_lens.append((start, end, qlens))
++                for q in qlens:
++                    if q not in decode_query_lens:
++                        decode_query_lens.append(q)
++    return decode_query_lens, ranged_query_lens
++
++
++def decode_query_len_allowed(
++    query_len: int,
++    num_reqs: int,
++    schedule_query_lens: set[int],
++    ranged_query_lens: RangedQueryLens,
++) -> bool:
++    """Whether a uniform-decode graph (query_len x num_reqs) is worth capturing."""
++    if query_len in schedule_query_lens:
++        return True
++    return any(
++        start <= num_reqs <= end and query_len in qs
++        for start, end, qs in ranged_query_lens
++    )
++
++
+ class AttentionState(NamedTuple):
+     attn_metadata: dict[str, Any] | None
+     slot_mappings: dict[str, torch.Tensor]
+@@ -192,29 +254,33 @@
+ 
+         # When using Dynamic SD, num_speculative_tokens is the max number of
+         # draft tokens. The scheduler might use a smaller number so we need
+-        # to capture graphs for all possible values during decode.
++        # to capture graphs for all possible values during decode. Only
++        # managers whose decode query covers the verify tokens (target model,
++        # draft prefill) vary with the draft length; the draft-decode manager
++        # (decode_query_len == 1) does not.
+         speculative_config = self.vllm_config.speculative_config
+         if (
+-            speculative_config
+-            and speculative_config.uses_dynamic_speculative_decoding()
++            speculative_config is not None
++            and self.decode_query_len > self.vllm_config.num_speculative_tokens
+         ):
+-            num_spec_per_batch_size = (
+-                speculative_config.num_speculative_tokens_per_batch_size
+-            )
+-            # uses_dynamic_speculative_decoding() guarantees this is set.
+-            assert num_spec_per_batch_size is not None
+-            # decode_query_len = num_speculative_steps + num_new_sampled_tokens
+-            # _per_step. Recover num_new_sampled_tokens_per_step
+-            # from the values the manager already has.
+-            num_new_sampled_tokens_per_step = (
+-                self.decode_query_len - self.vllm_config.num_speculative_tokens
++            decode_query_lens, ranged_query_lens = decode_query_lens_for_spec(
++                speculative_config=speculative_config,
++                decode_query_len=self.decode_query_len,
++                max_num_reqs=self.max_num_reqs,
+             )
+-            # Each entry is (range_start, range_end, num_speculative_tokens).
+-            decode_query_lens = [
+-                x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
+-            ]
+         else:
+-            decode_query_lens = [self.decode_query_len]
++            decode_query_lens, ranged_query_lens = [self.decode_query_len], []
++        schedule_query_lens = set(decode_query_lens) - {
++            q for _, _, qs in ranged_query_lens for q in qs
++        }
++
++        def _query_len_allowed(query_len: int, num_reqs: int) -> bool:
++            return decode_query_len_allowed(
++                query_len=query_len,
++                num_reqs=num_reqs,
++                schedule_query_lens=schedule_query_lens,
++                ranged_query_lens=ranged_query_lens,
++            )
+ 
+         capture_varlen_decode = (
+             separate_decode_routine and bool(decode_mode) and self.varlen_decode
+@@ -245,6 +311,9 @@
+                         rounded_num_tokens > max_decode_tokens
+                         or rounded_num_tokens > max_cg_capture_size
+                         or rounded_num_reqs > self.max_num_reqs
++                        or not _query_len_allowed(
++                            query_len=decode_query_len, num_reqs=rounded_num_reqs
++                        )
+                     ):
+                         continue
+ 
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1673,6 +1673,7 @@
+             aux_hidden_states=aux_hidden_states,
+             finished_req_ids=finished_req_ids,
+             routed_experts=routed_experts,
++            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+         )
+ 
+         if not self.is_last_pp_rank:
+@@ -1696,6 +1697,9 @@
+         aux_hidden_states = self.execute_model_state.aux_hidden_states
+         finished_req_ids = self.execute_model_state.finished_req_ids
+         routed_experts = self.execute_model_state.routed_experts
++        num_spec_tokens_to_schedule = (
++            self.execute_model_state.num_spec_tokens_to_schedule
++        )
+         self.execute_model_state = None
+ 
+         if not self.is_last_pp_rank:
+@@ -1812,19 +1816,31 @@
+                 self.sampler.sampling_states.temperature.gpu,
+                 self.sampler.sampling_states.seeds.gpu,
+                 mm_inputs=mm_inputs,
++                num_speculative_steps=num_spec_tokens_to_schedule,
++            )
++            # The scheduler may have asked for fewer than num_speculative_steps
++            # drafts (dynamic / adaptive SD); only those columns are handed on,
++            # so sync and async scheduling verify exactly the requested count.
++            num_drafted = draft_tokens.shape[1]
++            if num_spec_tokens_to_schedule < num_drafted:
++                num_drafted = num_spec_tokens_to_schedule
++                draft_tokens = draft_tokens[:, :num_drafted]
++            self.req_states.draft_tokens[input_batch.idx_mapping, :num_drafted] = (
++                draft_tokens
+             )
+-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.record_confidences(
+                     self.speculator.draft_token_confidence_probs, input_batch
+                 )
++        else:
++            num_drafted = self.num_speculative_steps
+ 
+         if self.num_speculative_steps > 0:
+             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+             # not have a speculator (i.e. self.speculator is None)
+             self.draft_tokens_handler.set_draft_tokens(
+                 input_batch,
+-                self.req_states.draft_tokens[input_batch.idx_mapping],
++                self.req_states.draft_tokens[input_batch.idx_mapping, :num_drafted],
+             )
+ 
+         # Post-step KV connector related operations.
+@@ -1955,6 +1971,8 @@
+     aux_hidden_states: list[torch.Tensor] | None
+     finished_req_ids: set[str]
+     routed_experts: RoutedExpertsTensors | None
++    # Draft tokens the scheduler will verify next step (dynamic/adaptive SD).
++    num_spec_tokens_to_schedule: int = 0
+ 
+ 
+ class BatchReqState(NamedTuple):
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -65,6 +65,10 @@
+         skip_attn_for_dummy_run: bool = False,
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+         is_profile: bool = False,
++        # Draft tokens the scheduler will verify next step (dynamic/adaptive
++        # SD); None means num_speculative_tokens. Speculators that always
++        # draft the full length accept and ignore it.
++        num_speculative_steps: int | None = None,
+     ) -> torch.Tensor:
+         pass
+ 
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -25,6 +25,11 @@
+ 
+ logger = init_logger(__name__)
+ 
++# A propose() call always runs at least the first draft step (draft position 0)
++# and only counts >= 2 need a fused multi-step decode graph.
++MIN_DRAFT_STEPS = 1
++MIN_FUSED_DRAFT_STEPS = 2
++
+ 
+ class AutoRegressiveSpeculator(DraftModelSpeculator):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+@@ -42,6 +47,12 @@
+ 
+         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
++        # One decode manager per draft-step count when the scheduler can ask
++        # for fewer than num_speculative_steps drafts (adaptive draft length).
++        self.decode_cudagraph_managers: dict[int, SpeculatorCudaGraphManager] = {}
++        # Draft steps for the current propose()/capture() call.
++        self._num_steps = self.num_speculative_steps
++        self._active_decode_manager: SpeculatorCudaGraphManager | None = None
+         self.use_fused_multi_step_decode = False
+ 
+     def load_model(self, target_model: nn.Module) -> None:
+@@ -137,12 +148,24 @@
+             cudagraph_mode = CUDAGraphMode.NONE
+ 
+         # Initialize cudagraph manager for draft decodes (draft positions > 0).
+-        self.decode_cudagraph_manager = SpeculatorCudaGraphManager(
+-            self.vllm_config,
+-            self.device,
+-            cudagraph_mode,
+-            decode_query_len=1,
+-        )
++        for num_steps in self._draft_step_options():
++            self.decode_cudagraph_managers[num_steps] = SpeculatorCudaGraphManager(
++                self.vllm_config,
++                self.device,
++                cudagraph_mode,
++                decode_query_len=1,
++            )
++        self.decode_cudagraph_manager = self.decode_cudagraph_managers[
++            self.num_speculative_steps
++        ]
++
++    def _draft_step_options(self) -> list[int]:
++        """Draft-step counts the scheduler may request that need a fused graph."""
++        spec_cfg = self.speculative_config
++        if spec_cfg.adaptive_draft_length:
++            lo = max(MIN_FUSED_DRAFT_STEPS, spec_cfg.adaptive_draft_min_tokens)
++            return list(range(lo, self.num_speculative_steps + 1))
++        return [self.num_speculative_steps]
+ 
+     def capture(self) -> None:
+         logger.info("Capturing model for speculator...")
+@@ -186,15 +209,26 @@
+             if self.use_fused_multi_step_decode
+             else self._generate_draft
+         )
+-        self.decode_cudagraph_manager.capture(
+-            decode_fn,
+-            self.model_state,
+-            self.input_buffers,
+-            self.block_tables,
+-            self.attn_groups,
+-            self.kv_cache_config,
+-            progress_bar_desc="Capturing decode CUDA graphs",
++        # The fused loop bakes the step count into the graph, so capture one
++        # set of graphs per requestable step count; single-step graphs are
++        # count-independent, capture them once.
++        managers = (
++            self.decode_cudagraph_managers.items()
++            if self.use_fused_multi_step_decode
++            else [(self.num_speculative_steps, self.decode_cudagraph_manager)]
+         )
++        for num_steps, manager in managers:
++            self._num_steps = num_steps
++            manager.capture(
++                decode_fn,
++                self.model_state,
++                self.input_buffers,
++                self.block_tables,
++                self.attn_groups,
++                self.kv_cache_config,
++                progress_bar_desc=f"Capturing decode CUDA graphs ({num_steps} steps)",
++            )
++        self._num_steps = self.num_speculative_steps
+         self.on_multi_step_decode_end(self.max_num_reqs)
+ 
+     @torch.inference_mode()
+@@ -224,7 +258,18 @@
+         skip_attn_for_dummy_run: bool = False,
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+         is_profile: bool = False,
++        num_speculative_steps: int | None = None,
+     ) -> torch.Tensor:
++        # Draft steps for this call; the scheduler may ask for fewer than the
++        # configured maximum (dynamic / adaptive speculative decoding). Even a
++        # request for 0 runs the first draft step: it keeps the draft KV/state
++        # in sync with the target; the runner drops columns beyond the
++        # requested count before they reach the scheduler.
++        self._num_steps = self.num_speculative_steps
++        if num_speculative_steps is not None:
++            self._num_steps = max(
++                MIN_DRAFT_STEPS, min(self.num_speculative_steps, num_speculative_steps)
++            )
+         num_tokens = input_batch.num_tokens
+         num_tokens_padded = input_batch.num_tokens_after_padding
+         num_reqs = input_batch.num_reqs
+@@ -311,10 +356,30 @@
+             )
+         self.on_prefill_end(num_reqs)
+ 
+-        if self.num_speculative_steps == 1:
++        if self._num_steps == 1:
+             # Early exit.
+             return self.draft_tokens[:num_reqs, :1]
+ 
++        drafts = self._multi_step_propose(
++            input_batch=input_batch,
++            num_reqs=num_reqs,
++            num_rejected=num_rejected,
++            dummy_run=dummy_run,
++            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
++            is_profile=is_profile,
++        )
++        # Only the columns this call drafted are valid.
++        return drafts[:, : self._num_steps]
++
++    def _multi_step_propose(
++        self,
++        input_batch: InputBatch,
++        num_reqs: int,
++        num_rejected: torch.Tensor,
++        dummy_run: bool,
++        skip_attn_for_dummy_run: bool,
++        is_profile: bool,
++    ) -> torch.Tensor:
+         # Prepare the inputs for the decode steps.
+         prepare_decode_inputs(
+             self.draft_tokens[:num_reqs, 0],
+@@ -328,8 +393,18 @@
+ 
+         # Each request produces exactly 1 token per draft generation step,
+         # enabling FULL graph replay.
++        decode_manager = self.decode_cudagraph_manager
++        if self.use_fused_multi_step_decode:
++            # The fused loop is baked into the graph: pick the manager captured
++            # for this step count, or fall back to the full chain.
++            fused_manager = self.decode_cudagraph_managers.get(self._num_steps)
++            if fused_manager is None:
++                self._num_steps = self.num_speculative_steps
++            else:
++                decode_manager = fused_manager
++        self._active_decode_manager = decode_manager
+         decode_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+-            self.decode_cudagraph_manager,
++            decode_manager,
+             num_reqs,
+             num_reqs,
+             uniform_token_count=1,
+@@ -469,7 +544,7 @@
+ 
+         attn_metadata = None
+         slot_mappings_by_layer = None
+-        for step in range(1, self.num_speculative_steps):
++        for step in range(1, self._num_steps):
+             # Rebuild every step when positions advance, or just once
+             # on the first step when positions are constant (Gemma4 MTP).
+             if not skip_attn and (self.advance_draft_positions or step == 1):
+@@ -493,8 +568,8 @@
+             self.current_draft_step.fill_(step)
+ 
+             if batch_desc.cg_mode == CUDAGraphMode.FULL:
+-                assert self.decode_cudagraph_manager is not None
+-                self.decode_cudagraph_manager.run_fullgraph(batch_desc)
++                assert self._active_decode_manager is not None
++                self._active_decode_manager.run_fullgraph(batch_desc)
+             else:
+                 self._generate_draft(
+                     num_reqs,
+@@ -539,8 +614,8 @@
+             )
+ 
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+-            assert self.decode_cudagraph_manager is not None
+-            self.decode_cudagraph_manager.run_fullgraph(batch_desc)
++            assert self._active_decode_manager is not None
++            self._active_decode_manager.run_fullgraph(batch_desc)
+             return
+ 
+         self._generate_fused_drafts(
+@@ -570,7 +645,7 @@
+             else []
+         )
+ 
+-        for step in range(1, self.num_speculative_steps):
++        for step in range(1, self._num_steps):
+             self.current_draft_step.fill_(step)
+             self._generate_draft(
+                 num_reqs,
+@@ -581,7 +656,7 @@
+                 cudagraph_runtime_mode,
+             )
+             if (
+-                step < self.num_speculative_steps - 1
++                step < self._num_steps - 1
+                 and attn_metadata is not None
+                 and self.advance_draft_positions
+             ):
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -325,6 +325,7 @@
+         skip_attn_for_dummy_run: bool = False,
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+         is_profile: bool = False,
++        num_speculative_steps: int | None = None,  # always drafts the full length
+     ) -> torch.Tensor:
+         num_reqs = input_batch.num_reqs
+         num_target_tokens = input_batch.num_tokens
+--- a/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+@@ -155,6 +155,7 @@
+         skip_attn_for_dummy_run: bool = False,
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+         is_profile: bool = False,
++        num_speculative_steps: int | None = None,  # always drafts the full length
+     ) -> torch.Tensor:
+         num_reqs = input_batch.num_reqs
+         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound

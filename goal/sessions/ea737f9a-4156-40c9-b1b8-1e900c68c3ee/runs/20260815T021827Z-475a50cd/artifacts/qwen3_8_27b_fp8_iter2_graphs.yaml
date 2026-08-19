@@ -1,0 +1,37 @@
+# Qwen3.8-27B-FP8 on 4x L4 — iteration-0 smoke draft (TP2, 2 of 4 GPUs).
+# DRAFT — lives in the goal run dir until benchmark-proven, then the winning
+# descendant is committed to serve-configs/.
+#
+# Serve (venv TBD by upstream-fix research: .venv-qwen38 on nightly, or local tree):
+#   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 \
+#     <venv>/bin/vllm serve --config <this file>
+model: Qwen/Qwen3.8-27B-FP8
+# Block-128 fine-grained FP8; on SM89 expect Marlin/Triton fallback, not CUTLASS.
+tensor-parallel-size: 2
+# Full 262k from the start — the goal gate requires it servable, not just set.
+# KV is cheap on this arch: only 16 of 64 layers are full attention
+# (4 KV heads, head_dim 256) -> ~32 KB/token fp8 whole-model, ~16 KB/token/rank
+# at TP2 => a full 262k sequence costs ~4.2 GB/rank paged KV.
+max-model-len: 262144
+kv-cache-dtype: fp8
+# Weights ~15.5 GB/rank of 22.5 GiB. 0.92 -> ~21.2 GB budget: ~5.7 GB for KV
+# pool + GDN recurrent state + activations.
+gpu-memory-utilization: 0.95
+# 48 GDN layers keep per-sequence float32 recurrent state (scales with
+# max-num-seqs, not context) — start tiny for the smoke, tune in the loop.
+max-num-seqs: 4
+max-num-batched-tokens: 8192
+# Smoke only: skip CUDA graph capture (headroom + SM89 GDN Triton JIT risk,
+# triton-lang/triton#9939). Drop in the first optimization round.
+# enforce-eager off: iteration-2 lever = CUDA graphs on
+# Capture only the batch sizes we can actually schedule (max-num-seqs 4):
+# full default capture list starved the KV pool below the 262k minimum.
+compilation-config: '{"max_cudagraph_capture_size": 4}'
+reasoning-parser: qwen3
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+port: 8013
+# Deliberately omitted for smoke: MTP speculative-config (needs GDN spec fix;
+# measured in a later optimization round), prefix caching (measured lever).
+# Sampling per card: thinking T=1.0/top_p 0.95; instruct T=0.7/top_p 0.80.

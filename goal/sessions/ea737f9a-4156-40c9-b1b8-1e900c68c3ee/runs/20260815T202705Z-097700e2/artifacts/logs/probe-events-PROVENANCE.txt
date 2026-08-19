@@ -1,0 +1,1 @@
+provenance: probe-events-*.txt are verbatim archives of the harness monitor task outputs that drove each iteration's probes; the 'retrieved: True' lines are the needle-correctness records for the 200k probes (iter6 = committed prefill profile config).

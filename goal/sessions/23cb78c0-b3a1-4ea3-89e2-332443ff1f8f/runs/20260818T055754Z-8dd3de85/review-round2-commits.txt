@@ -1,0 +1,7 @@
+1f3c16e goal run 20260818T055754Z-8dd3de85: evidence for the two Qwen3.8-27B profiles
+4957ee2 systemd: harden the vllm-qwen38 units
+2815915 keepalive middleware: SSE early commit for streaming requests, telemetry, hardening
+e1a099a Throughput profile: seqs 128, dense-TP DBO, Triton attention; own systemd unit
+af18ad7 vLLM patch 0006: dense-TP dual batch overlap for prefill
+a4703eb Latency profile: adaptive draft length, int4 draft head, Model Runner V2
+48646ff vLLM patch 0005: adaptive draft length, quantized draft lm_head, V2 runner support

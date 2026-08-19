@@ -1,0 +1,11 @@
+# Minimal repro for native KV-offload startup deadlock (hybrid GDN model).
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 4
+max-model-len: 8192
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.90
+max-num-seqs: 8
+enforce-eager: true
+kv-offloading-size: 8
+port: 8017
+served-model-name: repro

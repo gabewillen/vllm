@@ -1,0 +1,16 @@
+attention-backend: TRITON_ATTN
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 4
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.95
+max-num-seqs: 192
+enable-dbo: true
+dbo-decode-token-threshold: 1000000
+max-num-batched-tokens: 8192
+compilation-config: '{"max_cudagraph_capture_size": 192}'
+reasoning-parser: qwen3
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+port: 8013

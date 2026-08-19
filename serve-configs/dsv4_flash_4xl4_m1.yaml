@@ -1,0 +1,23 @@
+# DeepSeek-V4-Flash-0731 on 4x L4 — M1 baseline (UVA expert offload, no prediction)
+# Serve: .venv-omni/bin/vllm serve --config serve-configs/dsv4_flash_4xl4_m1.yaml
+# Memory plan per GPU (23.03 GiB): ~2 GiB non-expert weights (TP4) +
+# ~17.5 GiB GPU-resident expert layers + KV(256k ~0.3 GiB/rank) + workspace.
+# ~21 of 43 expert layers' weights UVA-offloaded to pinned CPU (~17 GiB/rank,
+# ~67 GiB total pinned; ZFS ARC capped at 12.6 GiB leaves headroom in 96 GiB).
+model: deepseek-ai/DeepSeek-V4-Flash-0731
+download-dir: /shared/vllm/huggingface/hub
+tensor-parallel-size: 4
+block-size: 256
+kv-cache-dtype: fp8
+moe-backend: marlin
+max-model-len: 32768        # M1 bring-up; raised to 262144 in M3
+gpu-memory-utilization: 0.94
+offload-backend: uva
+cpu-offload-gb: 17
+cpu-offload-params: ["experts.w13_weight", "experts.w2_weight",
+                     "experts.w13_weight_scale", "experts.w2_weight_scale"]
+tokenizer-mode: deepseek_v4
+tool-call-parser: deepseek_v4
+reasoning-parser: deepseek_v4
+trust-remote-code: true
+port: 8010

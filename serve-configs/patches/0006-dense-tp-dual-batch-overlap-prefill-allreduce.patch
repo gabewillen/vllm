@@ -1,0 +1,269 @@
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1679,7 +1689,11 @@
+                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
+             )
+ 
+-        if self.parallel_config.use_ubatching:
++        if self.parallel_config.use_ubatching and (
++            self.model_config is None or self.model_config.is_moe
++        ):
++            # Dense models overlap TP all-reduces instead of all2all
++            # dispatch/combine, so they need no special all2all backend.
+             a2a_backend = self.parallel_config.all2all_backend
+             assert a2a_backend in [
+                 "deepep_low_latency",
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -686,6 +686,22 @@
+     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+         if self.device_communicator is None:
+             raise ValueError("No device communicator found")
++        # Function-local import: vllm.v1.worker.ubatching imports
++        # forward_context, which imports this module.
++        from vllm.v1.worker.ubatching import (
++            dbo_overlap_tp_all_reduce,
++            dbo_yield_and_switch_from_comm_to_compute,
++            dbo_yield_and_switch_from_compute_to_comm,
++        )
++
++        if dbo_overlap_tp_all_reduce():
++            # Dual-batch overlap for dense TP: hand the compute stream to the
++            # other micro-batch while this one's all-reduce runs on the comm
++            # stream, then wait for it before continuing.
++            dbo_yield_and_switch_from_compute_to_comm()
++            output = self.device_communicator.all_reduce(input_)
++            dbo_yield_and_switch_from_comm_to_compute()
++            return output
+         return self.device_communicator.all_reduce(input_)
+ 
+     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -228,6 +228,7 @@
+ from vllm.v1.worker.ubatch_utils import (
+     UBatchSlices,
+     check_ubatch_thresholds,
++    is_last_ubatch_empty,
+     maybe_create_ubatch_slices,
+     split_attn_metadata,
+ )
+@@ -4124,7 +4125,18 @@
+         # Extra coordination when running data-parallel since we need to coordinate
+         # across ranks
+         should_ubatch, num_tokens_across_dp = False, None
+-        if self.vllm_config.parallel_config.data_parallel_size > 1:
++        if (
++            self.vllm_config.parallel_config.data_parallel_size == 1
++            and self.parallel_config.use_ubatching
++            and allow_microbatching
++        ):
++            # Single DP rank: decide microbatching locally (no cross-rank sync).
++            should_ubatch = check_ubatch_thresholds(
++                self.parallel_config, num_tokens, uniform_decode=uniform_decode
++            ) and not is_last_ubatch_empty(
++                num_tokens, num_tokens_padded, self.parallel_config.num_ubatches
++            )
++        elif self.vllm_config.parallel_config.data_parallel_size > 1:
+             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
+                 coordinate_batch_across_dp(
+                     num_tokens_unpadded=num_tokens,
+--- a/vllm/v1/worker/gpu_ubatch_wrapper.py
++++ b/vllm/v1/worker/gpu_ubatch_wrapper.py
+@@ -26,7 +26,11 @@
+ from vllm.utils.deep_gemm import set_num_sms as deep_gemm_set_num_sms
+ from vllm.utils.import_utils import has_deep_gemm
+ from vllm.utils.platform_utils import num_compute_units
+-from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
++from vllm.v1.worker.ubatching import (
++    UBatchContext,
++    make_ubatch_contexts,
++    set_overlap_tp_all_reduce,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -121,6 +125,10 @@
+         self.runnable = runnable
+         self.vllm_config = vllm_config
+         self.compilation_config = vllm_config.compilation_config
++        # Dense (non-MoE) models overlap the TP all-reduce itself under DBO.
++        set_overlap_tp_all_reduce(
++            vllm_config.model_config is not None and not vllm_config.model_config.is_moe
++        )
+         self.comm_stream = torch.cuda.Stream(device=device)
+         # Ubatch threads plus the main thread
+         self.ready_barrier = threading.Barrier(
+@@ -474,10 +482,13 @@
+ 
+         dp_metadata = forward_context.dp_metadata
+ 
+-        # We shouldn't be here unless we are running with multiple DP ranks
+-        assert dp_metadata is not None
+-        ubatch_dp_metadata = []
++        # With a single DP rank there is no DP metadata to split; the
++        # micro-batches only overlap TP collectives with compute.
++        ubatch_dp_metadata: list[DPMetadata | None] = []
+         for ubatch_slice in ubatch_slices:
++            if dp_metadata is None:
++                ubatch_dp_metadata.append(None)
++                continue
+             dp_size = self.vllm_config.parallel_config.data_parallel_size
+             ubatch_num_tokens_across_dp = torch.tensor(
+                 [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
+--- a/vllm/v1/worker/ubatch_utils.py
++++ b/vllm/v1/worker/ubatch_utils.py
+@@ -177,6 +177,9 @@
+         query_start_loc[1:] -= tokens_skipped
+         query_start_loc_cpu[1:] -= tokens_skipped
+     seq_lens = attn_metadata.seq_lens[request_slice]
++    # State-carrying backends must use the request's full step length for
++    # slot selection in every slice (see CommonAttentionMetadata).
++    mamba_state_seq_lens = attn_metadata.state_seq_lens[request_slice]
+     # Read raw fields to avoid triggering the deprecated D2H-syncing properties.
+     seq_lens_cpu = (
+         attn_metadata._seq_lens_cpu[request_slice]
+@@ -194,6 +197,14 @@
+         else None
+     )
+ 
++    if splits_first_request and num_computed_tokens_cpu is not None:
++        # The continuation has already "computed" the tokens of the earlier
++        # slice this step: state-carrying backends (mamba/GDN align mode) read
++        # their initial state from the block of the last computed token.
++        tokens_skipped = first_tok - start_locs[first_req]
++        num_computed_tokens_cpu = num_computed_tokens_cpu.clone()
++        num_computed_tokens_cpu[0] += tokens_skipped
++
+     if splits_last_request:
+         # NOTE: We use start_locs (the original query_start_loc_cpu) to calculate
+         # the tokens skipped because query_start_loc_cpu might have been modified
+@@ -243,6 +254,7 @@
+         block_table_tensor=block_table_tensor,
+         slot_mapping=slot_mapping,
+         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
++        mamba_state_seq_lens=mamba_state_seq_lens,
+         _seq_lens_cpu=seq_lens_cpu,
+         _num_computed_tokens_cpu=num_computed_tokens_cpu,
+     )
+--- a/vllm/v1/worker/ubatching.py
++++ b/vllm/v1/worker/ubatching.py
+@@ -147,10 +147,26 @@
+         self._wait_comm_done()
+ 
+ 
++# Whether TP all-reduces themselves are overlapped under DBO. Dense models
++# have no all2all to overlap, so their all-reduce is the collective that
++# yields to the other micro-batch; MoE models keep the upstream schedule.
++_OVERLAP_TP_ALL_REDUCE: bool = False
++
++
++def set_overlap_tp_all_reduce(enabled: bool) -> None:
++    global _OVERLAP_TP_ALL_REDUCE
++    _OVERLAP_TP_ALL_REDUCE = enabled
++
++
+ def dbo_enabled() -> bool:
+     return len(_THREAD_ID_TO_CONTEXT) > 0
+ 
+ 
++def dbo_overlap_tp_all_reduce() -> bool:
++    """True inside a micro-batch thread when TP all-reduces should yield."""
++    return _OVERLAP_TP_ALL_REDUCE and dbo_enabled()
++
++
+ def dbo_current_ubatch_id() -> int:
+     if len(_THREAD_ID_TO_CONTEXT) == 0:
+         return 0
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -537,6 +537,14 @@
+     at the current decode run's last full-state write. write_pos counts from
+     here, so a preemption-resumed request re-anchors past the prompt boundary."""
+ 
++    mamba_state_seq_lens: torch.Tensor | None = None
++    """(batch_size,) sequence lengths that select the mamba/GDN state slot in
++    align mode. Set by micro-batch slicing when a request is split across
++    micro-batches: every slice must read/write the state block of the request's
++    last token this step (where the runner pre-copied the initial state), while
++    ``seq_lens`` stays the slice's true attention length. ``None`` means
++    ``seq_lens``."""
++
+     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
+     _seq_lens_cpu: torch.Tensor | None = None
+     _num_computed_tokens_cpu: torch.Tensor | None = None
+@@ -547,6 +555,13 @@
+     def batch_size(self) -> int:
+         return self.seq_lens.shape[0]
+ 
++    @property
++    def state_seq_lens(self) -> torch.Tensor:
++        """Sequence lengths for mamba/GDN state-slot selection."""
++        if self.mamba_state_seq_lens is not None:
++            return self.mamba_state_seq_lens
++        return self.seq_lens
++
+     def naive_query_lens(self) -> torch.Tensor:
+         """Naive because it assumes that query ends where the next query starts."""
+         return self.query_start_loc[1:] - self.query_start_loc[:-1]
+@@ -627,6 +642,9 @@
+             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
+             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
+             seq_lens=self.seq_lens[:num_actual_reqs],
++            mamba_state_seq_lens=self.mamba_state_seq_lens[:num_actual_reqs]
++            if self.mamba_state_seq_lens is not None
++            else None,
+             _seq_lens_cpu=self._seq_lens_cpu[:num_actual_reqs]
+             if self._seq_lens_cpu is not None
+             else None,
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -222,7 +222,7 @@
+         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+         block_table_tensor = mamba_get_block_table_tensor(
+             m.block_table_tensor,
+-            m.seq_lens,
++            m.state_seq_lens,
+             self.kv_cache_spec,
+             self.vllm_config.cache_config.mamba_cache_mode,
+         )
+--- a/vllm/v1/attention/backends/mamba_attn.py
++++ b/vllm/v1/attention/backends/mamba_attn.py
+@@ -526,7 +526,7 @@
+         else:
+             state_indices_tensor = mamba_get_block_table_tensor(
+                 common_attn_metadata.block_table_tensor,
+-                common_attn_metadata.seq_lens,
++                common_attn_metadata.state_seq_lens,
+                 self.kv_cache_spec,
+                 self.vllm_config.cache_config.mamba_cache_mode,
+             )
+@@ -812,7 +812,7 @@
+     ) -> M:
+         state_indices_tensor = mamba_get_block_table_tensor(
+             blk_table,
+-            metadata.seq_lens,
++            metadata.state_seq_lens,
+             self.kv_cache_spec,
+             self.vllm_config.cache_config.mamba_cache_mode,
+         )
+--- a/vllm/v1/attention/backends/linear_attn.py
++++ b/vllm/v1/attention/backends/linear_attn.py
+@@ -71,7 +71,7 @@
+ 
+         state_indices_tensor = mamba_get_block_table_tensor(
+             common_attn_metadata.block_table_tensor,
+-            common_attn_metadata.seq_lens,
++            common_attn_metadata.state_seq_lens,
+             self.kv_cache_spec,
+             self.vllm_config.cache_config.mamba_cache_mode,
+         )[:, 0]
+@@ -196,7 +196,7 @@
+ 
+         state_indices_tensor = mamba_get_block_table_tensor(
+             common_attn_metadata.block_table_tensor,
+-            common_attn_metadata.seq_lens,
++            common_attn_metadata.state_seq_lens,
+             self.kv_cache_spec,
+             self.vllm_config.cache_config.mamba_cache_mode,
+         )

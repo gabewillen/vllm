@@ -1,0 +1,42 @@
+{
+ "soup9k": {
+  "content": "To determine which Greek letter appears most often, we can analyze the frequency of the terms in the provided text. The text consists entirely of Greek letter names separated by spaces.\n\n**Step 1: Identify the candidates**\nScanning the text, the most frequent candidates appear to be:\n*   **omicron**\n*   **zeta**\n*   **theta**\n*   **pi**\n*   **nu**\n*   **sigma**",
+  "usage": {
+   "prompt_tokens": 9356,
+   "total_tokens": 9452,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  },
+  "time": 6.94
+ },
+ "soup37k": {
+  "content": "To determine which Greek letter appears most often, we can analyze the frequency of the terms in the provided text. The text is a long, unstructured list of Greek letter names.\n\n**Step 1: Identify the candidates**\nScanning the text, the most frequently appearing words are:\n*   `omicron`\n*   `theta`\n*   `zeta`\n*   `sigma`\n*   `lambda`\n*   `phi",
+  "usage": {
+   "prompt_tokens": 37354,
+   "total_tokens": 37450,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  },
+  "time": 17.26
+ },
+ "code_review": {
+  "content": "Here are the bugs in the provided Python file:\n\n1.  **Race Condition in `lookup()` / `drain_results()`**:\n    The method `lookup()` calls `drain_results()` only if `self._need_to_drain` is `True`. However, `flush()` sets `self._need_to_drain = True` *before* putting the batch into the queue. If the worker thread is extremely fast and processes the batch, puts the result",
+  "usage": {
+   "prompt_tokens": 2158,
+   "total_tokens": 2254,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  },
+  "time": 4.03
+ },
+ "essay": {
+  "content": "# The Box That Changed the World: A History of Container Shipping\n\nIn the mid-20th century, the global economy was held in a state of logistical limbo. Moving goods from a factory floor to a retail shelf was a slow, labor-intensive, and often chaotic process. Cargo was loaded and unloaded by hand, piece by piece, in a process known as \"breakbulk.\" A single ship could spend weeks in port just to be loaded, during which time cargo",
+  "usage": {
+   "prompt_tokens": 23,
+   "total_tokens": 119,
+   "completion_tokens": 96,
+   "prompt_tokens_details": null
+  },
+  "time": 3.45
+ }
+}

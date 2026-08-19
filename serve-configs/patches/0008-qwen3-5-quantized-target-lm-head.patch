@@ -1,0 +1,47 @@
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -474,6 +474,14 @@
+ 
+         self.config = config
+         self.model_config = vllm_config.model_config
++        # additional-config {"lm_head_dtype": "fp8"|"int4", "lm_head_free_bf16":
++        # true}: serve the target lm_head from a quantized copy and optionally
++        # drop the bf16 weight (only when no drafter shares it). See
++        # serve-configs/patches/README.md.
++        additional = vllm_config.additional_config
++        additional = additional if isinstance(additional, dict) else {}
++        self._lm_head_dtype = additional.get("lm_head_dtype", "auto")
++        self._lm_head_free_bf16 = bool(additional.get("lm_head_free_bf16", False))
+         self.multimodal_config = multimodal_config
+         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+         self.is_multimodal_pruning_enabled = (
+@@ -584,7 +592,28 @@
+             self,
+             skip_prefixes=["mtp."],
+         )
+-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        # Serve the target lm_head from a quantized copy when asked; the bf16
++        # weight stays for drafters that share it and for the copy itself.
++        lm = self.language_model
++        if self._lm_head_dtype != "auto" and hasattr(lm, "lm_head"):
++            from vllm.v1.spec_decode.draft_lm_head import QuantizedDraftLMHead
++
++            bf16_head = lm.lm_head
++            lm.lm_head = QuantizedDraftLMHead(
++                target_head=bf16_head, dtype=self._lm_head_dtype
++            )
++            if self._lm_head_free_bf16:
++                # Release the bf16 shard (636 MB/rank at TP4); drafters that
++                # share the head must not be configured together with this.
++                bf16_head.weight.data = bf16_head.weight.data.new_empty(0)
++                torch.cuda.empty_cache()
++            logger.info(
++                "Target lm_head served as %s (bf16 copy %s)",
++                self._lm_head_dtype,
++                "released" if self._lm_head_free_bf16 else "retained",
++            )
++        return loaded
+ 
+     @classmethod
+     def get_mamba_state_dtype_from_config(

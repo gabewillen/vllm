@@ -1,0 +1,20 @@
+# Qwen3.8-27B-FP8 — iteration-3 candidate: TP4, batch unlocked.
+# Rationale: TP2 cannot raise max-num-seqs (weights 15.5 GB/rank + 4.16 GiB
+# 262k KV floor + ~300 MB/seq/rank GDN fp32 state saturate 23 GiB). TP4
+# halves all three per-rank terms: weights 7.7 GB, KV floor ~2.1 GiB,
+# state ~150 MB/seq -> concurrency becomes the lever. PCIe all-reduce cost
+# is the open question this iteration measures.
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 4
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.95
+# 16 seqs x ~150 MB state = ~2.4 GB/rank; leaves a large KV pool.
+max-num-seqs: 96
+max-num-batched-tokens: 8192
+compilation-config: '{"max_cudagraph_capture_size": 96}'
+reasoning-parser: qwen3
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+port: 8012

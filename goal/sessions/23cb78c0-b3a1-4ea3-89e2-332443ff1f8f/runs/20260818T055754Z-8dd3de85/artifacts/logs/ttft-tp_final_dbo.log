@@ -1,0 +1,3 @@
+[tp_final dbo n=8000] prompt_tokens=9329 ttft=2.88s prefill_tok_s=3236
+[tp_final dbo n=16000] prompt_tokens=18669 ttft=5.97s prefill_tok_s=3129
+[tp_final dbo n=32000] prompt_tokens=37366 ttft=13.61s prefill_tok_s=2745

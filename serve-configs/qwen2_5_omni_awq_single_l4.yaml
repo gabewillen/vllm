@@ -1,0 +1,43 @@
+base_config: /shared/eve/vllm/.venv-omni/lib/python3.12/site-packages/vllm_omni/deploy/qwen2_5_omni.yaml
+
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_model_len: 32768
+    max_num_seqs: 1
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.60
+    kv_cache_dtype: fp8
+    kv_cache_memory_bytes: 1006632960
+    enforce_eager: true
+    enable_prefix_caching: false
+    mm_processor_cache_gb: 0
+
+  - stage_id: 1
+    devices: "0"
+    max_model_len: 32768
+    max_num_seqs: 1
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.20
+    kv_cache_dtype: fp8
+    kv_cache_memory_bytes: 838860800
+    enforce_eager: true
+    enable_prefix_caching: false
+    hf_overrides:
+      quantization_config: null
+
+  - stage_id: 2
+    devices: "0"
+    max_model_len: 2048
+    max_num_seqs: 1
+    max_num_batched_tokens: 2048
+    gpu_memory_utilization: 0.05
+    kv_cache_dtype: fp8
+    enforce_eager: true
+    enable_prefix_caching: false
+    enable_flashinfer_autotune: false
+    async_scheduling: false
+    hf_overrides:
+      quantization_config: null

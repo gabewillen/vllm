@@ -1,0 +1,29 @@
+# DeepSeek-V4-Flash-0731 on 4x L4 — tier2 + DSpark MTP speculative decoding.
+# Serve: HF_HOME=/shared/vllm/huggingface HF_HUB_OFFLINE=1 TORCHDYNAMO_DISABLE=1 \
+#   .venv-omni/bin/vllm serve --config serve-configs/dsv4_flash_4xl4_tier2_mtp.yaml
+# vs tier2: speculative-config method=mtp (DSpark drafter, 1 draft token/step;
+# >1 needs the parallel block-drafting path, not implemented). With drafting on,
+# the expert tier binds the mtp cache layers 43-45 too, so pools size over 46
+# layers (~88 slots/layer at the same gpu budget) and each rank carries ~350 MB
+# of bf16-dequantized drafter attention weights. max-num-seqs 1 is required by
+# the drafter's rolling window attention.
+model: deepseek-ai/DeepSeek-V4-Flash-0731
+tensor-parallel-size: 4
+block-size: 256
+kv-cache-dtype: fp8
+max-model-len: 262144
+max-num-batched-tokens: 2048
+max-num-seqs: 1
+gpu-memory-utilization: 0.92
+enforce-eager: true
+speculative-config: '{"method": "mtp", "num_speculative_tokens": 1}'
+expert-tier-cache-dir: /shared/vllm/vllm-cache/dsv4-marlin-tp4
+expert-tier-gpu-gb: 13
+expert-tier-pinned-gb: 15
+expert-tier-io-threads: 12
+expert-tier-prefetch-predictors: "hash"
+tokenizer-mode: deepseek_v4
+tool-call-parser: deepseek_v4
+reasoning-parser: deepseek_v4
+trust-remote-code: true
+port: 8010

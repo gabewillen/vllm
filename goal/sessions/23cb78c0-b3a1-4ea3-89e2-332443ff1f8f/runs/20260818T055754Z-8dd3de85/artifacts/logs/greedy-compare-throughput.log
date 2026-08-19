@@ -1,0 +1,9 @@
+reason-math: DIFF at char 34/329 (96 vs 96 tok)
+reason-sys: DIFF at char 279/357 (96 vs 96 tok)
+prose-essay: DIFF at char 67/407 (96 vs 96 tok)
+prose-story: DIFF at char 54/446 (96 vs 96 tok)
+code-write: DIFF at char 258/408 (96 vs 96 tok)
+code-edit: identical (96 tok)
+code-explain: identical (96 tok)
+json-extract: identical (96 tok)
+identical 3/8

@@ -1,0 +1,17 @@
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 4
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.92
+max-num-seqs: 96
+max-num-batched-tokens: 8192
+compilation-config: '{"max_cudagraph_capture_size": 96}'
+speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
+kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
+reasoning-parser: qwen3
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+attention-backend: TRITON_ATTN
+port: 8013
+middleware: ["vllm_keepalive.KeepAliveMiddleware"]

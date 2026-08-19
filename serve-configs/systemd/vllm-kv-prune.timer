@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly vLLM KV offload tier prune
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,92 @@
+=== PID 2511443 ===
+Process 2511443: VLLM::Worker_TP0
+Python v3.12.3 (/usr/bin/python3.12)
+
+Thread 2511443 (active): "MainThread"
+    ioctl (libc.so.6)
+    0x76afb2066b38 (libcuda.so.610.43.02)
+    0x76afb2068204 (libcuda.so.610.43.02)
+    0x76afb2f210ba (libcuda.so.610.43.02)
+    0x76afb2085d44 (libcuda.so.610.43.02)
+    0x76afb2010cda (libcuda.so.610.43.02)
+    0x76afb202f704 (libcuda.so.610.43.02)
+    0x76afb2030a30 (libcuda.so.610.43.02)
+    0x76afb20331e5 (libcuda.so.610.43.02)
+    0x76afb2034d74 (libcuda.so.610.43.02)
+    0x76afb1e1bfce (libcuda.so.610.43.02)
+    0x76afb1f7b212 (libcuda.so.610.43.02)
+    cuMemHostRegister_v2 (libcuda.so.610.43.02)
+    0x76afdec14863 (libcudart.so.13)
+    cudaHostRegister (libcudart.so.13)
+    pybind11::cpp_function::initialize<torch::cuda::shared::initCudartBindings(_object*)::{lambda(unsigned long, unsigned long, unsigned int)#1}, cudaError, unsigned long, unsigned long, unsigned int, pybind11::name, pybind11::scope, pybind11::sibling>(torch::cuda::shared::initCudartBindings(_object*)::{lambda(unsigned long, unsigned long, unsigned int)#1}&&, cudaError (*)(unsigned long, unsigned long, unsigned int), pybind11::name const, pybind11::scope&, pybind11::sibling)::{lambda(pybind11::detail::function_call&)#1}::_FUN (libtorch_python.so)
+    pybind11::cpp_function::dispatcher (libtorch_python.so)
+    pin_mmap_region (vllm/v1/kv_offload/cpu/gpu_worker.py:206)
+=== PID 2511444 ===
+Process 2511444: VLLM::Worker_TP1
+Python v3.12.3 (/usr/bin/python3.12)
+
+Thread 2511444 (idle): "MainThread"
+    poll (libc.so.6)
+    zmq_poll (libzmq-7b073b3d.so.5.2.5)
+    0x705ba55e66e9 (zmq/backend/cython/_zmq.abi3.so)
+    poll (zmq/sugar/poll.py:106)
+    wait (vllm/distributed/device_communicators/shm_broadcast.py:206)
+    acquire_read (vllm/distributed/device_communicators/shm_broadcast.py:794)
+    __enter__ (contextlib.py:137)
+    dequeue (vllm/distributed/device_communicators/shm_broadcast.py:889)
+    worker_busy_loop (vllm/v1/executor/multiproc_executor.py:1016)
+    worker_main (vllm/v1/executor/multiproc_executor.py:918)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+    0x705c6fe2a1ca (libc.so.6)
+Thread 2512280 (idle): "tqdm_monitor"
+    0x705c6fe98d71 (libc.so.6)
+=== PID 2511445 ===
+Process 2511445: VLLM::Worker_TP2
+Python v3.12.3 (/usr/bin/python3.12)
+
+Thread 2511445 (idle): "MainThread"
+    poll (libc.so.6)
+    zmq_poll (libzmq-7b073b3d.so.5.2.5)
+    0x7012f41a06e9 (zmq/backend/cython/_zmq.abi3.so)
+    poll (zmq/sugar/poll.py:106)
+    wait (vllm/distributed/device_communicators/shm_broadcast.py:206)
+    acquire_read (vllm/distributed/device_communicators/shm_broadcast.py:794)
+    __enter__ (contextlib.py:137)
+    dequeue (vllm/distributed/device_communicators/shm_broadcast.py:889)
+    worker_busy_loop (vllm/v1/executor/multiproc_executor.py:1016)
+    worker_main (vllm/v1/executor/multiproc_executor.py:918)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+    0x7013bd82a1ca (libc.so.6)
+Thread 2512279 (idle): "tqdm_monitor"
+    0x7013bd898d71 (libc.so.6)
+=== PID 2511459 ===
+Process 2511459: VLLM::Worker_TP3
+Python v3.12.3 (/usr/bin/python3.12)
+
+Thread 2511459 (active): "MainThread"
+    sched_yield (libc.so.6)
+    sched_yield (vllm/distributed/utils.py:48)
+    wait (vllm/distributed/device_communicators/shm_broadcast.py:204)
+    acquire_read (vllm/distributed/device_communicators/shm_broadcast.py:794)
+    __enter__ (contextlib.py:137)
+    dequeue (vllm/distributed/device_communicators/shm_broadcast.py:889)
+    worker_busy_loop (vllm/v1/executor/multiproc_executor.py:1016)
+    worker_main (vllm/v1/executor/multiproc_executor.py:918)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+    0x78a69e82a1ca (libc.so.6)
+Thread 2512278 (idle): "tqdm_monitor"
+    0x78a69e898d71 (libc.so.6)
+    0x78a69e8a42be (libc.so.6)
+    PyThread_acquire_lock_timed (python3.12)

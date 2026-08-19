@@ -1,0 +1,30 @@
+=== PID 2504174 ===
+Thread 2504174 (active): "MainThread"
+    _init_handles (triton/compiler/compiler.py:469)
+    launch_metadata (triton/compiler/compiler.py:485)
+    run (triton/runtime/jit.py:760)
+    <lambda> (triton/runtime/jit.py:370)
+    triton_mrope (vllm/model_executor/layers/rotary_embedding/mrope.py:203)
+    forward_cuda (vllm/model_executor/layers/rotary_embedding/mrope.py:381)
+    forward (vllm/model_executor/custom_op.py:136)
+    _call_impl (torch/nn/modules/module.py:1789)
+    _wrapped_call_impl (torch/nn/modules/module.py:1778)
+    _project_qkv_gate (vllm/model_executor/models/qwen3_next.py:382)
+    forward (vllm/model_executor/models/qwen3_next.py:391)
+    _call_impl (torch/nn/modules/module.py:1789)
+    _wrapped_call_impl (torch/nn/modules/module.py:1778)
+    forward (vllm/model_executor/models/qwen3_next.py:507)
+    _call_impl (torch/nn/modules/module.py:1789)
+    _wrapped_call_impl (torch/nn/modules/module.py:1778)
+    forward (vllm/model_executor/models/qwen3_next.py:648)
+    __call__ (vllm/compilation/decorators.py:507)
+    forward (vllm/model_executor/models/qwen3_5.py:573)
+    _call_impl (torch/nn/modules/module.py:1789)
+    _wrapped_call_impl (torch/nn/modules/module.py:1778)
+    _dummy_run (vllm/v1/worker/gpu_model_runner.py:6266)
+    decorate_context (torch/utils/_contextlib.py:124)
+    compile_or_warm_up_model (vllm/v1/worker/gpu_worker.py:809)
+    sync_wrapper (vllm/tracing/otel.py:178)
+=== PID 2504175 ===
+=== PID 2504176 ===
+=== PID 2504177 ===

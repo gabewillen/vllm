@@ -1,0 +1,5 @@
+ITER6 UP
+I6_32K_a: latency: 10.3s
+I6_32K_b: latency: 10.4s
+I6_200K: latency: 90.4s retrieved: True 
+ITER6_DONE

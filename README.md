@@ -1,3 +1,31 @@
+## About this fork
+
+[gabewillen/vllm](https://github.com/gabewillen/vllm) is a fork of [vllm-project/vllm](https://github.com/vllm-project/vllm).
+`main` tracks upstream unchanged; model-specific engine tuning lives in branches.
+
+### Branches
+
+- [`main`](https://github.com/gabewillen/vllm/tree/main) — upstream `main`, no fork commits.
+- [`qwen3.8-27B`](https://github.com/gabewillen/vllm/tree/qwen3.8-27B) — Qwen3.8-27B-FP8 on 4× NVIDIA L4.
+  Upstream `acb0f1dcd` (0.27.2rc1) plus the nine tuning patches as commits, so it installs directly:
+
+  ```bash
+  VLLM_USE_PRECOMPILED=1 uv pip install git+https://github.com/gabewillen/vllm@qwen3.8-27B
+  ```
+
+  No venv-local patching step any more.
+
+  - [`serve-configs/`](https://github.com/gabewillen/vllm/tree/qwen3.8-27B/serve-configs) — serve YAMLs, systemd units, keep-alive middleware, tests
+  - [`serve-configs/patches/`](https://github.com/gabewillen/vllm/tree/qwen3.8-27B/serve-configs/patches) — the same nine changes kept as standalone patch files, with the per-patch rationale and measurements
+  - [`docs/dynamic-reasoning.claude.md`](https://github.com/gabewillen/vllm/blob/qwen3.8-27B/docs/dynamic-reasoning.claude.md) — dynamic reasoning effort: design, measurements, results
+  - [`goal/`](https://github.com/gabewillen/vllm/tree/qwen3.8-27B/goal) — measurement evidence from the tuning runs
+- [`qwen3.8-27B-legacy`](https://github.com/gabewillen/vllm/tree/qwen3.8-27B-legacy) — the previous deployment-tree branch (old upstream snapshot, patches as files only, plus unrelated DSv4/SM89 work). Kept for reference.
+- [`venv-0.27.2rc1-patched`](https://github.com/gabewillen/vllm/tree/venv-0.27.2rc1-patched), [`lane-a-telemetry`](https://github.com/gabewillen/vllm/tree/lane-a-telemetry), [`lane-b-v2-budget`](https://github.com/gabewillen/vllm/tree/lane-b-v2-budget), [`lane-c-controller`](https://github.com/gabewillen/vllm/tree/lane-c-controller) — historical: the patched installed package and the implementation lanes behind patch 0009. Superseded by the commits on `qwen3.8-27B`.
+
+The tuning commits are unreported upstream.
+
+---
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>

@@ -1,0 +1,124 @@
+# Qwen3.8-27B-FP8 on 4x L4 — MTP speculative-decoding profile (latency-first,
+# but batch-safe): +47-87% single-stream decode, -11% aggregate at max batch.
+#
+# 2026-08-17: K raised 2 -> 7 for <=8 seqs (K=2 for 9-32, off above). With
+# draft_tensor_parallel_size=1 + local argmax the sequential MTP head is cheap
+# enough that deeper drafts pay even at 30% position-6 acceptance
+# ("tokens per pass" is the dial, not acceptance rate). Measured single-stream
+# (768-tok greedy) K=2 -> K=7: code-edit 55 -> 103 tok/s (7.8 tok/pass),
+# code-write 48-52 -> 69, reasoning 46 -> 42-50, prose 39-42 -> 38-40.
+# K=10: edit 107, reasoning 55-59, but prose 30 and write 63 -> not chosen.
+# This matches the DSpark drafter (serve-configs/qwen3_8_27b_fp8_dspark_code.yaml)
+# on code and beats it on prose with NO KV-pool cost (DSpark halves the pool).
+#
+# Serve (same venv as qwen3_8_27b_fp8_max.yaml):
+#   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 PYTHONHASHSEED=8012 \
+#     /shared/vllm/.venv-qwen38/bin/vllm serve \
+#     --config /shared/vllm/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml
+#
+# Measured 2026-08-16 (128x1k/1k aggregate; single-stream 512-tok greedy):
+#   single-stream: 26.7 -> 39.4 tok/s prose (+47%), 49.8 code (+87%);
+#     draft acceptance 81%/59% at pos 0/1 (~2.4 tok/engine step)
+#   aggregate: 476.7 tok/s (TP4 no-MTP control) -> 424.7 (-11%)
+# How the aggregate cost got from -35% to -11%: profiling showed the 1-layer
+# draft head at TP4 added ~4k extra NCCL all-reduces (~10.7 ms each on PCIe)
+# per prefill window. draft_tensor_parallel_size=1 runs the head unsharded on
+# every rank (no draft all-reduce); use_local_argmax_reduction drops the
+# vocab all-gather. The remaining -11% is the draft prefill forward, which
+# vLLM deliberately runs even at K=0 to keep the draft KV in sync — a design
+# floor, not a bug.
+# num_speculative_tokens_per_batch_size adapts K to live batch size (K=2 up
+# to 8 seqs, K=1 to 32, off above); verified: draft counters freeze at high
+# batch, so heavy batches pay only the K=0 floor above.
+#
+# Tiered KV offload ENABLED — requires the venv-local patch
+# artifacts/offload-debug/mtp-eagle-group-detection.patch (offloading
+# connector scheduler.py): stock nightly marks ALL KV groups EAGLE-volatile
+# when MTP is on (no group carries is_eagle_group), so restore lookups never
+# converge and every resume full-recomputes. Patch detects the draft tower by
+# its "mtp" layer prefix (group [3] only). Verified on this config: 32k resume
+# after eviction 20.6 s -> 2.1 s, after service restart (disk tier) -> 3.1 s,
+# output byte-identical to cold. A venv rebuild loses this AND the two
+# pin_mmap_region patches (see qwen3_8_27b_fp8_max.yaml).
+#
+# NCCL P2P + Triton attention (2026-08-18): the unit sets NCCL_P2P_LEVEL=SYS
+# (needs IOMMU off + ACS cleared on the host; 4-way all-reduce 25.9 -> 11.7 ms,
+# cold 90k prefill 61 -> 42 s, plain TP4 aggregate 477 -> 620 tok/s, single-
+# stream reason/prose/write/edit 46/40/68/103 -> 51/42/81/115). With P2P the
+# FlashInfer backend faults (illegal memory access; GPU core dump names
+# flashinfer::PersistentVariableLengthMergeStatesKernel) on the spec-decode
+# verify path — a FlashInfer race exposed by faster all-reduces — so both the
+# target and the MTP draft run TRITON_ATTN. Never mix P2P with FLASHINFER here.
+#
+# Keep-alive middleware (serve-configs/middleware/vllm_keepalive.py, needs that
+# dir on PYTHONPATH): Cloudflare returns 524 when the origin sends no response
+# BYTES for 100 s, streaming or not (verified through the tunnel: 524 at 125 s
+# on a streaming request with a 130 s TTFT). A ~200k-token uncached prompt
+# takes 130-150 s to prefill on 4x L4, so agent compaction calls died at the
+# edge and were retried in loops. The middleware emits SSE comments / JSON
+# leading whitespace while the engine works; every client parser ignores them.
+#
+# Speculative-decoding settings (venv patch serve-configs/patches/0005):
+#   adaptive_draft_length + adaptive_draft_margin 2.0: the scheduler keeps a
+#     per-request EMA of accepted draft tokens and drafts ceil(ema+margin)
+#     tokens (capped by the batch-size schedule) instead of always K. Each MTP
+#     draft step is memory-bound (draft layer + lm_head read), so prompts that
+#     rarely accept deep drafts (prose, reasoning) stop paying for them; margin
+#     2 keeps code drafts near K (margin 1 starved code-write, 3 gained nothing).
+#   draft_lm_head_dtype int4: the drafter reads a Marlin group-128 copy of the
+#     bf16 target lm_head shard for its argmax; the target verifies with its
+#     own bf16 head, so the target distribution is untouched (fp8 is the other
+#     option; int4 is faster on L4 and costs ~1% acceptance). Token-level
+#     outputs still differ from the previous config at numeric near-ties, as
+#     between any two kernel paths: per-token logprob agreement with the old
+#     config is at the noise floor of vLLM's own config variation (run
+#     artifacts logprob-agreement-*.log).
+#   draft_tensor_parallel_size is ignored for MTP (the eagle path uses the
+#     target TP group); it stays for documentation only.
+# Model Runner V2 (unit sets VLLM_USE_V2_MODEL_RUNNER=1): full CUDA graphs and
+# a fused multi-step draft graph. The eager GDN op otherwise costs ~0.6 ms CPU
+# per call (48/step) and desyncs the TP ranks. V2's graphs take ~1.6 GiB, so
+# gpu-memory-utilization is 0.92 (0.94 OOMs on a 200k prefill).
+#   additional-config lm_head_dtype fp8 (venv patch 0008): the target verifies
+#     with a per-channel fp8 copy of its lm_head (CUTLASS W8A8, dynamic
+#     per-token activation scale). Per-token logprob agreement with the bf16
+#     head: mean |dlogprob| 0.035, top-1 2.5% - below the kernel-path noise
+#     floor (0.076 / 3.2%) - for -1 ms per verify step. int4 is not used for
+#     the target.
+#   in_proj_ba skinny GEMM (venv patch 0007): cuBLAS spends 27 us per layer on
+#     the bf16 [8 x 5120] x [5120 x 24] gate projection at decode; a split-K
+#     Triton kernel takes 5.5 us (48 layers -> -1 ms/step).
+# Observability: draft length is visible as spec_decode_num_draft_tokens_total
+# / spec_decode_num_drafts_total (mean K) and the per-position acceptance
+# counters vLLM already exports.
+# Measurements and rejected alternatives: goal run
+# goal/sessions/23cb78c0-b3a1-4ea3-89e2-332443ff1f8f/runs/20260818T055754Z-8dd3de85.
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 4
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.92
+max-num-seqs: 96
+max-num-batched-tokens: 8192
+compilation-config: '{"max_cudagraph_capture_size": 96}'
+speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
+kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
+reasoning-parser: qwen3
+# Dynamic reasoning effort (venv patch 0009, docs/dynamic-reasoning.claude.md):
+# reasoning_effort "dynamic" starts every request at a 1k thinking cap rendered as
+# template medium + the Qwen "low" sentence on the last user turn (block 0 stays
+# effort-free), and the scheduler raises the cap 1k -> 4k -> 16k -> 64k only
+# when live entropy/margin/MTP signals say more thinking pays. Defaults from
+# DynamicEffortConfig; non-dynamic requests are untouched. Calibration =
+# per-token entropy (/log V) and top1-top2 margin measured on this model over
+# 13.6k decode steps (8 prompts x xhigh/low, 2026-08-18, VLLM_EFFORT_TELEMETRY
+# sink): entropy mean 0.043 sd 0.046, margin mean 5.9 sd 4.5. Escalation score
+# z(H) - z(margin) + trend + MTP term >= theta [0, 0.5, 1.0] per rung.
+reasoning-config: '{"dynamic_effort": {"calibration": {"entropy": [0.043, 0.046], "margin": [5.9, 4.5]}}}'
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+attention-backend: TRITON_ATTN
+additional-config: '{"lm_head_dtype": "fp8"}'
+port: 8012
+middleware: ["vllm_keepalive.KeepAliveMiddleware"]
