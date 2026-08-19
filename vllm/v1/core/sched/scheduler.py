@@ -2697,8 +2697,12 @@ class Scheduler(SchedulerInterface):
                 warm=sketches.warm("entropy") and sketches.warm("margin"),
             )
         self._effort_policy_age += 1
-        self._effort_policy.max_rung = cfg.max_rung_for_batch_size(batch_size)
-        return self._effort_policy
+        # A fresh object per step: the same policy may still be in flight in an
+        # already-scheduled SchedulerOutput under async scheduling.
+        return replace(
+            self._effort_policy,
+            max_rung=cfg.max_rung_for_batch_size(batch_size),
+        )
 
     def _ingest_effort_reports(
         self, reports: dict[str, tuple[int, int, int, int]]

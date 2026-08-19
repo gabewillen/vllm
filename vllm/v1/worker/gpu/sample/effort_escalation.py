@@ -175,6 +175,7 @@ class EffortEscalationState:
             idx = torch.tensor(self._reset_reqs, dtype=torch.int64, device=self.device)
             for tensor in (
                 self.rung,
+                self.cap,
                 self.rung_entry_think,
                 self.grace_granted,
                 self.escalations,
@@ -451,7 +452,9 @@ def evaluate_escalation_torch(
 
     # --- within-request baseline --------------------------------------
     base_ready = state.base_ready[slots]
-    take_base = in_think & ~base_ready & (think >= policy.baseline_tokens)
+    # Same gate as the scheduler-side controller: the baseline is only taken on
+    # a step that actually carried signals.
+    take_base = fresh & ~base_ready & (think >= policy.baseline_tokens)
     state.base_h[slots] = torch.where(take_base, h_fast, state.base_h[slots])
     state.base_margin[slots] = torch.where(take_base, m_ema, state.base_margin[slots])
     state.base_ready[slots] = base_ready | take_base

@@ -878,3 +878,36 @@ def test_effort_calibrate_skips_rows_outside_the_think_block(tmp_path):
         [str(sink)], str(out), None, 1, 100.0, include_all_rows=True
     )
     assert counts["entropy"] == 2.0
+
+
+def test_worker_slot_reuse_resets_the_cap_and_state():
+    policy = _policy(_cfg())
+    state = _worker()
+    _run_worker(
+        state,
+        policy,
+        200,
+        lambda t: 0.2 if t < 40 else 0.95,
+        lambda t: 0.5,
+        lambda t: 0.0,
+        lambda t: 1,
+    )
+    assert int(state.cap[0]) == LADDER[1] and int(state.rung[0]) == 1
+    # The slot is recycled by a request with a different ladder.
+    state.add_request(
+        0,
+        SamplingParams(
+            extra_args={"dynamic_effort": {"ladder": [64, 256], "worker_eval": True}}
+        ),
+    )
+    state.apply_staged_writes()
+    assert int(state.cap[0]) == 64
+    assert int(state.rung[0]) == 0 and int(state.escalations[0]) == 0
+    assert not bool(state.base_ready[0]) and float(state.h_fast[0]) == 0.0
+
+    # And a slot recycled by a non-dynamic request is disarmed entirely.
+    state.add_request(1, SamplingParams())
+    state.apply_staged_writes()
+    assert not state.enabled_np[1]
+    budget = state.effective_budget(torch.full((2,), 777, dtype=torch.int32))
+    assert int(budget[1]) == 777
