@@ -341,6 +341,9 @@ class Scheduler(SchedulerInterface):
         self._effort_vectors: dict[str, np.ndarray] = {}
         self._effort_start_rung_total: dict[int, int] = {}
         self._effort_decision_skipped: dict[str, int] = {}
+        # First few decisions are logged at INFO so a deployment can see the
+        # split arm and the vector arrive without turning on debug logging.
+        self._effort_trace_budget = 5
         reasoning_config = vllm_config.reasoning_config
         if reasoning_config is not None and reasoning_config.dynamic_effort:
             self._init_effort_controller(reasoning_config)
@@ -2805,6 +2808,16 @@ class Scheduler(SchedulerInterface):
                 and 0 < body_len < request.num_prompt_tokens
             ):
                 boundary = self._effort_body_boundary(request, body_len)
+                if self._effort_trace_budget > 0:
+                    logger.info(
+                        "dynamic_effort %s: seam at %d of %d prompt tokens, "
+                        "body boundary %d, tails %s",
+                        request.request_id,
+                        body_len,
+                        request.num_prompt_tokens,
+                        boundary,
+                        [len(t) for t in tails],
+                    )
                 if boundary:
                     assert request.prompt_token_ids is not None
                     # Tokens between the boundary and the frontend's seam are
@@ -2858,6 +2871,16 @@ class Scheduler(SchedulerInterface):
         state = self._effort.get(request.request_id)
         rung = 0
         reason = "no-vector"
+        if self._effort_trace_budget > 0:
+            self._effort_trace_budget -= 1
+            logger.info(
+                "dynamic_effort %s: body prefilled (%d tokens), vector %s, "
+                "memory %d entries",
+                request.request_id,
+                request.effort_body_len,
+                "present" if vector is not None else "MISSING",
+                memory.n_entries if memory is not None else -1,
+            )
         if memory is not None and tails and vector is not None:
             self._effort_vectors[request.request_id] = np.asarray(
                 vector, dtype=np.float32

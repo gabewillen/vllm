@@ -133,6 +133,9 @@ class EffortInfo(OpenAIBaseModel):
     """Dynamic reasoning-effort outcome (`reasoning_effort: "dynamic"` only)."""
 
     rung: int
+    start_rung: int = 0
+    """Rung the prefill hidden-state decision chose (`hidden_effort`); 0 when
+    it is off, the memory is cold or no vector reached the scheduler."""
     escalations: int
     reasoning_tokens: int
     late: bool = False
@@ -150,6 +153,7 @@ class EffortInfo(OpenAIBaseModel):
             close_kind = CLOSE_NATURAL
         return cls(
             rung=report.get("rung", 0),
+            start_rung=report.get("start_rung", 0),
             escalations=report.get("escalations", 0),
             reasoning_tokens=report.get("reasoning_tokens", 0),
             late=bool(report.get("late", 0)),
