@@ -16,6 +16,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.effort_signals import (
+    NUM_ROW_SIGNALS,
     commit_order_permutation,
     effort_row_signals_scattered,
     flagged_row_indices,
@@ -80,7 +81,7 @@ class RejectionSampler(nn.Module):
             "raw_logits",
             "processed_logits",
         )
-        # [num_draft_total, 2] target-row effort signals of the last
+        # [num_draft_total, 3] target-row effort signals of the last
         # ``apply_logits_processors`` call; None when no request opted in.
         self._effort_target_rows: torch.Tensor | None = None
 
@@ -211,7 +212,7 @@ class RejectionSampler(nn.Module):
             assert bonus_sampler_output.effort_signals is not None
             effort_signals = self._reduce_effort_signals(
                 effort_target_rows,
-                bonus_sampler_output.effort_signals[:, :2],
+                bonus_sampler_output.effort_signals[:, :NUM_ROW_SIGNALS],
                 metadata.num_draft_tokens,
                 output_token_ids,
             )
@@ -233,14 +234,14 @@ class RejectionSampler(nn.Module):
         """Per-request means over committed rows (accepted drafts + bonus).
 
         Args:
-            target_rows: ``[num_draft_total, 2]`` target-row signals.
-            bonus_rows: ``[num_reqs, 2]`` bonus-row signals.
+            target_rows: ``[num_draft_total, 3]`` target-row signals.
+            bonus_rows: ``[num_reqs, 3]`` bonus-row signals.
             num_draft_tokens: per-request draft counts.
             output_token_ids: ``[num_reqs, max_spec_len + 1]`` sampled ids;
                 rejected positions hold ``PLACEHOLDER_TOKEN_ID``.
 
         Returns:
-            ``[num_reqs, 3]`` (mean entropy, mean margin, n committed rows).
+            ``[num_reqs, 4]`` (mean entropy, mean margin, mean p(end), n rows).
         """
         device = target_rows.device
         perm = async_tensor_h2d(commit_order_permutation(num_draft_tokens), device)
@@ -395,7 +396,9 @@ class RejectionSampler(nn.Module):
         if effort_mask is not None:
             rows = flagged_row_indices(effort_mask, metadata.num_draft_tokens)
             self._effort_target_rows = effort_row_signals_scattered(
-                logits, async_tensor_h2d(rows, device=logits.device)
+                logits,
+                async_tensor_h2d(rows, device=logits.device),
+                sampling_metadata.effort_end_token_id,
             )
         holder = sampling_metadata.thinking_budget_state_holder
         if holder is not None and holder.has_tracked_requests():

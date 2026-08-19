@@ -73,7 +73,7 @@ class Sampler(nn.Module):
         self.pin_memory = PIN_MEMORY
         self.logprobs_mode = logprobs_mode
         self.use_fp64_gumbel = use_fp64_gumbel
-        # [num_reqs, 2] canonical-stage effort signals of the last
+        # [num_reqs, 3] canonical-stage effort signals of the last
         # ``apply_logits_processors`` call; None when no request opted in.
         self._effort_rows: torch.Tensor | None = None
 
@@ -429,7 +429,9 @@ class Sampler(nn.Module):
         if effort_mask is not None:
             rows = flagged_row_indices(effort_mask)
             self._effort_rows = effort_row_signals_scattered(
-                logits, async_tensor_h2d(rows, device=logits.device)
+                logits,
+                async_tensor_h2d(rows, device=logits.device),
+                sampling_metadata.effort_end_token_id,
             )
         holder = sampling_metadata.thinking_budget_state_holder
         if holder is not None and holder.has_tracked_requests():

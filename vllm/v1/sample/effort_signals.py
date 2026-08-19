@@ -20,8 +20,11 @@ import torch
 
 from vllm.sampling_params import SamplingParams
 
-# Column layout of a reduced per-request signal row.
-ENTROPY, MARGIN, NUM_ROWS = 0, 1, 2
+# Column layout of a per-row signal (``NUM_ROWS`` only exists after the
+# per-request reduction). The tuple order is frozen: entropy, margin, p_end,
+# n_rows.
+ENTROPY, MARGIN, P_END, NUM_ROWS = 0, 1, 2, 3
+NUM_ROW_SIGNALS = 3
 
 # ``SamplingParams.extra_args`` keys that opt a request into the telemetry.
 _OPT_IN_KEYS = ("effort_telemetry", "dynamic_effort")
@@ -37,15 +40,19 @@ def wants_effort_signals(sampling_params: SamplingParams | None) -> bool:
     return any(bool(extra_args.get(key)) for key in _OPT_IN_KEYS)
 
 
-def effort_row_signals(logits: torch.Tensor) -> torch.Tensor:
-    """Per-row normalised entropy and top1-top2 margin.
+def effort_row_signals(
+    logits: torch.Tensor, end_token_id: int | None = None
+) -> torch.Tensor:
+    """Per-row normalised entropy, top1-top2 margin and p(reasoning end).
 
     Args:
         logits: ``[rows, vocab]`` canonical-stage logits (any float dtype).
+        end_token_id: first token of the reasoning end sequence; its softmax
+            probability becomes the third column. ``None`` yields zeros.
 
     Returns:
-        ``[rows, 2]`` fp32: entropy / ``log(vocab)`` in ``[0, 1]`` and the
-        top1-top2 margin in logit units.
+        ``[rows, 3]`` fp32: entropy / ``log(vocab)`` in ``[0, 1]``, the
+        top1-top2 margin in logit units, and p(end) in ``[0, 1]``.
     """
     z = logits.float()
     vocab = z.shape[-1]
@@ -56,30 +63,40 @@ def effort_row_signals(logits: torch.Tensor) -> torch.Tensor:
     entropy = (lse - pz.sum(dim=-1)) / math.log(vocab)
     top2 = z.topk(2, dim=-1).values
     margin = top2[:, 0] - top2[:, 1]
-    out = torch.stack((entropy, margin), dim=-1)
+    if end_token_id is None or not 0 <= end_token_id < vocab:
+        p_end = torch.zeros_like(entropy)
+    else:
+        p_end = probs[:, end_token_id]
+    out = torch.stack((entropy, margin, p_end), dim=-1)
     return torch.nan_to_num(out, nan=0.0)
 
 
 def effort_row_signals_scattered(
     logits: torch.Tensor,
     row_indices: torch.Tensor | None,
+    end_token_id: int | None = None,
 ) -> torch.Tensor:
     """Row signals for a subset of rows, zero elsewhere.
 
     Args:
         logits: ``[rows, vocab]`` logits.
         row_indices: int64 row indices to compute, or ``None`` for all rows.
+        end_token_id: first token of the reasoning end sequence.
 
     Returns:
-        ``[rows, 2]`` fp32 with computed rows filled and other rows zero.
+        ``[rows, 3]`` fp32 with computed rows filled and other rows zero.
     """
     if row_indices is None:
-        return effort_row_signals(logits)
-    out = torch.zeros((logits.shape[0], 2), dtype=torch.float32, device=logits.device)
+        return effort_row_signals(logits, end_token_id)
+    out = torch.zeros(
+        (logits.shape[0], NUM_ROW_SIGNALS), dtype=torch.float32, device=logits.device
+    )
     if row_indices.numel() == 0:
         return out
     row_indices = row_indices.to(device=logits.device)
-    out.index_copy_(0, row_indices, effort_row_signals(logits[row_indices]))
+    out.index_copy_(
+        0, row_indices, effort_row_signals(logits[row_indices], end_token_id)
+    )
     return out
 
 
@@ -97,19 +114,22 @@ def reduce_committed(
     ``row_signals.shape[0]`` and ``cu_num_rows.shape[0]``.
 
     Args:
-        row_signals: ``[rows, 2]`` per-row signals.
+        row_signals: ``[rows, 3]`` per-row signals.
         cu_num_rows: ``[num_reqs + 1]`` int cumulative row counts.
         num_committed: ``[num_reqs]`` int committed row count per request.
         row_mask: optional ``[rows]`` bool; rows with ``False`` are excluded.
 
     Returns:
-        ``[num_reqs, 3]`` fp32: mean entropy, mean margin, committed row count.
+        ``[num_reqs, 4]`` fp32: mean entropy, mean margin, mean p(end),
+        committed row count.
     """
     num_reqs = cu_num_rows.shape[0] - 1
     num_rows = row_signals.shape[0]
     device = row_signals.device
     if num_reqs == 0 or num_rows == 0:
-        return torch.zeros((num_reqs, 3), dtype=torch.float32, device=device)
+        return torch.zeros(
+            (num_reqs, NUM_ROW_SIGNALS + 1), dtype=torch.float32, device=device
+        )
     counts = (cu_num_rows[1:] - cu_num_rows[:-1]).long()
     req_of_row = torch.repeat_interleave(
         torch.arange(num_reqs, device=device), counts, output_size=num_rows
@@ -119,7 +139,9 @@ def reduce_committed(
     if row_mask is not None:
         committed = committed & row_mask
     weight = committed.to(torch.float32)
-    sums = torch.zeros((num_reqs, 2), dtype=torch.float32, device=device)
+    sums = torch.zeros(
+        (num_reqs, NUM_ROW_SIGNALS), dtype=torch.float32, device=device
+    )
     sums.index_add_(0, req_of_row, row_signals.float() * weight[:, None])
     n_rows = torch.zeros(num_reqs, dtype=torch.float32, device=device)
     n_rows.index_add_(0, req_of_row, weight)
@@ -174,23 +196,28 @@ def signals_to_dict(
     req_ids: Sequence[str],
     signals: np.ndarray,
     flags: np.ndarray | None,
-) -> dict[str, tuple[float, float, int]]:
+) -> dict[str, tuple[float, float, float, int]]:
     """Build ``ModelRunnerOutput.effort_signals`` for flagged requests only.
 
     Args:
         req_ids: batch-ordered request ids.
-        signals: ``[num_reqs, 3]`` host array (entropy, margin, n_rows).
+        signals: ``[num_reqs, 4]`` host array (entropy, margin, p_end, n_rows).
         flags: ``[num_reqs]`` bool opt-in mask; ``None`` means all flagged.
 
     Returns:
-        req_id -> (mean entropy, mean margin, n committed rows).
+        req_id -> (mean entropy, mean margin, mean p(end), n committed rows).
     """
-    out: dict[str, tuple[float, float, int]] = {}
+    out: dict[str, tuple[float, float, float, int]] = {}
     for i, req_id in enumerate(req_ids):
         if flags is not None and not flags[i]:
             continue
         row = signals[i]
-        out[req_id] = (float(row[ENTROPY]), float(row[MARGIN]), int(row[NUM_ROWS]))
+        out[req_id] = (
+            float(row[ENTROPY]),
+            float(row[MARGIN]),
+            float(row[P_END]),
+            int(row[NUM_ROWS]),
+        )
     return out
 
 
@@ -258,7 +285,7 @@ def format_sink_record(
     req_id: str,
     step: int,
     num_output_tokens: int,
-    signal: tuple[float, float, int],
+    signal: tuple[float, float, float, int],
     num_draft_tokens: int | None,
     num_accepted: int | None,
     in_think: bool | None,
@@ -270,6 +297,7 @@ def format_sink_record(
         "num_output_tokens": num_output_tokens,
         "entropy": signal[ENTROPY],
         "margin": signal[MARGIN],
+        "p_end": signal[P_END],
         "n_rows": signal[NUM_ROWS],
         "num_draft_tokens": num_draft_tokens,
         "num_accepted": num_accepted,
@@ -313,7 +341,7 @@ class EffortTelemetrySink:
         self,
         req_id: str,
         output_token_ids: Sequence[int],
-        signal: tuple[float, float, int],
+        signal: tuple[float, float, float, int],
         num_draft_tokens: int | None,
         num_accepted: int | None,
         finished: bool,
