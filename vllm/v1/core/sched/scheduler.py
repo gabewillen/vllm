@@ -322,6 +322,7 @@ class Scheduler(SchedulerInterface):
         self._effort_policy_age = 0
         self._effort_worker_eval = False
         self._effort_worker_reqs: set[str] = set()
+        self._effort_use_uncertainty = True
         self._effort_soft_limit = SoftLimit(enabled=False)
         reasoning_config = vllm_config.reasoning_config
         if reasoning_config is not None and reasoning_config.dynamic_effort:
@@ -2593,6 +2594,8 @@ class Scheduler(SchedulerInterface):
                 "dynamic_effort: could not load %s (%s)", cfg.quantile_path, exc
             )
             warmed = False
+        auc = self._effort_sketches.uncertainty_auc
+        self._effort_use_uncertainty, reason = cfg.uncertainty_features(auc)
         soft = soft_limit_from_config(cfg.soft_limit)
         self._effort_soft_limit = soft
         logger.info(
@@ -2601,6 +2604,13 @@ class Scheduler(SchedulerInterface):
             cfg.evaluation,
             "warm" if warmed else "cold",
             cfg.quantile_path or "in-memory",
+        )
+        logger.info(
+            "dynamic_effort: escalation keys on termination/length%s; "
+            "entropy/margin rank features %s - %s",
+            "" if self._effort_use_uncertainty else " only",
+            "ON" if self._effort_use_uncertainty else "OFF",
+            reason,
         )
         if soft.active:
             logger.info(
@@ -2701,6 +2711,7 @@ class Scheduler(SchedulerInterface):
         if self._effort_policy is None or self._effort_policy_age >= 256:
             self._effort_policy_age = 0
             edges = cfg.quantile_edges
+            use_uncertainty = self._effort_use_uncertainty
             self._effort_policy = EffortPolicy(
                 p_uncertain=list(cfg.p_uncertain or []),
                 entropy_edges=sketches.edges("entropy", edges),
@@ -2717,7 +2728,10 @@ class Scheduler(SchedulerInterface):
                 grace_tokens=0 if self._effort_soft_limit.active else cfg.grace_tokens,
                 p_end_rise_eps=cfg.p_end_rise_eps,
                 acc_veto_rank=cfg.acc_veto_rank,
-                warm=sketches.warm("entropy") and sketches.warm("margin"),
+                use_uncertainty=use_uncertainty,
+                # Without the rank features there is no distribution to warm.
+                warm=(not use_uncertainty)
+                or (sketches.warm("entropy") and sketches.warm("margin")),
             )
         self._effort_policy_age += 1
         # A fresh object per step: the same policy may still be in flight in an

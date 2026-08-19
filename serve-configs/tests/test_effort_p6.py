@@ -751,7 +751,7 @@ def test_scheduler_and_worker_agree_on_the_same_signal_stream():
 
 def test_p6_config_defaults():
     cfg = DynamicEffortConfig()
-    assert cfg.rule == "rank" and cfg.evaluation == "worker"
+    assert cfg.rule == "length" and cfg.evaluation == "worker"
     assert cfg.ladder == [1024, 4096, 16384]
     assert cfg.p_uncertain == [0.85, 0.92]
     assert cfg.baseline_tokens == 128 and cfg.baseline_rise == 0.10
@@ -911,3 +911,363 @@ def test_worker_slot_reuse_resets_the_cap_and_state():
     assert not state.enabled_np[1]
     budget = state.effective_budget(torch.full((2,), 777, dtype=torch.int32))
     assert int(budget[1]) == 777
+
+
+# ------------------------------------------- P7: length rule + AUC evidence gate
+
+
+def test_default_rule_is_length_based_and_needs_no_calibration():
+    cfg = DynamicEffortConfig()
+    assert cfg.rule == "length"
+    assert cfg.uncertainty_min_auc == 0.60
+    # No AUC in the file means no evidence, so the rank features stay out.
+    active, reason = cfg.uncertainty_features(None)
+    assert not active and "no discriminative AUC" in reason
+
+
+@pytest.mark.parametrize(
+    "rule,auc,active",
+    [
+        ("length", None, False),
+        ("length", 0.41, False),
+        ("length", 0.599, False),
+        ("length", 0.60, True),
+        ("length", 0.83, True),
+        ("rank", None, True),
+        ("rank", 0.41, True),
+        ("score", None, True),
+    ],
+)
+def test_the_rule_chooses_its_features_by_measured_auc(rule, auc, active):
+    cfg = DynamicEffortConfig(rule=rule)
+    got, reason = cfg.uncertainty_features(auc)
+    assert got is active
+    assert reason
+
+
+def test_uncertainty_min_auc_is_configurable():
+    cfg = DynamicEffortConfig(uncertainty_min_auc=0.75)
+    assert not cfg.uncertainty_features(0.70)[0]
+    assert cfg.uncertainty_features(0.80)[0]
+
+
+def test_length_rule_escalates_without_any_uncertainty_evidence():
+    """Flat, low uncertainty: the P6 rank rule refuses, the length rule fires."""
+    cfg = _cfg()
+    flat = lambda i: 0.02  # noqa: E731 - bottom of the entropy distribution
+    ranked = _policy(cfg)
+    state, _ = _drive(cfg, ranked, flat, p_end_of=lambda i: 0.001)
+    assert state.rung == 0  # no rise over its own baseline
+
+    length = _policy(cfg, use_uncertainty=False)
+    state, decisions = _drive(cfg, length, flat, p_end_of=lambda i: 0.001)
+    assert state.rung == 1 and state.escalations == 1
+    fired = [d for d in decisions if d.escalation]
+    assert fired[0].vector["use_uncertainty"] is False
+
+
+def test_length_rule_needs_no_warm_sketches_at_all():
+    cfg = _cfg()
+    policy = _policy(cfg, use_uncertainty=False, entropy_edges=None, margin_edges=None)
+    state, _ = _drive(cfg, policy, lambda i: 0.5, p_end_of=lambda i: 0.001)
+    assert state.rung == 1
+
+
+def test_length_rule_does_not_escalate_a_request_that_is_wrapping_up():
+    cfg = _cfg()
+    policy = _policy(cfg, use_uncertainty=False)
+    # p(end) climbing = converging, whatever the entropy trend does.
+    state, _ = _drive(cfg, policy, lambda i: 0.95, p_end_of=lambda i: 0.001 + i * 0.002)
+    assert state.rung == 0 and state.escalations == 0
+
+
+def test_length_rule_still_respects_loop_churn_and_the_mtp_veto():
+    churny = _cfg(novelty_min_rate=0.5, loop_repeats=1000)
+    policy = _policy(churny, use_uncertainty=False)
+    phrase = _tokens(12)
+    state, _ = _drive(
+        churny,
+        policy,
+        lambda i: 0.5,
+        p_end_of=lambda i: 0.001,
+        tokens=[START] + phrase * 14,
+    )
+    assert state.churn and state.rung == 0
+
+    vetoed = _cfg(acc_veto_rank=0.5)
+    policy = _policy(vetoed, use_uncertainty=False, acceptance_edges=[0.0, 0.5, 1.0])
+    state = new_effort_state("r", vetoed, {}, [START], [END], [], None, 100_000)
+    for tok in [START] + _tokens(120):
+        step_effort(
+            state,
+            vetoed,
+            EffortEvent(
+                new_token_ids=[tok],
+                entropy=0.5,
+                margin=0.5,
+                p_end=0.001,
+                n_rows=1,
+                max_tokens=100_000,
+                num_draft_tokens=4,
+                num_accepted_tokens=4,
+            ),
+            policy,
+        )
+    assert state.rung == 0
+
+
+def test_escalation_verdict_skips_the_rank_terms_only_when_gated():
+    ranked = EffortPolicy(p_uncertain=[0.9], warm=True, baseline_rise=0.1)
+    assert not escalation_verdict(ranked, 0, 0.2, 0.1, False, False, None)
+    assert not escalation_verdict(ranked, 0, None, None, False, False, None)
+    length = EffortPolicy(
+        p_uncertain=[0.9], warm=True, baseline_rise=0.1, use_uncertainty=False
+    )
+    assert escalation_verdict(length, 0, 0.2, 0.1, False, False, None)
+    assert escalation_verdict(length, 0, None, None, False, False, None)
+    # The non-uncertainty vetoes still bind.
+    assert not escalation_verdict(length, 0, None, None, True, False, None)
+    assert not escalation_verdict(length, 0, None, None, False, True, None)
+    assert not escalation_verdict(length, 0, None, None, False, False, 0.99)
+
+
+def test_worker_matches_the_scheduler_under_the_length_rule():
+    cfg = _cfg()
+    policy = _policy(cfg, use_uncertainty=False, grace_tokens=0)
+    worker = _worker()
+    caps = _run_worker(
+        worker,
+        policy,
+        300,
+        lambda t: 0.02,
+        lambda t: 0.9,
+        lambda t: 0.001,
+        lambda t: 1,
+    )
+    state = new_effort_state("r", cfg, {}, [START], [END], [], None, 100_000)
+    sched_caps = []
+    for i, tok in enumerate([START] + _tokens(300)):
+        step_effort(
+            state,
+            cfg,
+            EffortEvent(
+                new_token_ids=[tok],
+                entropy=0.02,
+                margin=0.9,
+                p_end=0.001,
+                n_rows=1,
+                max_tokens=100_000,
+            ),
+            policy,
+        )
+        if i:
+            sched_caps.append(state.cap)
+    assert int(worker.rung[0]) == state.rung == 2
+    assert int(worker.escalations[0]) == state.escalations
+    assert sched_caps[-1] == caps[-1] == LADDER[2]
+
+
+def test_worker_length_rule_stops_at_a_rising_p_end():
+    cfg = _cfg()
+    policy = _policy(cfg, use_uncertainty=False, grace_tokens=0)
+    worker = _worker()
+    _run_worker(
+        worker,
+        policy,
+        300,
+        lambda t: 0.02,
+        lambda t: 0.9,
+        lambda t: 0.001 + t * 0.002,
+        lambda t: 1,
+    )
+    assert int(worker.rung[0]) == 0
+
+
+# ------------------------------------------------ AUC in the calibration file
+
+
+def _auc_sink(tmp_path, *, positives=30, negatives=30, rising=True):
+    """A telemetry sink whose long requests do (or do not) look uncertain."""
+    sink = tmp_path / "auc.jsonl"
+    with sink.open("w") as f:
+        for r in range(negatives):
+            for _ in range(40):  # 400 think tokens: closed under the 1024 cap
+                f.write(
+                    json.dumps(
+                        {
+                            "req_id": f"n{r}",
+                            "entropy": 0.05,
+                            "margin": 5.0,
+                            "n_rows": 10,
+                            "in_think": True,
+                        }
+                    )
+                    + "\n"
+                )
+        for r in range(positives):
+            for step in range(200):  # 2000 think tokens: escalated and finished
+                entropy = 0.05 + step * 0.001 if rising else 0.05
+                f.write(
+                    json.dumps(
+                        {
+                            "req_id": f"p{r}",
+                            "entropy": entropy,
+                            "margin": 5.0,
+                            "n_rows": 10,
+                            "in_think": True,
+                        }
+                    )
+                    + "\n"
+                )
+    return sink
+
+
+def test_effort_calibrate_measures_and_stores_the_uncertainty_auc(tmp_path):
+    calibrate = _calibrate_module()
+    sink = _auc_sink(tmp_path)
+    out = tmp_path / "sketch.json"
+    calibrate.build_sketches([str(sink)], str(out), "m", 10, 100.0)
+
+    sketches = SignalSketches(min_samples=10, path=str(out))
+    assert sketches.load()
+    assert sketches.uncertainty_auc is not None
+    assert sketches.uncertainty_auc > 0.9  # entropy rises only on the long group
+    assert sketches.auc["n_positive"] == 30 and sketches.auc["n_negative"] == 30
+    assert set(sketches.auc["features"]) == {
+        "entropy_first",
+        "entropy_last",
+        "entropy_rise",
+        "margin_first",
+        "margin_last",
+        "margin_drop",
+    }
+    assert "uncertainty AUC" in calibrate.format_auc(sketches.auc)
+    assert "uncertainty AUC" in calibrate.summarise(str(out))
+
+
+def test_uncertainty_auc_is_at_chance_when_the_signal_is_flat(tmp_path):
+    calibrate = _calibrate_module()
+    out = tmp_path / "sketch.json"
+    calibrate.build_sketches(
+        [str(_auc_sink(tmp_path, rising=False))], str(out), "m", 10, 100.0
+    )
+    sketches = SignalSketches(min_samples=10, path=str(out))
+    sketches.load()
+    # Identical distributions: every directional AUC sits at 0.5, which is
+    # below the 0.60 gate, so the features stay off.
+    assert sketches.uncertainty_auc == pytest.approx(0.5, abs=0.01)
+    assert not DynamicEffortConfig().uncertainty_features(sketches.uncertainty_auc)[0]
+
+
+def test_uncertainty_auc_is_inconclusive_without_enough_requests(tmp_path):
+    calibrate = _calibrate_module()
+    out = tmp_path / "sketch.json"
+    calibrate.build_sketches(
+        [str(_auc_sink(tmp_path, positives=3, negatives=3))], str(out), "m", 10, 100.0
+    )
+    sketches = SignalSketches(min_samples=10, path=str(out))
+    sketches.load()
+    assert sketches.uncertainty_auc is None
+    assert sketches.auc["inconclusive"]
+    assert "inconclusive" in calibrate.format_auc(sketches.auc)
+
+
+def test_requests_that_landed_on_a_higher_cap_are_not_positives(tmp_path):
+    calibrate = _calibrate_module()
+    sink = tmp_path / "cap.jsonl"
+    with sink.open("w") as f:
+        for _ in range(410):  # 4100 think tokens: a hair over the 4096 rung
+            f.write(
+                json.dumps(
+                    {
+                        "req_id": "c",
+                        "entropy": 0.5,
+                        "margin": 1.0,
+                        "n_rows": 10,
+                        "in_think": True,
+                    }
+                )
+                + "\n"
+            )
+        for _ in range(409):  # 4090: a cap landing, so neither label
+            f.write(
+                json.dumps(
+                    {
+                        "req_id": "d",
+                        "entropy": 0.5,
+                        "margin": 1.0,
+                        "n_rows": 10,
+                        "in_think": True,
+                    }
+                )
+                + "\n"
+            )
+    auc = calibrate.compute_uncertainty_auc([str(sink)], [1024, 4096, 16384])
+    assert auc["n_positive"] == 1  # "c" only; "d" landed within the slack
+    assert auc["n_negative"] == 0
+    assert auc["uncertainty_auc"] is None
+
+
+def test_sketch_file_without_an_auc_block_still_loads(tmp_path):
+    path = tmp_path / "old.json"
+    sketches = SignalSketches(min_samples=1, path=str(path))
+    sketches.observe("entropy", 0.5)
+    sketches.save()
+    blob = json.loads(path.read_text())
+    assert "auc" not in blob  # additive: nothing is written when nothing is known
+    warm = SignalSketches(min_samples=1, path=str(path))
+    assert warm.load()
+    assert warm.uncertainty_auc is None
+
+
+def test_the_server_preserves_a_loaded_auc_when_it_reflushes(tmp_path):
+    path = tmp_path / "s.json"
+    first = SignalSketches(min_samples=1, path=str(path))
+    first.auc = {"uncertainty_auc": 0.71, "features": {}}
+    first.observe("entropy", 0.5)
+    first.save()
+    live = SignalSketches(min_samples=1, path=str(path))
+    live.load()
+    live.observe("entropy", 0.7)
+    live.save()
+    reloaded = SignalSketches(min_samples=1, path=str(path))
+    reloaded.load()
+    assert reloaded.uncertainty_auc == pytest.approx(0.71)
+
+
+# --------------------------------------- policy resolution in the scheduler
+
+
+def _policy_scheduler(cfg, sketches, use_uncertainty):
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.sample.soft_limit import soft_limit_from_config
+
+    sched = Scheduler.__new__(Scheduler)
+    sched._effort_cfg = cfg
+    sched._effort_sketches = sketches
+    sched._effort_policy = None
+    sched._effort_policy_age = 0
+    sched._effort_use_uncertainty = use_uncertainty
+    sched._effort_soft_limit = soft_limit_from_config(cfg.soft_limit)
+    return sched
+
+
+def test_resolved_policy_is_warm_and_grace_free_under_the_length_rule():
+    cfg = _cfg()
+    cold = SignalSketches(min_samples=10**9)
+    sched = _policy_scheduler(cfg, cold, use_uncertainty=False)
+    policy = sched._effort_resolve_policy(1)
+    assert policy.warm  # nothing to warm when the features are off
+    assert not policy.use_uncertainty
+    # The soft-limit ramp already grants room past the cap, so the p(end)
+    # grace window is switched off rather than stacked on top of it.
+    assert policy.grace_tokens == 0
+
+    ranked = _policy_scheduler(cfg, cold, use_uncertainty=True)
+    assert not ranked._effort_resolve_policy(1).warm
+
+
+def test_grace_window_survives_when_the_soft_limit_is_disabled():
+    cfg = _cfg(soft_limit={"enabled": False}, grace_tokens=128)
+    sched = _policy_scheduler(cfg, SignalSketches(min_samples=1), False)
+    assert sched._effort_resolve_policy(1).grace_tokens == 128

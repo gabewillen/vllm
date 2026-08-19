@@ -63,7 +63,7 @@ def test_config_defaults_and_theta():
     assert cfg.ladder == [1024, 4096, 16384]
     assert cfg.theta == [0.0, 0.5]
     assert cfg.p_uncertain == [0.85, 0.92]
-    assert cfg.rule == "rank" and cfg.evaluation == "worker"
+    assert cfg.rule == "length" and cfg.evaluation == "worker"
     assert cfg.check_at == 0.75 and cfg.final_check_at == 0.9
     assert cfg.loop_ngram == 16 and cfg.loop_repeats == 3 and cfg.loop_window == 512
     assert cfg.floor_enabled is False

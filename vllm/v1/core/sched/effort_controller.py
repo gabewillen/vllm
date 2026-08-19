@@ -481,12 +481,18 @@ def request_ranks(
 
 
 def is_converging(state: EffortState, policy: EffortPolicy) -> bool:
-    """`H_fast < H_slow` **and** p(end) is rising."""
+    """The request is wrapping up, so more budget would not be used.
+
+    p(end) rising is the whole test under the default length rule; the entropy
+    trend is an uncertainty feature and only joins when those are active.
+    """
+    if not p_end_rising(state, policy):
+        return False
+    if not policy.use_uncertainty:
+        return True
     if state.h_fast is None or state.h_slow is None:
         return False
-    if state.h_fast >= state.h_slow - policy.h_trend_eps:
-        return False
-    return p_end_rising(state, policy)
+    return state.h_fast < state.h_slow - policy.h_trend_eps
 
 
 def p_end_rising(state: EffortState, policy: EffortPolicy) -> bool:
@@ -583,6 +589,7 @@ def _try_escalate(
         "acc_rank": acc_rank,
         "p_uncertain": policy.p_for_rung(state.rung),
         "converging": converging,
+        "use_uncertainty": policy.use_uncertainty,
         "samples": state.samples,
         "loop": state.loop_flag,
         "churn": state.churn,

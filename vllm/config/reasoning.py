@@ -78,10 +78,25 @@ class DynamicEffortConfig:
     had a fourth 65536 rung; across 1199 measured requests nothing ever passed
     16384 think tokens and only 5 passed 4096 (docs/dynamic-reasoning-v3-
     analysis.md §3), so the top rung was dead weight. It stays configurable."""
-    rule: str = "rank"
-    """`rank` (default, P6): ordinal percentile-rank rule fed by the
-    scheduler's running quantile sketches. `score`: the pre-P6 weighted
-    z-score against the fixed `calibration` table (deprecated)."""
+    rule: str = "length"
+    """Which escalation rule decides a check point.
+
+    `length` (default, P7): termination/length-based - escalate when the
+    request is *still* in the think block at the check point, is not looping or
+    churning, is not converging (p(reasoning end) rising) and passes the MTP
+    corroboration veto. The entropy/margin percentile-rank features are added
+    on top **only** when the model's calibration file reports a discriminative
+    AUC of at least `uncertainty_min_auc`; the v3 measurement found them at
+    chance on Qwen3.8 (0.41-0.54, length controlled), so by default they are
+    inert rather than silently load-bearing.
+    `rank` (P6): always applies the rank features, whatever the calibration
+    says. `score`: the pre-P6 weighted z-score against the fixed `calibration`
+    table (deprecated)."""
+    uncertainty_min_auc: float = Field(default=0.60, ge=0.0, le=1.0)
+    """Discriminative AUC (from `quantile_path`, written by
+    `serve-configs/effort_calibrate.py`) the entropy/margin features must reach
+    on *this* model before `rule="length"` consults them. No AUC in the file
+    means no evidence, which means the features stay off."""
     soft_limit: SoftLimitConfig = field(default_factory=SoftLimitConfig)
     """Ramped close at the cap instead of a hard cut; see `SoftLimitConfig`.
     Honoured by both actuators and by static `thinking_token_budget`
@@ -229,8 +244,8 @@ class DynamicEffortConfig:
             )
         if self.final_check_at <= self.check_at:
             raise ValueError("dynamic_effort.final_check_at must exceed check_at")
-        if self.rule not in ("rank", "score"):
-            raise ValueError("dynamic_effort.rule must be 'rank' or 'score'")
+        if self.rule not in ("length", "rank", "score"):
+            raise ValueError("dynamic_effort.rule must be 'length', 'rank' or 'score'")
         if self.evaluation not in ("worker", "scheduler"):
             raise ValueError(
                 "dynamic_effort.evaluation must be 'worker' or 'scheduler'"
@@ -302,6 +317,29 @@ class DynamicEffortConfig:
                 if start <= batch_size <= end:
                     return rung
         return self.top_rung
+
+    def uncertainty_features(self, auc: float | None) -> tuple[bool, str]:
+        """Whether the entropy/margin rank features are consulted, and why.
+
+        Args:
+            auc: the discriminative AUC recorded for this model in the
+                calibration file, or `None` when it holds none.
+
+        Returns:
+            `(active, reason)`; `reason` is a short phrase for the startup log.
+        """
+        if self.rule == "score":
+            return True, "rule='score' scores the z-features directly"
+        if self.rule == "rank":
+            return True, "rule='rank' always applies them"
+        if auc is None:
+            return False, (
+                "no discriminative AUC in the calibration file (run "
+                "serve-configs/effort_calibrate.py build)"
+            )
+        if auc >= self.uncertainty_min_auc:
+            return True, f"calibration AUC {auc:.3f} >= {self.uncertainty_min_auc:.2f}"
+        return False, f"calibration AUC {auc:.3f} < {self.uncertainty_min_auc:.2f}"
 
 
 @config

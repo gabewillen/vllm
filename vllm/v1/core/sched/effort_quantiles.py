@@ -248,6 +248,10 @@ class SignalSketches:
         }
         self._since_flush = 0
         self.model: str | None = None
+        self.auc: dict[str, Any] | None = None
+        """Offline discriminative power of the uncertainty features on this
+        model, written by ``serve-configs/effort_calibrate.py``. ``None`` means
+        "no evidence", which under ``rule="length"`` keeps them off."""
 
     # -- ingestion ---------------------------------------------------------
 
@@ -265,6 +269,16 @@ class SignalSketches:
     def count(self, key: str) -> float:
         digest = self.digests.get(key)
         return 0.0 if digest is None else digest.count
+
+    @property
+    def uncertainty_auc(self) -> float | None:
+        """The recorded discriminative AUC of the entropy/margin features."""
+        if not self.auc:
+            return None
+        value = self.auc.get("uncertainty_auc")
+        if value is None or not math.isfinite(float(value)):
+            return None
+        return float(value)
 
     # -- queries -----------------------------------------------------------
 
@@ -286,12 +300,17 @@ class SignalSketches:
     # -- persistence -------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "version": SKETCH_VERSION,
             "model": self.model,
             "min_samples": self.min_samples,
             "signals": {k: d.to_dict() for k, d in self.digests.items()},
         }
+        if self.auc is not None:
+            # Optional and additive: a file written before the AUC pass still
+            # loads, and reports "no evidence".
+            data["auc"] = self.auc
+        return data
 
     def load_dict(self, data: dict[str, Any]) -> None:
         if int(data.get("version", 0)) != SKETCH_VERSION:
@@ -299,6 +318,8 @@ class SignalSketches:
                 f"effort sketch version {data.get('version')} != {SKETCH_VERSION}"
             )
         self.model = data.get("model")
+        auc = data.get("auc")
+        self.auc = auc if isinstance(auc, dict) else None
         for key, blob in (data.get("signals") or {}).items():
             if key in self.digests:
                 self.digests[key] = TDigest.from_dict(blob)

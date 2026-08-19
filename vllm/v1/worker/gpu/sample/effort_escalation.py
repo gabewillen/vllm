@@ -514,9 +514,14 @@ def evaluate_escalation_torch(
     else:
         p_req = torch.ones_like(u_now)
 
-    converging = (h_fast < h_slow - policy.h_trend_eps) & (
-        pe_fast > pe_slow + policy.p_end_rise_eps
-    )
+    # p(end) rising is the whole convergence test under the default length
+    # rule; the entropy trend joins it only when the uncertainty features are
+    # active (see EffortPolicy.use_uncertainty).
+    p_rising = pe_fast > pe_slow + policy.p_end_rise_eps
+    if policy.use_uncertainty:
+        converging = (h_fast < h_slow - policy.h_trend_eps) & p_rising
+    else:
+        converging = p_rising
     blocked = (
         state.veto[slots]
         | state.frozen[slots]
@@ -526,18 +531,18 @@ def evaluate_escalation_torch(
         | (rung >= num_rungs - 1)
         | (next_rung > policy.max_rung)
         | acc_veto
-        | ~have_rank
-        | ~base_ready
     )
+    if policy.use_uncertainty:
+        blocked = blocked | ~have_rank | ~base_ready
     fire = (
         checked
         & in_think
         & torch.tensor(bool(policy.warm), device=device)
         & ~blocked
         & ~converging
-        & (u_now >= p_req)
-        & ((u_now - u_base) >= policy.baseline_rise)
     )
+    if policy.use_uncertainty:
+        fire = fire & (u_now >= p_req) & ((u_now - u_base) >= policy.baseline_rise)
 
     new_cap = torch.where(fire, next_cap, cap)
     state.rung[slots] = torch.where(fire, next_rung, rung)
@@ -554,7 +559,7 @@ def evaluate_escalation_torch(
 
     # --- p(end) grace window ---------------------------------------------
     grace_used = state.grace_used[slots]
-    rising = pe_fast > pe_slow + policy.p_end_rise_eps
+    rising = p_rising
     want_grace = (
         in_think
         & ~fire

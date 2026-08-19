@@ -27,6 +27,14 @@ Two modes, usually run back to back:
 `build` reads only in-think rows (`in_think: true`) and weights each row by its
 committed row count, exactly as the scheduler does at run time, so a warmed
 file and a self-warmed server converge to the same distribution.
+
+`build` also measures whether the entropy/margin features carry any signal on
+*this* model and stores the answer in the same file (`auc` block). The default
+escalation rule (`dynamic_effort.rule = "length"`) consults those features only
+when that AUC clears `uncertainty_min_auc`; a file without an `auc` block means
+"no evidence", so they stay off. See docs/dynamic-reasoning-v3-analysis.md §4
+for the method - this is the same label and the same rank statistic, run
+against the current sink instead of by hand.
 """
 
 from __future__ import annotations
@@ -88,6 +96,8 @@ def build_sketches(
     min_samples: int,
     compression: float,
     include_all_rows: bool = False,
+    ladder: list[int] | None = None,
+    with_auc: bool = True,
 ) -> dict[str, float]:
     """Fold a telemetry sink into a sketch file.
 
@@ -98,6 +108,8 @@ def build_sketches(
         min_samples: `quantile_min_samples` of the target server.
         compression: t-digest compression.
         include_all_rows: also fold rows outside the think block (debug only).
+        ladder: the rung caps the traffic ran with (for the AUC labels).
+        with_auc: also measure and store the uncertainty-feature AUC.
 
     Returns:
         Per-signal observation counts.
@@ -129,8 +141,201 @@ def build_sketches(
                 ema = ratio if prev is None else 0.7 * prev + 0.3 * ratio
                 acc_ema[req_id] = ema
                 sketches.observe("acceptance", ema)
+    if with_auc:
+        sketches.auc = compute_uncertainty_auc(telemetry_paths, ladder)
     sketches.save()
     return {key: sketches.count(key) for key in sketches.digests}
+
+
+DEFAULT_LADDER = [1024, 4096, 16384]
+AUC_WINDOW = 128
+AUC_MIN_GROUP = 20
+AUC_CAP_SLACK = 8
+
+
+def _rank_auc(positive: list[float], negative: list[float]) -> float | None:
+    """`P(positive > negative)` with ties at 0.5 (Mann-Whitney).
+
+    Args:
+        positive: feature values of the "needed more thinking" group.
+        negative: feature values of the "closed at or before the cap" group.
+
+    Returns:
+        The AUC, or `None` when either group is empty.
+    """
+    if not positive or not negative:
+        return None
+    merged = sorted(
+        (v, i) for i, values in enumerate((positive, negative)) for v in values
+    )
+    ranks = [0.0] * len(merged)
+    i = 0
+    while i < len(merged):
+        j = i
+        while j + 1 < len(merged) and merged[j + 1][0] == merged[i][0]:
+            j += 1
+        average = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[k] = average
+        i = j + 1
+    rank_sum = sum(r for r, (_, group) in zip(ranks, merged) if group == 0)
+    n_pos, n_neg = len(positive), len(negative)
+    return (rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def _window_means(
+    steps: list[tuple[float, float, float]], window: int
+) -> tuple[dict[str, float], dict[str, float]] | None:
+    """Token-weighted (entropy, margin) means of the first and last `window`.
+
+    Args:
+        steps: per-step `(entropy, margin, n_rows)` of one request's in-think
+            steps, in commit order.
+        window: think tokens each end of the request contributes.
+
+    Returns:
+        `(first, last)` mean dicts, or `None` when the request is too short for
+        the two windows to be disjoint.
+    """
+    total = sum(int(n) for _, _, n in steps)
+    if total < 2 * window:
+        return None
+
+    def _mean(ordered: list[tuple[float, float, float]]) -> dict[str, float]:
+        left = window
+        entropy = margin = weight = 0.0
+        for e, m, n in ordered:
+            take = min(int(n), left)
+            if take <= 0:
+                break
+            entropy += e * take
+            margin += m * take
+            weight += take
+            left -= take
+        return {"entropy": entropy / weight, "margin": margin / weight}
+
+    return _mean(steps), _mean(steps[::-1])
+
+
+def compute_uncertainty_auc(
+    telemetry_paths: list[str],
+    ladder: list[int] | None = None,
+    window: int = AUC_WINDOW,
+    min_group: int = AUC_MIN_GROUP,
+    cap_slack: int = AUC_CAP_SLACK,
+) -> dict[str, Any]:
+    """Discriminative power of the entropy/margin features on this model.
+
+    Label (docs/dynamic-reasoning-v3-analysis.md §4): a request is *positive*
+    when it needed the higher rung - it passed the rung-0 cap and then closed
+    naturally rather than landing on a higher cap - and *negative* when it
+    closed at or before the rung-0 cap. Length is controlled by requiring both
+    groups to be at least `2 * window` think tokens long, so a request's first
+    and last windows are disjoint. Every feature is scored in the direction the
+    escalation rule assumes (high entropy / low margin = "still working"), so
+    an AUC below 0.5 means the rule's premise is backwards on this model.
+
+    Args:
+        telemetry_paths: JSONL sinks written by `VLLM_EFFORT_TELEMETRY`.
+        ladder: the rung caps the traffic ran with.
+        window: think tokens per end window.
+        min_group: smallest usable group; below it the result is inconclusive.
+        cap_slack: tokens below a higher cap that still count as landing on it.
+
+    Returns:
+        The `auc` block stored in the sketch file.
+    """
+    ladder = list(ladder or DEFAULT_LADDER)
+    cap = ladder[0]
+    steps: dict[str, list[tuple[float, float, float]]] = {}
+    for path in telemetry_paths:
+        for rec in iter_jsonl(path):
+            n_rows = rec.get("n_rows") or 0
+            if n_rows <= 0 or not rec.get("in_think"):
+                continue
+            steps.setdefault(str(rec.get("req_id", "")), []).append(
+                (
+                    float(rec.get("entropy", 0.0)),
+                    float(rec.get("margin", 0.0)),
+                    float(n_rows),
+                )
+            )
+
+    features = ("entropy_first", "entropy_last", "entropy_rise")
+    features += ("margin_first", "margin_last", "margin_drop")
+    groups: dict[str, dict[str, list[float]]] = {
+        key: {"positive": [], "negative": []} for key in features
+    }
+    for request in steps.values():
+        think = int(sum(n for _, _, n in request))
+        if think > cap:
+            landed = any(0 <= higher - think <= cap_slack for higher in ladder[1:])
+            label = None if landed else "positive"
+        else:
+            label = "negative"
+        if label is None:
+            continue
+        windows = _window_means(request, window)
+        if windows is None:
+            continue
+        first, last = windows
+        values = {
+            "entropy_first": first["entropy"],
+            "entropy_last": last["entropy"],
+            "entropy_rise": last["entropy"] - first["entropy"],
+            "margin_first": first["margin"],
+            "margin_last": last["margin"],
+            "margin_drop": last["margin"] - first["margin"],
+        }
+        for key, value in values.items():
+            groups[key][label].append(value)
+
+    n_pos = len(groups["entropy_last"]["positive"])
+    n_neg = len(groups["entropy_last"]["negative"])
+    scored: dict[str, float] = {}
+    for key, sides in groups.items():
+        # Margin features run the other way: the rule reads a *low* margin as
+        # uncertainty, so P(positive < negative) is the directional AUC.
+        if key.startswith("margin"):
+            auc = _rank_auc(sides["negative"], sides["positive"])
+        else:
+            auc = _rank_auc(sides["positive"], sides["negative"])
+        if auc is not None:
+            scored[key] = auc
+    usable = n_pos >= min_group and n_neg >= min_group
+    return {
+        "uncertainty_auc": max(scored.values()) if (usable and scored) else None,
+        "features": scored,
+        "n_positive": n_pos,
+        "n_negative": n_neg,
+        "window": window,
+        "cap": cap,
+        "min_think_tokens": 2 * window,
+        "min_group": min_group,
+        "inconclusive": not usable,
+    }
+
+
+def format_auc(auc: dict[str, Any] | None) -> str:
+    """Human-readable summary of an `auc` block."""
+    if not auc:
+        return "uncertainty AUC: absent (features stay off under rule='length')"
+    lines = []
+    overall = auc.get("uncertainty_auc")
+    if overall is None:
+        lines.append(
+            "uncertainty AUC: inconclusive "
+            f"(positives={auc.get('n_positive')} negatives={auc.get('n_negative')}, "
+            f"need {auc.get('min_group')} of each)"
+        )
+    else:
+        lines.append(
+            f"uncertainty AUC: {overall:.3f} "
+            f"(positives={auc.get('n_positive')} negatives={auc.get('n_negative')})"
+        )
+    for key, value in sorted(auc.get("features", {}).items()):
+        lines.append(f"  {key:<14} {value:.3f}")
+    return "\n".join(lines)
 
 
 def summarise(path: str) -> str:
@@ -149,6 +354,8 @@ def summarise(path: str) -> str:
         row = key.ljust(12) + f"{digest.count:>10.0f}"
         row += "".join(f"{digest.quantile(q):>9.4f}" for q in quantiles)
         lines.append(row)
+    lines.append("")
+    lines.append(format_auc(sketches.auc))
     return "\n".join(lines)
 
 
@@ -228,6 +435,18 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--min-samples", type=int, default=2048)
     build.add_argument("--compression", type=float, default=100.0)
     build.add_argument("--include-all-rows", action="store_true")
+    build.add_argument(
+        "--ladder",
+        type=int,
+        nargs="+",
+        default=DEFAULT_LADDER,
+        help="rung caps the traffic ran with; labels the AUC groups",
+    )
+    build.add_argument(
+        "--no-auc",
+        action="store_true",
+        help="skip the uncertainty-feature AUC pass",
+    )
 
     show = sub.add_parser("show", help="print a sketch file's percentiles")
     show.add_argument("--sketch", required=True)
@@ -259,11 +478,17 @@ def main(argv: list[str] | None = None) -> int:
             args.min_samples,
             args.compression,
             args.include_all_rows,
+            args.ladder,
+            not args.no_auc,
         )
         print(f"wrote {args.out}")
         for key, count in counts.items():
             warm = "warm" if count >= args.min_samples else "COLD"
             print(f"  {key:<12} {count:>10.0f}  {warm}")
+        if not args.no_auc:
+            written = SignalSketches(min_samples=1, path=args.out)
+            written.load()
+            print(format_auc(written.auc))
         return 0
 
     print(summarise(args.sketch))

@@ -10,16 +10,24 @@ worker-side tensors (V2) - turn a raw signal into a rank with the same grid
 and apply the same predicate, so the decision does not depend on where it is
 made or on which TP rank makes it.
 
-Rule (docs/dynamic-reasoning.claude.md §P6):
+Rule (docs/dynamic-reasoning.claude.md §11, §12):
 
-    u = max(rank(H_fast), 1 - rank(margin))
     escalate = (
-        u >= p_uncertain[rung]                    # globally uncertain
-        and u - u_baseline >= baseline_rise       # and rising for *this* request
-        and (H_fast >= H_slow or p_end not rising)  # not converging
+        still in the think block at the check point
         and no loop / churn
-        and rank(MTP acceptance) <= acc_veto_rank   # corroboration only
+        and p_end not rising                       # not converging
+        and rank(MTP acceptance) <= acc_veto_rank  # corroboration only
+        and (not use_uncertainty or (
+            u >= p_uncertain[rung]                 # globally uncertain
+            and u - u_baseline >= baseline_rise    # and rising for *this* request
+            and H_fast >= H_slow                   # entropy not falling
+        ))
     )
+
+with ``u = max(rank(H_fast), 1 - rank(margin))``. ``use_uncertainty`` is the
+evidence gate: the entropy/margin features are consulted only when the model's
+calibration file reports a discriminative AUC for them (`rule="length"`, the
+default), or unconditionally under `rule="rank"`.
 """
 
 from __future__ import annotations
@@ -66,8 +74,15 @@ class EffortPolicy:
     EMAs of a constant signal differ only by float noise)."""
     acc_veto_rank: float = 0.85
     """Acceptance rank above which escalation is vetoed (text is predictable)."""
+    use_uncertainty: bool = True
+    """Whether the entropy/margin rank features take part in the decision.
+    False (the default `rule="length"` without calibration evidence) leaves the
+    rule termination/length-based: uncertainty is measured and logged, but it
+    neither escalates nor blocks."""
     warm: bool = False
-    """False while the sketches are cold; no request may escalate."""
+    """False while the sketches are cold; no request may escalate. With
+    `use_uncertainty` off there is nothing to warm, so the scheduler ships
+    `warm=True` immediately."""
 
     def p_for_rung(self, rung: int) -> float:
         if not self.p_uncertain:
@@ -126,7 +141,8 @@ def escalation_verdict(
         rung: the request's current rung.
         u_now: current uncertainty rank, or ``None`` when unavailable.
         u_base: within-request baseline uncertainty rank.
-        converging: ``H_fast < H_slow`` and p(end) is rising.
+        converging: the request is wrapping up (p(end) rising, and - when the
+            uncertainty features are active - entropy falling too).
         blocked: a loop / churn / dwell / headroom veto fired.
         acceptance_rank: rank of the request's MTP acceptance EMA.
 
@@ -135,10 +151,11 @@ def escalation_verdict(
     """
     if not policy.warm or blocked or converging:
         return False
-    if u_now is None or u_base is None:
-        return False
-    if u_now < policy.p_for_rung(rung):
-        return False
-    if u_now - u_base < policy.baseline_rise:
-        return False
+    if policy.use_uncertainty:
+        if u_now is None or u_base is None:
+            return False
+        if u_now < policy.p_for_rung(rung):
+            return False
+        if u_now - u_base < policy.baseline_rise:
+            return False
     return not (acceptance_rank is not None and acceptance_rank > policy.acc_veto_rank)
