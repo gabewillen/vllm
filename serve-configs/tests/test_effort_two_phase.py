@@ -31,16 +31,18 @@ BODY = 96
 TAILS = [[10, 11, 12, 13], [20, 21], [30, 31, 32, 33, 34, 35]]
 
 
-def _scheduler(**hidden_kw):
+def _scheduler(max_num_batched_tokens=2048, async_scheduling=None, **hidden_kw):
     from tests.v1.core.utils import create_scheduler
 
+    kw = {} if async_scheduling is None else {"async_scheduling": async_scheduling}
     scheduler = create_scheduler(
         model=MODEL,
         enable_prefix_caching=True,
         block_size=BLOCK,
-        max_num_batched_tokens=2048,
+        max_num_batched_tokens=max_num_batched_tokens,
         max_model_len=2048,
         use_v2_model_runner=True,
+        **kw,
     )
     kwargs = dict(enabled=True, memory_size=128, min_entries=4, k=4, flush_every=0)
     kwargs.update(hidden_kw)
@@ -363,6 +365,46 @@ def test_split_survives_async_scheduling(async_scheduling):
     )
     assert list(request.prompt_token_ids)[BODY:] == TAILS[2]
     assert request.num_output_placeholders == 0
+
+
+def test_a_multi_chunk_body_is_decided_by_the_step_that_computed_it():
+    """The vector belongs to the step whose output carries it, not to a counter.
+
+    A body wider than one prefill chunk finishes on a later step, and under
+    async scheduling that step is already scheduled - so the request's token
+    counter has already reached the body boundary - by the time the *earlier*
+    chunk's output is processed. Resolving off the counter consumes the
+    decision against an output that never captured anything, and the request
+    silently runs at the default level with reason `no-vector`.
+    """
+    scheduler = _scheduler(
+        max_num_batched_tokens=64, async_scheduling=True, q_mid=0.0, q_high=0.0
+    )
+    _fill_memory(scheduler)
+    request = _add(scheduler, "a")
+    body = list(request.prompt_token_ids[:BODY])
+
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens["a"] == 64
+    assert first.effort_prefill_capture == []
+
+    # Async scheduling runs a step ahead of the outputs: the chunk that
+    # finishes the body is scheduled before the first chunk's output arrives.
+    second = scheduler.schedule()
+    assert second.num_scheduled_tokens["a"] == BODY - 64
+    assert second.effort_prefill_capture == ["a"]
+    assert request.num_computed_tokens == BODY
+
+    scheduler.update_from_output(first, _runner_output(first))
+    assert request.effort_decision_pending
+
+    scheduler.update_from_output(
+        second, _runner_output(second, {"a": np.ones(HIDDEN, dtype=np.float16)})
+    )
+    assert not request.effort_decision_pending
+    assert list(request.prompt_token_ids) == body + TAILS[2]
+    assert scheduler._effort["a"].level == 2
+    assert "no-vector" not in scheduler._effort_default_reason
 
 
 def test_body_stops_at_a_cacheable_block_boundary_under_mamba_align():

@@ -1910,6 +1910,12 @@ class Scheduler(SchedulerInterface):
 
         effort_prefill_states = model_runner_output.effort_prefill_states
         effort_requeued: set[Request] = set()
+        # Which requests' body rows *this* step computed. Async scheduling has
+        # already scheduled the step after a multi-chunk body - so the token
+        # counter is past the boundary - when the earlier chunk's vector-less
+        # output arrives, and resolving off that counter would spend the
+        # decision on it. Empty on almost every step.
+        effort_capture = scheduler_output.effort_prefill_capture
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
@@ -1975,10 +1981,7 @@ class Scheduler(SchedulerInterface):
             if output_is_stale and request.drop_stale_output:
                 continue
 
-            if (
-                request.effort_decision_pending
-                and request.num_computed_tokens >= request.effort_body_len
-            ):
+            if request.effort_decision_pending and req_id in effort_capture:
                 # v3: the body's last prefill row came back with this step, so
                 # the starting rung is decided here and the chosen tail replaces
                 # the rung-0 one (§13.3 step 4).

@@ -1,9 +1,9 @@
 diff --git a/docs/dynamic-reasoning-v3-results.md b/docs/dynamic-reasoning-v3-results.md
 new file mode 100644
-index 0000000000..6183e1931e
+index 0000000000..be78f79dfb
 --- /dev/null
 +++ b/docs/dynamic-reasoning-v3-results.md
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,299 @@
 +# P8 on the box: the effort level, decided before thinking
 +
 +Status: **implemented and benchmarked 2026-08-19** on the 4x L4 trial arm
@@ -26,7 +26,24 @@ index 0000000000..6183e1931e
 +
 +## 1. Headline
 +
-+_(filled in from the run; see §5)_
++Greedy, cold memory, 22 of 23 tasks (one killed as a runaway, §5):
++
++| column | solved | mean functional | completion tokens | per request | reasoning p90 / p99 / max |
++|---|---:|---:|---:|---:|---:|
++| `dynamic` (v1, greedy, c=5) | 19/23 | 0.826 | 411 118 | — | — |
++| `dynamic-v2` (greedy, c=5) | 19/23 | **0.857** | 846 811 | 1 071 | 1 303 / 5 865 / 16 663 |
++| `dynamic-v3` (greedy, c=12) | 17/22 | 0.773 | 753 027 | 1 572 | 2 092 / 19 355 / **40 849** |
++
++**The router works and the uncapped greedy configuration does not.** The
++hidden-state level separates the traffic as designed — level 2 requests think
++3.7x as long as level 0 at the mean and 7x at p90 (§5) — but removing the cap
++under **greedy** decoding lets a think block run away: the median request thinks
++*less* than under `dynamic-v2` (28 vs 68 tokens) while the tail goes 2.5x
++further, and one task (`oss-chi-readfrom-tee-doublecount`) spent **254 066**
++completion tokens to solve what `dynamic` and `dynamic-v2` solved with 3 214 and
++2 971. That is the failure mode Qwen's model card names for greedy decoding, and
++with no cap nothing bounds it. §5b reruns the same build with the model's
++recommended thinking-mode sampling.
 +
 +## 2. Where the effort sentence has to go (measured 2026-08-19)
 +
@@ -152,7 +169,103 @@ index 0000000000..6183e1931e
 +  requests got `default_level` (the `low` sentence, which is what `dynamic`
 +  rendered before v3) while filling it.
 +
-+## 5. The `dynamic-v3` column
++## 5. The `dynamic-v3` column (greedy)
++
++23 tasks launched, **22 completed**. `oss-aiohttp-upgrade-deferred` was killed
++while still running after 2h10m: 34 agent steps, 94 077 reasoning tokens
++accumulated, largest single think block 16 502 — a runaway, so it is recorded as
++**killed while running** rather than as a failure, and its trace-only directory
++is under `_discarded/dynamic-v3-greedy-killed/`. `dynamic` scored 0.00 on that
++task and `dynamic-v2` scored 1.00.
++
++| | `dynamic` | `dynamic-v2` | `dynamic-v3` |
++|---|---:|---:|---:|
++| solved | 19/23 | 19/23 | 17/22 |
++| mean functional | 0.826 | 0.857 | 0.773 |
++| completion tokens | 411 118 | 846 811 | 753 027 |
++| per request | — | 1 071 | 1 572 |
++| requests | — | 791 | 479 |
++| prompt tokens | 11 608 558 | 16 681 500 | 5 061 297 |
++
++Per task (functional / completion tokens / steps) is in §5c.
++
++**Levels chosen.** 479 requests: level 0 (the `low` sentence) 338, level 1
++(template `medium`, no sentence) 33, level 2 (the `xhigh` sentence) 108. **167**
++of them were decided by the memory; the rest ran at the default level because
++the memory was still cold (the first ~128 finished requests, by design), because
++the prompt had no usable seam (33 — under one KV block), or because no vector
++reached the scheduler (148, §7).
++
++Reasoning tokens by chosen level:
++
++| level | n | mean | p50 | p90 | max |
++|---|---:|---:|---:|---:|---:|
++| 0 (`low`) | 338 | 587 | 25 | 711 | 25 757 |
++| 1 (`medium`) | 33 | 302 | 41 | 665 | 4 649 |
++| 2 (`xhigh`) | 108 | **2 183** | 86 | **5 308** | 40 849 |
++
++That separation is the signal doing its job: the level-2 band thinks 3.7x longer
++at the mean and 7.5x at p90 than the level-0 band, on the same server, with the
++level chosen before either of them produced a token.
++
++## 5a. Reasoning length without a cap
++
++Per-request reasoning-token distribution, from the run traces (the `dynamic`
++column's traces predate the field):
++
++| run set | n | mean | p50 | p90 | p99 | max | >4k | >8k | >16k | >32k |
++|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
++| `dynamic-v2` (capped 1k/4k/16k + soft limit) | 791 | 546 | 68 | 1 303 | 5 865 | 16 663 | 13 | 2 | 1 | 0 |
++| `dynamic-v3` (no cap, greedy) | 479 | 927 | **28** | 2 092 | 19 355 | **40 849** | 28 | 13 | 6 | 1 |
++
++Read both halves. The **median falls** — most requests think less once the level
++is chosen for them — and the **tail triples**: p99 goes 5 865 -> 19 355 and the
++maximum is no longer the 16 384 cap but 40 849 tokens. `dynamic-v2`'s maximum
++*is* its cap; `dynamic-v3` has nothing to stop it.
++
++Qwen's model card warns that **greedy decoding can cause endless repetition**,
++and with no cap a looping think block is bounded only by `max_tokens` and the
++task timeout. That is the most likely explanation for both the runaway that was
++killed and the 254 066-token solve of `oss-chi-readfrom-tee-doublecount`. So
++`dynamic-v3` is measured twice on the same build: once greedy (above, like every
++other v3 column) and once with the model's recommended thinking-mode sampling
++(temperature 1.0, top_p 0.95, top_k 20, min_p 0, fixed seed) below.
++
++## 5c. Per task (greedy)
++
++functional score / completion tokens / agent steps.
++
++| task | `dynamic` | `dynamic-v2` | `dynamic-v3` |
++|---|---|---|---|
++| `oss-aiohttp-upgrade-deferred` | 0.00 / 52,102 / 236 | 1.00 / 135,366 / 472 | — (killed, runaway) |
++| `oss-chi-readfrom-tee-doublecount` | 1.00 / 3,214 / 70 | 1.00 / 2,971 / 58 | 1.00 / 254,066 / 78 |
++| `oss-cobra-noduplicateargs` | 1.00 / 1,405 / 60 | 1.00 / 1,793 / 52 | 1.00 / 1,626 / 60 |
++| `oss-flask-teardown-robust` | 1.00 / 15,480 / 162 | 1.00 / 7,601 / 98 | 0.00 / 20,080 / 48 |
++| `oss-hono-client-header-merge` | 1.00 / 10,337 / 80 | 1.00 / 10,558 / 72 | 1.00 / 22,142 / 124 |
++| `oss-hono-request-bytes` | 1.00 / 2,460 / 78 | 1.00 / 3,458 / 96 | 1.00 / 17,563 / 148 |
++| `oss-itertools-strip-prefix` | 1.00 / 21,584 / 296 | 0.00 / 28,484 / 300 | 0.00 / 52,567 / 88 |
++| `oss-jiff-date-day-lt1` | 1.00 / 4,751 / 136 | 1.00 / 2,219 / 60 | 1.00 / 3,053 / 76 |
++| `oss-jiff-signdur-panic` | 1.00 / 4,469 / 112 | 1.00 / 2,598 / 80 | 1.00 / 2,365 / 64 |
++| `oss-jiff-strftime-negpad` | 1.00 / 18,701 / 172 | 1.00 / 55,986 / 300 | 1.00 / 90,216 / 134 |
++| `oss-more-itertools-interleave-empty` | 1.00 / 1,486 / 50 | 1.00 / 1,554 / 54 | 1.00 / 1,615 / 54 |
++| `oss-networkx-leiden-communities` | 0.00 / 63,179 / 197 | 0.50 / 94,345 / 288 | 0.00 / 9,155 / 40 |
++| `oss-packaging-range-prerelease-policy` | 1.00 / 7,731 / 102 | 1.00 / 8,886 / 128 | 1.00 / 5,660 / 108 |
++| `oss-pennylane-trotter-fragmented` | 0.00 / 61,910 / 175 | 0.20 / 124,283 / 322 | 0.00 / 45,860 / 54 |
++| `oss-pflag-uintslice-hex` | 1.00 / 1,851 / 46 | 1.00 / 2,516 / 54 | 1.00 / 2,337 / 58 |
++| `oss-semver-inc-dotted-prerelease` | 1.00 / 16,768 / 78 | 1.00 / 14,716 / 108 | 1.00 / 30,493 / 74 |
++| `oss-semver-truncate` | 1.00 / 6,049 / 108 | 1.00 / 2,662 / 90 | 1.00 / 3,199 / 76 |
++| `oss-semver-xrange-order` | 1.00 / 9,949 / 108 | 1.00 / 6,857 / 98 | 1.00 / 48,037 / 138 |
++| `oss-sqlglot-canonicalize-internal-names` | 0.00 / 66,729 / 209 | 0.00 / 298,334 / 113 | 0.00 / 80,157 / 92 |
++| `oss-sqlglot-iso8601-nanos` | 1.00 / 13,601 / 202 | 1.00 / 8,335 / 138 | 1.00 / 27,515 / 240 |
++| `oss-sqlglot-qualify-lateral-star` | 1.00 / 15,128 / 188 | 1.00 / 17,883 / 190 | 1.00 / 24,572 / 218 |
++| `oss-zod-invert-codec` | 1.00 / 9,301 / 160 | 1.00 / 13,384 / 230 | 1.00 / 7,679 / 186 |
++| `oss-zod-proto-catchall` | 1.00 / 2,933 / 94 | 1.00 / 2,022 / 62 | 1.00 / 3,070 / 94 |
++
++`oss-chi-readfrom-tee-doublecount` is the runaway that still solved:
++254 066 completion tokens against 3 214 and 2 971 for the same task in the
++two earlier columns.
++
++## 5b. The `dynamic-v3-sampled` column
 +
 +_(filled in from the run)_
 +
@@ -173,6 +286,16 @@ index 0000000000..6183e1931e
 +  touches `sampler.py`, `rejection_sampler.py`, `async_utils.py` and
 +  `model_runner.py` and was not worth doing between a benchmark and its rerun.
 +  It is the next thing on this branch.
++- **The 148 `no-vector` requests were a bug, and it is fixed.** A body wider
++  than one prefill chunk (boundary 3296 or more, i.e. every long prompt) had its
++  decision consumed by the *previous* chunk's output, which carries no vector,
++  because async scheduling had already advanced the token counter past the body
++  boundary before that output was processed. So the column above is the router
++  running on short prompts only; the long half of the traffic never took a
++  decision and never entered the memory. Root cause and fix:
++  `dynamic-reasoning.claude.md` §13.10 item 4. **The `dynamic-v3` numbers here
++  must be re-measured on the fixed build before they mean anything about long
++  prompts.**
 +- **The placement grid is six prompts, one sample each.** It is enough to
 +  choose a placement, not to quote a coefficient.
 +- **`split_min_fraction` still excludes short prompts.** With a 1648-token
@@ -181,10 +304,10 @@ index 0000000000..6183e1931e
 +- Multimodality: the traces are text-only, as in the probe doc.
 +- One model, one box, 23 tasks.
 diff --git a/docs/dynamic-reasoning.claude.md b/docs/dynamic-reasoning.claude.md
-index 179d8360fc..5315849015 100644
+index 179d8360fc..b5f0a7f8c7 100644
 --- a/docs/dynamic-reasoning.claude.md
 +++ b/docs/dynamic-reasoning.claude.md
-@@ -828,3 +828,48 @@ Explicitly *not* on this list: counterfactual replay by re-running saved
+@@ -828,3 +828,72 @@ Explicitly *not* on this list: counterfactual replay by re-running saved
  requests with forced closes at each rung. Item 1 subsumes it and is strictly
  cheaper — a forced close at rung *r* is a prefix of the unbounded trace, so the
  label comes out of the recording instead of a fresh generation.
@@ -227,6 +350,30 @@ index 179d8360fc..5315849015 100644
 +   boundary covering at least that fraction of itself takes no decision and runs
 +   at `default_level` with a byte-identical prompt. With a 1648-token block that
 +   is prompts under about one block.
++4. **The vector belongs to a *step*, not to a token counter.** `update_from_output`
++   resolved the level for any held request whose `num_computed_tokens` had
++   reached the body boundary. Async scheduling schedules step N+1 before it
++   processes step N's output, so a body wider than one prefill chunk — with a
++   1648-token block, every prompt whose boundary is 3296 or more — already had
++   its counter at the boundary when the *earlier* chunk's output arrived. That
++   output captured nothing, the decision was spent against it with reason
++   `no-vector`, and the real vector, arriving one step later, was dropped on a
++   request that was no longer pending. It cost **148 of 479** requests in the
++   greedy `dynamic-v3` sweep (31%, held timeouts 0, preemptions 0): every long
++   prompt ran at `default_level`, and none of them entered the memory either,
++   which is why the memory warmed on short prompts only. The resolve is now
++   gated on the step's own `effort_prefill_capture` list — the only thing that
++   says the vector came back with *this* output. Regression:
++   `test_a_multi_chunk_body_is_decided_by_the_step_that_computed_it`.
++
++Verified on the box, 2026-08-19 (`/tmp/dflash2-arms/V3-fix.log`): 160 real
++VulcanBench agent turns replayed at `reasoning_effort: dynamic`, concurrency 12,
++cold prefix cache and cold memory. **`no-vector` 0 of 151 decisions, held
++timeouts 0**, and the first five traced bodies — 3 296, 11 536, 13 184, 32 960
++and 34 608 tokens, every one of them a multi-chunk prefill — all report `vector
++present`. On the same server before the fix the same trace only ever reported
++`vector present` for a 1 648-token (single-chunk) body, and the 128-entry
++histogram read `no-vector: 77` of 242.
 +
 +§13.5's open question is answered differently than it framed itself: the token
 +cost of a higher level is now *entirely* the sentence, because there is no cap
@@ -3995,10 +4142,10 @@ index 37788a665e..729dd1ff53 100644
  # --------------------------------------------------------------------------
 diff --git a/serve-configs/tests/test_effort_two_phase.py b/serve-configs/tests/test_effort_two_phase.py
 new file mode 100644
-index 0000000000..c4afb16a5d
+index 0000000000..c44137ce8b
 --- /dev/null
 +++ b/serve-configs/tests/test_effort_two_phase.py
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,484 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""End-to-end scheduler tests for the v3 two-phase prefill decision (§13.3).
 +
@@ -4032,16 +4179,18 @@ index 0000000000..c4afb16a5d
 +TAILS = [[10, 11, 12, 13], [20, 21], [30, 31, 32, 33, 34, 35]]
 +
 +
-+def _scheduler(**hidden_kw):
++def _scheduler(max_num_batched_tokens=2048, async_scheduling=None, **hidden_kw):
 +    from tests.v1.core.utils import create_scheduler
 +
++    kw = {} if async_scheduling is None else {"async_scheduling": async_scheduling}
 +    scheduler = create_scheduler(
 +        model=MODEL,
 +        enable_prefix_caching=True,
 +        block_size=BLOCK,
-+        max_num_batched_tokens=2048,
++        max_num_batched_tokens=max_num_batched_tokens,
 +        max_model_len=2048,
 +        use_v2_model_runner=True,
++        **kw,
 +    )
 +    kwargs = dict(enabled=True, memory_size=128, min_entries=4, k=4, flush_every=0)
 +    kwargs.update(hidden_kw)
@@ -4364,6 +4513,46 @@ index 0000000000..c4afb16a5d
 +    )
 +    assert list(request.prompt_token_ids)[BODY:] == TAILS[2]
 +    assert request.num_output_placeholders == 0
++
++
++def test_a_multi_chunk_body_is_decided_by_the_step_that_computed_it():
++    """The vector belongs to the step whose output carries it, not to a counter.
++
++    A body wider than one prefill chunk finishes on a later step, and under
++    async scheduling that step is already scheduled - so the request's token
++    counter has already reached the body boundary - by the time the *earlier*
++    chunk's output is processed. Resolving off the counter consumes the
++    decision against an output that never captured anything, and the request
++    silently runs at the default level with reason `no-vector`.
++    """
++    scheduler = _scheduler(
++        max_num_batched_tokens=64, async_scheduling=True, q_mid=0.0, q_high=0.0
++    )
++    _fill_memory(scheduler)
++    request = _add(scheduler, "a")
++    body = list(request.prompt_token_ids[:BODY])
++
++    first = scheduler.schedule()
++    assert first.num_scheduled_tokens["a"] == 64
++    assert first.effort_prefill_capture == []
++
++    # Async scheduling runs a step ahead of the outputs: the chunk that
++    # finishes the body is scheduled before the first chunk's output arrives.
++    second = scheduler.schedule()
++    assert second.num_scheduled_tokens["a"] == BODY - 64
++    assert second.effort_prefill_capture == ["a"]
++    assert request.num_computed_tokens == BODY
++
++    scheduler.update_from_output(first, _runner_output(first))
++    assert request.effort_decision_pending
++
++    scheduler.update_from_output(
++        second, _runner_output(second, {"a": np.ones(HIDDEN, dtype=np.float16)})
++    )
++    assert not request.effort_decision_pending
++    assert list(request.prompt_token_ids) == body + TAILS[2]
++    assert scheduler._effort["a"].level == 2
++    assert "no-vector" not in scheduler._effort_default_reason
 +
 +
 +def test_body_stops_at_a_cacheable_block_boundary_under_mamba_align():
@@ -6528,7 +6717,7 @@ index e48596cc02..a7c5a79322 100644
      # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
      # the durable boundary block of a producer's last-prompt-boundary partial
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 7895359227..e5f9848ce1 100644
+index 7895359227..e480bf4f76 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -8,6 +8,8 @@ from collections.abc import Iterable
@@ -6750,7 +6939,7 @@ index 7895359227..e5f9848ce1 100644
              scheduler_output.has_structured_output_requests |= (
                  request.use_structured_output and not request.is_prefill_chunk
              )
-@@ -1853,15 +1908,8 @@ class Scheduler(SchedulerInterface):
+@@ -1853,15 +1908,14 @@ class Scheduler(SchedulerInterface):
          outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
          spec_decoding_stats: SpecDecodingStats | None = None
  
@@ -6765,17 +6954,20 @@ index 7895359227..e5f9848ce1 100644
 -        effort_now_ms: float | None = None
 +        effort_prefill_states = model_runner_output.effort_prefill_states
 +        effort_requeued: set[Request] = set()
++        # Which requests' body rows *this* step computed. Async scheduling has
++        # already scheduled the step after a multi-chunk body - so the token
++        # counter is past the boundary - when the earlier chunk's vector-less
++        # output arrives, and resolving off that counter would spend the
++        # decision on it. Empty on almost every step.
++        effort_capture = scheduler_output.effort_prefill_capture
  
          failed_kv_load_req_ids = None
          if kv_connector_output and kv_connector_output.invalid_block_ids:
-@@ -1927,6 +1975,19 @@ class Scheduler(SchedulerInterface):
+@@ -1927,6 +1981,16 @@ class Scheduler(SchedulerInterface):
              if output_is_stale and request.drop_stale_output:
                  continue
  
-+            if (
-+                request.effort_decision_pending
-+                and request.num_computed_tokens >= request.effort_body_len
-+            ):
++            if request.effort_decision_pending and req_id in effort_capture:
 +                # v3: the body's last prefill row came back with this step, so
 +                # the starting rung is decided here and the chosen tail replaces
 +                # the rung-0 one (§13.3 step 4).
@@ -6788,7 +6980,7 @@ index 7895359227..e5f9848ce1 100644
              req_index = model_runner_output.req_id_to_index[req_id]
              generated_token_ids = (
                  sampled_token_ids[req_index] if sampled_token_ids else []
-@@ -1935,7 +1996,6 @@ class Scheduler(SchedulerInterface):
+@@ -1935,7 +1999,6 @@ class Scheduler(SchedulerInterface):
              scheduled_spec_token_ids = (
                  scheduler_output.scheduled_spec_decode_tokens.get(req_id)
              )
@@ -6796,7 +6988,7 @@ index 7895359227..e5f9848ce1 100644
              effort_num_draft: int | None = None
              effort_num_accepted: int | None = None
              if scheduled_spec_token_ids and (
-@@ -1945,7 +2005,6 @@ class Scheduler(SchedulerInterface):
+@@ -1945,7 +2008,6 @@ class Scheduler(SchedulerInterface):
                  num_sampled = self.num_sampled_tokens_per_step
                  num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                  num_rejected = num_draft_tokens - num_accepted
@@ -6804,7 +6996,7 @@ index 7895359227..e5f9848ce1 100644
                  effort_num_draft, effort_num_accepted = num_draft_tokens, num_accepted
                  if self.adaptive_draft:
                      self._update_accepted_ema(req_id=req_id, num_accepted=num_accepted)
-@@ -2004,16 +2063,11 @@ class Scheduler(SchedulerInterface):
+@@ -2004,16 +2066,11 @@ class Scheduler(SchedulerInterface):
  
              effort_state = self._effort.get(req_id) if self._effort else None
              if effort_state is not None and new_token_ids:
@@ -6825,7 +7017,7 @@ index 7895359227..e5f9848ce1 100644
                  )
              if effort_sink is not None:
                  effort_signal = effort_signals.get(req_id)
-@@ -2169,6 +2223,13 @@ class Scheduler(SchedulerInterface):
+@@ -2169,6 +2226,13 @@ class Scheduler(SchedulerInterface):
                  # Invariant: EngineCore returns no partial prefill outputs.
                  assert not prompt_logprobs_tensors
  
@@ -6839,7 +7031,7 @@ index 7895359227..e5f9848ce1 100644
          # Remove the stopped requests from the running and waiting queues.
          if stopped_running_reqs:
              self.running = remove_all(self.running, stopped_running_reqs)
-@@ -2560,78 +2621,58 @@ class Scheduler(SchedulerInterface):
+@@ -2560,78 +2624,58 @@ class Scheduler(SchedulerInterface):
              return
          cfg = reasoning_config.dynamic_effort
          assert cfg is not None
@@ -6959,7 +7151,7 @@ index 7895359227..e5f9848ce1 100644
          )
  
      def _maybe_add_effort_state(self, request: Request) -> None:
-@@ -2642,189 +2683,252 @@ class Scheduler(SchedulerInterface):
+@@ -2642,189 +2686,252 @@ class Scheduler(SchedulerInterface):
          if not isinstance(overrides, dict):
              return
          assert self._effort_cfg is not None
@@ -7127,7 +7319,13 @@ index 7895359227..e5f9848ce1 100644
 +                request.effort_body_len,
 +                "present" if vector is not None else "MISSING",
 +                memory.n_entries if memory is not None else -1,
-+            )
+             )
+-        self._effort_policy_age += 1
+-        # A fresh object per step: the same policy may still be in flight in an
+-        # already-scheduled SchedulerOutput under async scheduling.
+-        return replace(
+-            self._effort_policy,
+-            max_rung=cfg.max_rung_for_batch_size(batch_size),
 +        if memory is not None and vector is not None:
 +            self._effort_vectors[request.request_id] = np.asarray(
 +                vector, dtype=np.float32
@@ -7169,13 +7367,7 @@ index 7895359227..e5f9848ce1 100644
 +        if level == default_level:
 +            self._effort_default_reason[reason] = (
 +                self._effort_default_reason.get(reason, 0) + 1
-             )
--        self._effort_policy_age += 1
--        # A fresh object per step: the same policy may still be in flight in an
--        # already-scheduled SchedulerOutput under async scheduling.
--        return replace(
--            self._effort_policy,
--            max_rung=cfg.max_rung_for_batch_size(batch_size),
++            )
 +        if state is not None:
 +            state.level = level
 +        if level == default_level or not tails:
@@ -7716,3 +7908,23 @@ index 088bf24e44..ecc73221d8 100644
  
  
  class BatchReqState(NamedTuple):
+diff --git a/work/make-patch.sh b/work/make-patch.sh
+index 847dfc2062..6cb0d97071 100755
+--- a/work/make-patch.sh
++++ b/work/make-patch.sh
+@@ -1,9 +1,12 @@
+ #!/bin/sh
+-# Emit a venv patch (paths a/vllm/... b/vllm/...) from a lane worktree vs master.
+-# Usage: work/make-patch.sh <worktree> <out.patch>
++# Emit a venv patch (paths a/vllm/... b/vllm/...) from a lane worktree.
++# Usage: work/make-patch.sh <worktree> <out.patch> [base]
++# `base` defaults to the branch the venv wheel was built from, so re-running
++# reproduces the same patch. Patch artifacts are excluded from their own diff.
+ set -e
+ cd "$1"
++BASE=${3:-master}
+ git add -A
+-git diff --cached master -- . ':(exclude)*.so' > "$2"
++git diff --cached "$BASE" -- . ':(exclude)*.so' ':(exclude)serve-configs/patches/*.patch' > "$2"
+ git reset -q
+ echo "$(grep -c '^diff --git' "$2") files -> $2"

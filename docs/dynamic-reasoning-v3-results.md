@@ -280,6 +280,16 @@ _(filled in from the run)_
   touches `sampler.py`, `rejection_sampler.py`, `async_utils.py` and
   `model_runner.py` and was not worth doing between a benchmark and its rerun.
   It is the next thing on this branch.
+- **The 148 `no-vector` requests were a bug, and it is fixed.** A body wider
+  than one prefill chunk (boundary 3296 or more, i.e. every long prompt) had its
+  decision consumed by the *previous* chunk's output, which carries no vector,
+  because async scheduling had already advanced the token counter past the body
+  boundary before that output was processed. So the column above is the router
+  running on short prompts only; the long half of the traffic never took a
+  decision and never entered the memory. Root cause and fix:
+  `dynamic-reasoning.claude.md` §13.10 item 4. **The `dynamic-v3` numbers here
+  must be re-measured on the fixed build before they mean anything about long
+  prompts.**
 - **The placement grid is six prompts, one sample each.** It is enough to
   choose a placement, not to quote a coefficient.
 - **`split_min_fraction` still excludes short prompts.** With a 1648-token

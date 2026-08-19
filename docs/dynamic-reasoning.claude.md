@@ -867,6 +867,30 @@ Three corrections to §13.3, all found on the GPU:
    boundary covering at least that fraction of itself takes no decision and runs
    at `default_level` with a byte-identical prompt. With a 1648-token block that
    is prompts under about one block.
+4. **The vector belongs to a *step*, not to a token counter.** `update_from_output`
+   resolved the level for any held request whose `num_computed_tokens` had
+   reached the body boundary. Async scheduling schedules step N+1 before it
+   processes step N's output, so a body wider than one prefill chunk — with a
+   1648-token block, every prompt whose boundary is 3296 or more — already had
+   its counter at the boundary when the *earlier* chunk's output arrived. That
+   output captured nothing, the decision was spent against it with reason
+   `no-vector`, and the real vector, arriving one step later, was dropped on a
+   request that was no longer pending. It cost **148 of 479** requests in the
+   greedy `dynamic-v3` sweep (31%, held timeouts 0, preemptions 0): every long
+   prompt ran at `default_level`, and none of them entered the memory either,
+   which is why the memory warmed on short prompts only. The resolve is now
+   gated on the step's own `effort_prefill_capture` list — the only thing that
+   says the vector came back with *this* output. Regression:
+   `test_a_multi_chunk_body_is_decided_by_the_step_that_computed_it`.
+
+Verified on the box, 2026-08-19 (`/tmp/dflash2-arms/V3-fix.log`): 160 real
+VulcanBench agent turns replayed at `reasoning_effort: dynamic`, concurrency 12,
+cold prefix cache and cold memory. **`no-vector` 0 of 151 decisions, held
+timeouts 0**, and the first five traced bodies — 3 296, 11 536, 13 184, 32 960
+and 34 608 tokens, every one of them a multi-chunk prefill — all report `vector
+present`. On the same server before the fix the same trace only ever reported
+`vector present` for a 1 648-token (single-chunk) body, and the 128-entry
+histogram read `no-vector: 77` of 242.
 
 §13.5's open question is answered differently than it framed itself: the token
 cost of a higher level is now *entirely* the sentence, because there is no cap
