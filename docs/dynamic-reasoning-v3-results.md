@@ -20,7 +20,24 @@ This file records what that took, the placement measurement it rests on, the
 
 ## 1. Headline
 
-_(filled in from the run; see §5)_
+Greedy, cold memory, 22 of 23 tasks (one killed as a runaway, §5):
+
+| column | solved | mean functional | completion tokens | per request | reasoning p90 / p99 / max |
+|---|---:|---:|---:|---:|---:|
+| `dynamic` (v1, greedy, c=5) | 19/23 | 0.826 | 411 118 | — | — |
+| `dynamic-v2` (greedy, c=5) | 19/23 | **0.857** | 846 811 | 1 071 | 1 303 / 5 865 / 16 663 |
+| `dynamic-v3` (greedy, c=12) | 17/22 | 0.773 | 753 027 | 1 572 | 2 092 / 19 355 / **40 849** |
+
+**The router works and the uncapped greedy configuration does not.** The
+hidden-state level separates the traffic as designed — level 2 requests think
+3.7x as long as level 0 at the mean and 7x at p90 (§5) — but removing the cap
+under **greedy** decoding lets a think block run away: the median request thinks
+*less* than under `dynamic-v2` (28 vs 68 tokens) while the tail goes 2.5x
+further, and one task (`oss-chi-readfrom-tee-doublecount`) spent **254 066**
+completion tokens to solve what `dynamic` and `dynamic-v2` solved with 3 214 and
+2 971. That is the failure mode Qwen's model card names for greedy decoding, and
+with no cap nothing bounds it. §5b reruns the same build with the model's
+recommended thinking-mode sampling.
 
 ## 2. Where the effort sentence has to go (measured 2026-08-19)
 
@@ -146,7 +163,103 @@ are a separate, explicitly requested capability.
   requests got `default_level` (the `low` sentence, which is what `dynamic`
   rendered before v3) while filling it.
 
-## 5. The `dynamic-v3` column
+## 5. The `dynamic-v3` column (greedy)
+
+23 tasks launched, **22 completed**. `oss-aiohttp-upgrade-deferred` was killed
+while still running after 2h10m: 34 agent steps, 94 077 reasoning tokens
+accumulated, largest single think block 16 502 — a runaway, so it is recorded as
+**killed while running** rather than as a failure, and its trace-only directory
+is under `_discarded/dynamic-v3-greedy-killed/`. `dynamic` scored 0.00 on that
+task and `dynamic-v2` scored 1.00.
+
+| | `dynamic` | `dynamic-v2` | `dynamic-v3` |
+|---|---:|---:|---:|
+| solved | 19/23 | 19/23 | 17/22 |
+| mean functional | 0.826 | 0.857 | 0.773 |
+| completion tokens | 411 118 | 846 811 | 753 027 |
+| per request | — | 1 071 | 1 572 |
+| requests | — | 791 | 479 |
+| prompt tokens | 11 608 558 | 16 681 500 | 5 061 297 |
+
+Per task (functional / completion tokens / steps) is in §5c.
+
+**Levels chosen.** 479 requests: level 0 (the `low` sentence) 338, level 1
+(template `medium`, no sentence) 33, level 2 (the `xhigh` sentence) 108. **167**
+of them were decided by the memory; the rest ran at the default level because
+the memory was still cold (the first ~128 finished requests, by design), because
+the prompt had no usable seam (33 — under one KV block), or because no vector
+reached the scheduler (148, §7).
+
+Reasoning tokens by chosen level:
+
+| level | n | mean | p50 | p90 | max |
+|---|---:|---:|---:|---:|---:|
+| 0 (`low`) | 338 | 587 | 25 | 711 | 25 757 |
+| 1 (`medium`) | 33 | 302 | 41 | 665 | 4 649 |
+| 2 (`xhigh`) | 108 | **2 183** | 86 | **5 308** | 40 849 |
+
+That separation is the signal doing its job: the level-2 band thinks 3.7x longer
+at the mean and 7.5x at p90 than the level-0 band, on the same server, with the
+level chosen before either of them produced a token.
+
+## 5a. Reasoning length without a cap
+
+Per-request reasoning-token distribution, from the run traces (the `dynamic`
+column's traces predate the field):
+
+| run set | n | mean | p50 | p90 | p99 | max | >4k | >8k | >16k | >32k |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `dynamic-v2` (capped 1k/4k/16k + soft limit) | 791 | 546 | 68 | 1 303 | 5 865 | 16 663 | 13 | 2 | 1 | 0 |
+| `dynamic-v3` (no cap, greedy) | 479 | 927 | **28** | 2 092 | 19 355 | **40 849** | 28 | 13 | 6 | 1 |
+
+Read both halves. The **median falls** — most requests think less once the level
+is chosen for them — and the **tail triples**: p99 goes 5 865 -> 19 355 and the
+maximum is no longer the 16 384 cap but 40 849 tokens. `dynamic-v2`'s maximum
+*is* its cap; `dynamic-v3` has nothing to stop it.
+
+Qwen's model card warns that **greedy decoding can cause endless repetition**,
+and with no cap a looping think block is bounded only by `max_tokens` and the
+task timeout. That is the most likely explanation for both the runaway that was
+killed and the 254 066-token solve of `oss-chi-readfrom-tee-doublecount`. So
+`dynamic-v3` is measured twice on the same build: once greedy (above, like every
+other v3 column) and once with the model's recommended thinking-mode sampling
+(temperature 1.0, top_p 0.95, top_k 20, min_p 0, fixed seed) below.
+
+## 5c. Per task (greedy)
+
+functional score / completion tokens / agent steps.
+
+| task | `dynamic` | `dynamic-v2` | `dynamic-v3` |
+|---|---|---|---|
+| `oss-aiohttp-upgrade-deferred` | 0.00 / 52,102 / 236 | 1.00 / 135,366 / 472 | — (killed, runaway) |
+| `oss-chi-readfrom-tee-doublecount` | 1.00 / 3,214 / 70 | 1.00 / 2,971 / 58 | 1.00 / 254,066 / 78 |
+| `oss-cobra-noduplicateargs` | 1.00 / 1,405 / 60 | 1.00 / 1,793 / 52 | 1.00 / 1,626 / 60 |
+| `oss-flask-teardown-robust` | 1.00 / 15,480 / 162 | 1.00 / 7,601 / 98 | 0.00 / 20,080 / 48 |
+| `oss-hono-client-header-merge` | 1.00 / 10,337 / 80 | 1.00 / 10,558 / 72 | 1.00 / 22,142 / 124 |
+| `oss-hono-request-bytes` | 1.00 / 2,460 / 78 | 1.00 / 3,458 / 96 | 1.00 / 17,563 / 148 |
+| `oss-itertools-strip-prefix` | 1.00 / 21,584 / 296 | 0.00 / 28,484 / 300 | 0.00 / 52,567 / 88 |
+| `oss-jiff-date-day-lt1` | 1.00 / 4,751 / 136 | 1.00 / 2,219 / 60 | 1.00 / 3,053 / 76 |
+| `oss-jiff-signdur-panic` | 1.00 / 4,469 / 112 | 1.00 / 2,598 / 80 | 1.00 / 2,365 / 64 |
+| `oss-jiff-strftime-negpad` | 1.00 / 18,701 / 172 | 1.00 / 55,986 / 300 | 1.00 / 90,216 / 134 |
+| `oss-more-itertools-interleave-empty` | 1.00 / 1,486 / 50 | 1.00 / 1,554 / 54 | 1.00 / 1,615 / 54 |
+| `oss-networkx-leiden-communities` | 0.00 / 63,179 / 197 | 0.50 / 94,345 / 288 | 0.00 / 9,155 / 40 |
+| `oss-packaging-range-prerelease-policy` | 1.00 / 7,731 / 102 | 1.00 / 8,886 / 128 | 1.00 / 5,660 / 108 |
+| `oss-pennylane-trotter-fragmented` | 0.00 / 61,910 / 175 | 0.20 / 124,283 / 322 | 0.00 / 45,860 / 54 |
+| `oss-pflag-uintslice-hex` | 1.00 / 1,851 / 46 | 1.00 / 2,516 / 54 | 1.00 / 2,337 / 58 |
+| `oss-semver-inc-dotted-prerelease` | 1.00 / 16,768 / 78 | 1.00 / 14,716 / 108 | 1.00 / 30,493 / 74 |
+| `oss-semver-truncate` | 1.00 / 6,049 / 108 | 1.00 / 2,662 / 90 | 1.00 / 3,199 / 76 |
+| `oss-semver-xrange-order` | 1.00 / 9,949 / 108 | 1.00 / 6,857 / 98 | 1.00 / 48,037 / 138 |
+| `oss-sqlglot-canonicalize-internal-names` | 0.00 / 66,729 / 209 | 0.00 / 298,334 / 113 | 0.00 / 80,157 / 92 |
+| `oss-sqlglot-iso8601-nanos` | 1.00 / 13,601 / 202 | 1.00 / 8,335 / 138 | 1.00 / 27,515 / 240 |
+| `oss-sqlglot-qualify-lateral-star` | 1.00 / 15,128 / 188 | 1.00 / 17,883 / 190 | 1.00 / 24,572 / 218 |
+| `oss-zod-invert-codec` | 1.00 / 9,301 / 160 | 1.00 / 13,384 / 230 | 1.00 / 7,679 / 186 |
+| `oss-zod-proto-catchall` | 1.00 / 2,933 / 94 | 1.00 / 2,022 / 62 | 1.00 / 3,070 / 94 |
+
+`oss-chi-readfrom-tee-doublecount` is the runaway that still solved:
+254 066 completion tokens against 3 214 and 2 971 for the same task in the
+two earlier columns.
+
+## 5b. The `dynamic-v3-sampled` column
 
 _(filled in from the run)_
 
