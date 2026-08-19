@@ -1689,7 +1689,11 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
-        if self.parallel_config.use_ubatching:
+        if self.parallel_config.use_ubatching and (
+            self.model_config is None or self.model_config.is_moe
+        ):
+            # Dense models overlap TP all-reduces instead of all2all
+            # dispatch/combine, so they need no special all2all backend.
             a2a_backend = self.parallel_config.all2all_backend
             assert a2a_backend in [
                 "deepep_low_latency",

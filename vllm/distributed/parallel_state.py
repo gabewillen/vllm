@@ -686,6 +686,22 @@ class GroupCoordinator:
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        # Function-local import: vllm.v1.worker.ubatching imports
+        # forward_context, which imports this module.
+        from vllm.v1.worker.ubatching import (
+            dbo_overlap_tp_all_reduce,
+            dbo_yield_and_switch_from_comm_to_compute,
+            dbo_yield_and_switch_from_compute_to_comm,
+        )
+
+        if dbo_overlap_tp_all_reduce():
+            # Dual-batch overlap for dense TP: hand the compute stream to the
+            # other micro-batch while this one's all-reduce runs on the comm
+            # stream, then wait for it before continuing.
+            dbo_yield_and_switch_from_compute_to_comm()
+            output = self.device_communicator.all_reduce(input_)
+            dbo_yield_and_switch_from_comm_to_compute()
+            return output
         return self.device_communicator.all_reduce(input_)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:

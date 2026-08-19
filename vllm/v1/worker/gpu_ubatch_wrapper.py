@@ -26,7 +26,11 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.deep_gemm import set_num_sms as deep_gemm_set_num_sms
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.platform_utils import num_compute_units
-from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
+from vllm.v1.worker.ubatching import (
+    UBatchContext,
+    make_ubatch_contexts,
+    set_overlap_tp_all_reduce,
+)
 
 logger = init_logger(__name__)
 
@@ -121,6 +125,10 @@ class UBatchWrapper:
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
+        # Dense (non-MoE) models overlap the TP all-reduce itself under DBO.
+        set_overlap_tp_all_reduce(
+            vllm_config.model_config is not None and not vllm_config.model_config.is_moe
+        )
         self.comm_stream = torch.cuda.Stream(device=device)
         # Ubatch threads plus the main thread
         self.ready_barrier = threading.Barrier(
@@ -474,10 +482,13 @@ class UBatchWrapper:
 
         dp_metadata = forward_context.dp_metadata
 
-        # We shouldn't be here unless we are running with multiple DP ranks
-        assert dp_metadata is not None
-        ubatch_dp_metadata = []
+        # With a single DP rank there is no DP metadata to split; the
+        # micro-batches only overlap TP collectives with compute.
+        ubatch_dp_metadata: list[DPMetadata | None] = []
         for ubatch_slice in ubatch_slices:
+            if dp_metadata is None:
+                ubatch_dp_metadata.append(None)
+                continue
             dp_size = self.vllm_config.parallel_config.data_parallel_size
             ubatch_num_tokens_across_dp = torch.tensor(
                 [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32

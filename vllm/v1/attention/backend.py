@@ -537,6 +537,14 @@ class CommonAttentionMetadata:
     at the current decode run's last full-state write. write_pos counts from
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
 
+    mamba_state_seq_lens: torch.Tensor | None = None
+    """(batch_size,) sequence lengths that select the mamba/GDN state slot in
+    align mode. Set by micro-batch slicing when a request is split across
+    micro-batches: every slice must read/write the state block of the request's
+    last token this step (where the runner pre-copied the initial state), while
+    ``seq_lens`` stays the slice's true attention length. ``None`` means
+    ``seq_lens``."""
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
@@ -546,6 +554,13 @@ class CommonAttentionMetadata:
 
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]
+
+    @property
+    def state_seq_lens(self) -> torch.Tensor:
+        """Sequence lengths for mamba/GDN state-slot selection."""
+        if self.mamba_state_seq_lens is not None:
+            return self.mamba_state_seq_lens
+        return self.seq_lens
 
     def naive_query_lens(self) -> torch.Tensor:
         """Naive because it assumes that query ends where the next query starts."""
@@ -627,6 +642,9 @@ class CommonAttentionMetadata:
             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
+            mamba_state_seq_lens=self.mamba_state_seq_lens[:num_actual_reqs]
+            if self.mamba_state_seq_lens is not None
+            else None,
             _seq_lens_cpu=self._seq_lens_cpu[:num_actual_reqs]
             if self._seq_lens_cpu is not None
             else None,

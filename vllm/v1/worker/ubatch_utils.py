@@ -177,6 +177,9 @@ def _make_metadata_with_slice(
         query_start_loc[1:] -= tokens_skipped
         query_start_loc_cpu[1:] -= tokens_skipped
     seq_lens = attn_metadata.seq_lens[request_slice]
+    # State-carrying backends must use the request's full step length for
+    # slot selection in every slice (see CommonAttentionMetadata).
+    mamba_state_seq_lens = attn_metadata.state_seq_lens[request_slice]
     # Read raw fields to avoid triggering the deprecated D2H-syncing properties.
     seq_lens_cpu = (
         attn_metadata._seq_lens_cpu[request_slice]
@@ -193,6 +196,14 @@ def _make_metadata_with_slice(
         if attn_metadata._num_computed_tokens_cpu is not None
         else None
     )
+
+    if splits_first_request and num_computed_tokens_cpu is not None:
+        # The continuation has already "computed" the tokens of the earlier
+        # slice this step: state-carrying backends (mamba/GDN align mode) read
+        # their initial state from the block of the last computed token.
+        tokens_skipped = first_tok - start_locs[first_req]
+        num_computed_tokens_cpu = num_computed_tokens_cpu.clone()
+        num_computed_tokens_cpu[0] += tokens_skipped
 
     if splits_last_request:
         # NOTE: We use start_locs (the original query_start_loc_cpu) to calculate
@@ -243,6 +254,7 @@ def _make_metadata_with_slice(
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        mamba_state_seq_lens=mamba_state_seq_lens,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
     )

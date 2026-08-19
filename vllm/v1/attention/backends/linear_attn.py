@@ -71,7 +71,7 @@ class LinearAttentionMetadataBuilder(AttentionMetadataBuilder[LinearAttentionMet
 
         state_indices_tensor = mamba_get_block_table_tensor(
             common_attn_metadata.block_table_tensor,
-            common_attn_metadata.seq_lens,
+            common_attn_metadata.state_seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )[:, 0]
@@ -196,7 +196,7 @@ class BailingLinearAttentionMetadataBuilder(LinearAttentionMetadataBuilder):
 
         state_indices_tensor = mamba_get_block_table_tensor(
             common_attn_metadata.block_table_tensor,
-            common_attn_metadata.seq_lens,
+            common_attn_metadata.state_seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )

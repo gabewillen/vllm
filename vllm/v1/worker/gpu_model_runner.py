@@ -228,6 +228,7 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
+    is_last_ubatch_empty,
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
@@ -4124,7 +4125,18 @@ class GPUModelRunner(
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        if (
+            self.vllm_config.parallel_config.data_parallel_size == 1
+            and self.parallel_config.use_ubatching
+            and allow_microbatching
+        ):
+            # Single DP rank: decide microbatching locally (no cross-rank sync).
+            should_ubatch = check_ubatch_thresholds(
+                self.parallel_config, num_tokens, uniform_decode=uniform_decode
+            ) and not is_last_ubatch_empty(
+                num_tokens, num_tokens_padded, self.parallel_config.num_ubatches
+            )
+        elif self.vllm_config.parallel_config.data_parallel_size > 1:
             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,

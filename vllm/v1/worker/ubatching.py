@@ -147,8 +147,24 @@ class UBatchContext:
         self._wait_comm_done()
 
 
+# Whether TP all-reduces themselves are overlapped under DBO. Dense models
+# have no all2all to overlap, so their all-reduce is the collective that
+# yields to the other micro-batch; MoE models keep the upstream schedule.
+_OVERLAP_TP_ALL_REDUCE: bool = False
+
+
+def set_overlap_tp_all_reduce(enabled: bool) -> None:
+    global _OVERLAP_TP_ALL_REDUCE
+    _OVERLAP_TP_ALL_REDUCE = enabled
+
+
 def dbo_enabled() -> bool:
     return len(_THREAD_ID_TO_CONTEXT) > 0
+
+
+def dbo_overlap_tp_all_reduce() -> bool:
+    """True inside a micro-batch thread when TP all-reduces should yield."""
+    return _OVERLAP_TP_ALL_REDUCE and dbo_enabled()
 
 
 def dbo_current_ubatch_id() -> int:
