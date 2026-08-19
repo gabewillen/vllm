@@ -293,6 +293,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Samplers and decode_query_len created in load_model() after
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
+        # Thinking budget update acks not yet returned in a ModelRunnerOutput.
+        self.pending_thinking_budget_acks: dict[str, int] = {}
         self.rejection_sampler: RejectionSampler | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -908,6 +910,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        self.pending_thinking_budget_acks.pop(req_id, None)
         if self.pooling_runner is not None:
             self.pooling_runner.remove_request(req_idx)
         if self.pp_handler is not None:
@@ -999,7 +1002,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.apply_staged_writes()
             self.model_state.apply_staged_writes()
         if self.sampler is not None:
+            self.update_thinking_budgets(scheduler_output)
             self.sampler.apply_staged_writes()
+
+    def update_thinking_budgets(self, scheduler_output: SchedulerOutput) -> None:
+        updates = scheduler_output.thinking_budget_updates
+        if not updates:
+            return
+        assert self.sampler is not None
+        acks = self.sampler.thinking_budget_state.update_budgets(
+            updates, self.req_states.req_id_to_index
+        )
+        self.pending_thinking_budget_acks.update(acks)
+
+    def take_thinking_budget_acks(self) -> dict[str, int] | None:
+        if not self.pending_thinking_budget_acks:
+            return None
+        acks = self.pending_thinking_budget_acks
+        self.pending_thinking_budget_acks = {}
+        return acks
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
@@ -1756,6 +1777,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            thinking_budget_acks=self.take_thinking_budget_acks(),
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(

@@ -10,6 +10,7 @@ from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
+from vllm.config.reasoning import DynamicEffortConfig, ReasoningConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -32,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.sampling_params import RepetitionDetectionParams
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -39,6 +41,14 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.effort_controller import (
+    EffortEvent,
+    EffortState,
+    finish_effort,
+    new_effort_state,
+    resolve_marker_sequences,
+    step_effort,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -52,13 +62,18 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.utils import (
+    check_sequence_repetition,
+    check_stop,
+    remove_all,
+)
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.sample.effort_signals import EffortTelemetrySink
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -288,6 +303,23 @@ class Scheduler(SchedulerInterface):
             and self.num_spec_tokens > 1
         )
         self._accepted_ema: dict[str, float] = {}
+        # Dynamic reasoning effort: per-request controller state, pending
+        # (unacked) budget updates, and relaxed repetition params.
+        self._effort: dict[str, EffortState] = {}
+        self._effort_pending: dict[str, tuple[int, int]] = {}
+        self._effort_rep_params: dict[str, RepetitionDetectionParams] = {}
+        self._effort_cfg: DynamicEffortConfig | None = None
+        self._effort_start_ids: list[int] = []
+        self._effort_end_ids: list[int] = []
+        self._effort_marker_seqs: list[tuple[int, ...]] = []
+        reasoning_config = vllm_config.reasoning_config
+        if reasoning_config is not None and reasoning_config.dynamic_effort:
+            self._init_effort_controller(reasoning_config)
+        # Optional JSONL sink for per-step effort signals (VLLM_EFFORT_TELEMETRY).
+        self.effort_sink = EffortTelemetrySink.from_env(
+            reasoning_config.reasoning_start_token_ids if reasoning_config else None,
+            reasoning_config.reasoning_end_token_ids if reasoning_config else None,
+        )
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -1326,6 +1358,7 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            thinking_budget_updates=dict(self._effort_pending),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1782,6 +1815,8 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        effort_signals = model_runner_output.effort_signals
+        effort_sink = self.effort_sink if effort_signals else None
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -1795,6 +1830,11 @@ class Scheduler(SchedulerInterface):
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
+
+        effort_acks = model_runner_output.thinking_budget_acks
+        if effort_acks and self._effort:
+            self._ingest_effort_acks(effort_acks)
+        effort_now_ms: float | None = None
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
@@ -1868,6 +1908,9 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            effort_draft = effort_accepted = 0
+            effort_num_draft: int | None = None
+            effort_num_accepted: int | None = None
             if scheduled_spec_token_ids and (
                 generated_token_ids or self.num_sampled_tokens_per_step == 0
             ):
@@ -1875,6 +1918,8 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+                effort_draft, effort_accepted = num_draft_tokens, num_accepted
+                effort_num_draft, effort_num_accepted = num_draft_tokens, num_accepted
                 if self.adaptive_draft:
                     self._update_accepted_ema(req_id=req_id, num_accepted=num_accepted)
                 # Rejections roll back num_computed_tokens (and, under async
@@ -1929,6 +1974,32 @@ class Scheduler(SchedulerInterface):
                 # a consumed prompt also means every item in it was encoded.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            effort_state = self._effort.get(req_id) if self._effort else None
+            if effort_state is not None and new_token_ids:
+                if effort_state.deadline_ms is not None and effort_now_ms is None:
+                    effort_now_ms = time.monotonic() * 1000.0
+                self._step_effort(
+                    request,
+                    effort_state,
+                    new_token_ids,
+                    effort_signals.get(req_id) if effort_signals else None,
+                    num_draft_tokens=effort_draft,
+                    num_accepted_tokens=effort_accepted,
+                    now_ms=effort_now_ms,
+                )
+            if effort_sink is not None:
+                effort_signal = effort_signals.get(req_id)
+                if effort_signal is not None:
+                    effort_sink.record(
+                        req_id,
+                        request.output_token_ids,
+                        effort_signal,
+                        effort_num_draft,
+                        effort_num_accepted,
+                        stopped,
+                        prompt_token_ids=request.prompt_token_ids,
+                    )
 
             if new_token_ids and self.structured_output_manager.should_advance(
                 request, new_token_ids=new_token_ids
@@ -2009,12 +2080,15 @@ class Scheduler(SchedulerInterface):
                     )
 
             finish_reason = None
+            effort_report = None
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    if effort_state is not None:
+                        effort_report = finish_effort(effort_state)
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
@@ -2061,6 +2135,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        effort=effort_report,
                     )
                 )
             else:
@@ -2357,6 +2432,8 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if self._effort_cfg is not None:
+                self._maybe_add_effort_state(request)
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
@@ -2444,11 +2521,136 @@ class Scheduler(SchedulerInterface):
             alpha=self.vllm_config.speculative_config.adaptive_draft_ema_alpha,
         )
 
+    def _init_effort_controller(self, reasoning_config: ReasoningConfig) -> None:
+        """Resolve the token ids the dynamic-effort controller tracks."""
+        start_ids = reasoning_config.reasoning_start_token_ids
+        end_ids = reasoning_config.natural_reasoning_end_token_ids
+        if not start_ids or not end_ids:
+            logger.warning(
+                "dynamic_effort configured but reasoning token ids are not "
+                "initialized; the effort controller is disabled."
+            )
+            return
+        cfg = reasoning_config.dynamic_effort
+        assert cfg is not None
+        marker_seqs: list[tuple[int, ...]] = []
+        if cfg.backtrack_markers:
+            try:
+                from vllm.tokenizers import cached_tokenizer_from_config
+
+                tokenizer = cached_tokenizer_from_config(self.vllm_config.model_config)
+                marker_seqs = resolve_marker_sequences(
+                    cfg.backtrack_markers,
+                    lambda text: tokenizer.encode(text, add_special_tokens=False),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "dynamic_effort: could not tokenize backtrack markers (%s); "
+                    "marker density is disabled.",
+                    exc,
+                )
+        self._effort_cfg = cfg
+        self._effort_start_ids = list(start_ids)
+        self._effort_end_ids = list(end_ids)
+        self._effort_marker_seqs = marker_seqs
+
+    def _maybe_add_effort_state(self, request: Request) -> None:
+        params = request.sampling_params
+        if params is None or not params.extra_args:
+            return
+        overrides = params.extra_args.get("dynamic_effort")
+        if not isinstance(overrides, dict):
+            return
+        assert self._effort_cfg is not None
+        now_ms = (
+            time.monotonic() * 1000.0
+            if overrides.get("deadline_ms") is not None
+            else None
+        )
+        self._effort[request.request_id] = new_effort_state(
+            request.request_id,
+            self._effort_cfg,
+            overrides,
+            self._effort_start_ids,
+            self._effort_end_ids,
+            self._effort_marker_seqs,
+            request.prompt_token_ids,
+            request.max_tokens,
+            now_ms=now_ms,
+        )
+        rep = params.repetition_detection
+        if rep is not None and rep.max_pattern_size > 0 and rep.min_count > 2:
+            # Read-only early evidence: the stop's own pattern at one repeat
+            # fewer. check_stop keeps the terminal decision.
+            self._effort_rep_params[request.request_id] = RepetitionDetectionParams(
+                max_pattern_size=rep.max_pattern_size,
+                min_pattern_size=rep.min_pattern_size,
+                min_count=rep.min_count - 1,
+            )
+
+    def _ingest_effort_acks(self, acks: dict[str, int]) -> None:
+        for req_id, revision in acks.items():
+            state = self._effort.get(req_id)
+            if state is None:
+                continue
+            if revision > state.acked_revision:
+                state.acked_revision = revision
+            pending = self._effort_pending.get(req_id)
+            if pending is not None and pending[0] <= revision:
+                del self._effort_pending[req_id]
+
+    def _step_effort(
+        self,
+        request: Request,
+        state: EffortState,
+        new_token_ids: list[int],
+        signals: tuple[float, float, int] | None,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+        now_ms: float | None,
+    ) -> None:
+        assert self._effort_cfg is not None
+        rep_params = self._effort_rep_params.get(request.request_id)
+        event = EffortEvent(
+            new_token_ids=new_token_ids,
+            entropy=signals[0] if signals is not None else None,
+            margin=signals[1] if signals is not None else None,
+            n_rows=signals[2] if signals is not None else 0,
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            batch_size=len(self.running),
+            max_tokens=request.max_tokens,
+            now_ms=now_ms,
+            repetition_evidence=(
+                rep_params is not None
+                and check_sequence_repetition(request.output_token_ids, rep_params)
+            ),
+        )
+        decision = step_effort(state, self._effort_cfg, event)
+        if decision.budget_update is not None:
+            self._effort_pending[request.request_id] = decision.budget_update
+        if decision.checked or decision.stall_clamp or decision.late:
+            logger.debug(
+                "dynamic_effort %s: escalation=%s stall=%s late=%s update=%s %s",
+                request.request_id,
+                decision.escalation,
+                decision.stall_clamp,
+                decision.late,
+                decision.budget_update,
+                decision.vector,
+            )
+
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
         self._accepted_ema.pop(request.request_id, None)
+        if self._effort:
+            self._effort.pop(request.request_id, None)
+            self._effort_pending.pop(request.request_id, None)
+            self._effort_rep_params.pop(request.request_id, None)
+        if self.effort_sink is not None:
+            self.effort_sink.forget(request.request_id)
 
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)

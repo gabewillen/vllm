@@ -17,6 +17,7 @@ from vllm.v1.outputs import (
     PoolerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.sample.effort_signals import signals_to_dict
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.utils import raise_if_nan_logits
 
@@ -147,6 +148,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            self.effort_signals_np: np.ndarray | None = None
+            if sampler_output.effort_signals is not None:
+                self.effort_signals_np = async_copy_to_np(sampler_output.effort_signals)
             self.sampling_mask_tensors: SamplingMaskTensors | None = None
             if sampler_output.sampling_mask_tensors is not None:
                 self.sampling_mask_tensors = (
@@ -188,6 +192,13 @@ class AsyncOutput(AsyncModelRunnerOutput):
             )
             if envs.VLLM_RAISE_ON_LOGIT_NANS:
                 raise_if_nan_logits(self.model_runner_output.num_nans_in_logits)
+
+        if self.effort_signals_np is not None:
+            self.model_runner_output.effort_signals = signals_to_dict(
+                self.model_runner_output.req_ids,
+                self.effort_signals_np,
+                self.sampler_output.effort_flags,
+            )
 
         if self.logprobs_tensors is not None:
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()

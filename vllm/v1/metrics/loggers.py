@@ -791,6 +791,62 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         #
+        # Dynamic reasoning effort (labels are fixed enums; rung indices are
+        # bounded by the configured ladder length).
+        #
+        histogram_effort_final_rung = self._histogram_cls(
+            name="vllm:effort_final_rung",
+            documentation="Final ladder rung of dynamic-effort requests.",
+            buckets=[0, 1, 2, 3, 4, 5, 6, 7],
+            labelnames=labelnames,
+        )
+        self.histogram_effort_final_rung = create_metric_per_engine(
+            histogram_effort_final_rung, per_engine_labelvalues
+        )
+        histogram_reasoning_tokens = self._histogram_cls(
+            name="vllm:reasoning_tokens",
+            documentation="Reasoning tokens of dynamic-effort requests.",
+            buckets=build_1_2_5_buckets(max_model_len),
+            labelnames=labelnames,
+        )
+        self.histogram_reasoning_tokens = create_metric_per_engine(
+            histogram_reasoning_tokens, per_engine_labelvalues
+        )
+        counter_effort_escalations = self._counter_cls(
+            name="vllm:effort_escalations",
+            documentation="Dynamic-effort rung escalations by transition.",
+            labelnames=labelnames + ["from", "to"],
+        )
+        self.counter_effort_escalations = {
+            idx: {
+                r: counter_effort_escalations.labels(
+                    model_name, str(idx), str(r), str(r + 1)
+                )
+                for r in range(8)
+            }
+            for idx in engine_indexes
+        }
+        counter_effort_stall_clamps = self._counter_cls(
+            name="vllm:effort_stall_clamps",
+            documentation="Dynamic-effort requests clamped by the stall guard.",
+            labelnames=labelnames,
+        )
+        self.counter_effort_stall_clamps = create_metric_per_engine(
+            counter_effort_stall_clamps, per_engine_labelvalues
+        )
+        counter_effort_late = self._counter_cls(
+            name="vllm:effort_late",
+            documentation=(
+                "Dynamic-effort requests whose budget update was not applied "
+                "before the think block closed."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_effort_late = create_metric_per_engine(
+            counter_effort_late, per_engine_labelvalues
+        )
+
+        #
         # Histogram of timing intervals
         #
         histogram_time_to_first_token = self._histogram_cls(
@@ -1257,6 +1313,25 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+            if finished_request.effort is not None:
+                self._record_effort(engine_idx, finished_request.effort)
+
+    def _record_effort(self, engine_idx: int, effort: dict[str, int]) -> None:
+        rung = effort.get("rung", 0)
+        self.histogram_effort_final_rung[engine_idx].observe(rung)
+        self.histogram_reasoning_tokens[engine_idx].observe(
+            effort.get("reasoning_tokens", 0)
+        )
+        # Escalations climb one rung at a time, so the transitions are exactly
+        # (r, r + 1) for the last `escalations` rungs below the final one.
+        transitions = self.counter_effort_escalations[engine_idx]
+        for r in range(max(rung - effort.get("escalations", 0), 0), rung):
+            if r in transitions:
+                transitions[r].inc()
+        if effort.get("stall_clamps"):
+            self.counter_effort_stall_clamps[engine_idx].inc()
+        if effort.get("late"):
+            self.counter_effort_late[engine_idx].inc()
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1

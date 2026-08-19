@@ -13,7 +13,14 @@ import torch.nn as nn
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
+from vllm.v1.sample.effort_signals import (
+    commit_order_permutation,
+    effort_row_signals_scattered,
+    flagged_row_indices,
+    reduce_committed,
+)
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
@@ -73,6 +80,9 @@ class RejectionSampler(nn.Module):
             "raw_logits",
             "processed_logits",
         )
+        # [num_draft_total, 2] target-row effort signals of the last
+        # ``apply_logits_processors`` call; None when no request opted in.
+        self._effort_target_rows: torch.Tensor | None = None
 
         self.synthetic_conditional_rates: torch.Tensor | None = None
         if (
@@ -161,6 +171,7 @@ class RejectionSampler(nn.Module):
         target_logits = self.apply_logits_processors(
             target_logits, sampling_metadata, metadata
         )
+        effort_target_rows, self._effort_target_rows = self._effort_target_rows, None
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `apply_sampling_constraints` function.
@@ -195,10 +206,51 @@ class RejectionSampler(nn.Module):
                 output_token_ids,
             )
 
+        effort_signals = None
+        if effort_target_rows is not None:
+            assert bonus_sampler_output.effort_signals is not None
+            effort_signals = self._reduce_effort_signals(
+                effort_target_rows,
+                bonus_sampler_output.effort_signals[:, :2],
+                metadata.num_draft_tokens,
+                output_token_ids,
+            )
+
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+            effort_signals=effort_signals,
+            effort_flags=sampling_metadata.effort_mask,
         )
+
+    @staticmethod
+    def _reduce_effort_signals(
+        target_rows: torch.Tensor,
+        bonus_rows: torch.Tensor,
+        num_draft_tokens: list[int],
+        output_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-request means over committed rows (accepted drafts + bonus).
+
+        Args:
+            target_rows: ``[num_draft_total, 2]`` target-row signals.
+            bonus_rows: ``[num_reqs, 2]`` bonus-row signals.
+            num_draft_tokens: per-request draft counts.
+            output_token_ids: ``[num_reqs, max_spec_len + 1]`` sampled ids;
+                rejected positions hold ``PLACEHOLDER_TOKEN_ID``.
+
+        Returns:
+            ``[num_reqs, 3]`` (mean entropy, mean margin, n committed rows).
+        """
+        device = target_rows.device
+        perm = async_tensor_h2d(commit_order_permutation(num_draft_tokens), device)
+        rows = torch.cat((target_rows, bonus_rows), dim=0)[perm]
+        counts = torch.tensor(num_draft_tokens, dtype=torch.int64) + 1
+        cu_num_rows = torch.zeros(len(num_draft_tokens) + 1, dtype=torch.int64)
+        torch.cumsum(counts, dim=0, out=cu_num_rows[1:])
+        cu_num_rows = async_tensor_h2d(cu_num_rows, device)
+        num_committed = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum(dim=-1)
+        return reduce_committed(rows, cu_num_rows, num_committed)
 
     def _get_logprobs_tensors(
         self,
@@ -336,6 +388,15 @@ class RejectionSampler(nn.Module):
                 logits = processor.apply_with_spec_decode(
                     logits, metadata.num_draft_tokens
                 )
+        # Canonical effort-telemetry stage for the target rows: after penalties
+        # and bad words, before the thinking-budget force and temperature.
+        effort_mask = sampling_metadata.effort_mask
+        self._effort_target_rows = None
+        if effort_mask is not None:
+            rows = flagged_row_indices(effort_mask, metadata.num_draft_tokens)
+            self._effort_target_rows = effort_row_signals_scattered(
+                logits, async_tensor_h2d(rows, device=logits.device)
+            )
         holder = sampling_metadata.thinking_budget_state_holder
         if holder is not None and holder.has_tracked_requests():
             logits = holder.apply_to_logits(

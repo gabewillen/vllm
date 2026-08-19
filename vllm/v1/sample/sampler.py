@@ -7,8 +7,12 @@ import torch.nn as nn
 
 from vllm.config.model import LogprobsMode
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
-from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+from vllm.v1.sample.effort_signals import (
+    effort_row_signals_scattered,
+    flagged_row_indices,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
@@ -69,6 +73,9 @@ class Sampler(nn.Module):
         self.pin_memory = PIN_MEMORY
         self.logprobs_mode = logprobs_mode
         self.use_fp64_gumbel = use_fp64_gumbel
+        # [num_reqs, 2] canonical-stage effort signals of the last
+        # ``apply_logits_processors`` call; None when no request opted in.
+        self._effort_rows: torch.Tensor | None = None
 
     def forward(
         self,
@@ -99,6 +106,7 @@ class Sampler(nn.Module):
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
         )
+        effort_rows, self._effort_rows = self._effort_rows, None
         # Sample the next token.
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
         if processed_logprobs is not None:
@@ -139,6 +147,15 @@ class Sampler(nn.Module):
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
 
+        effort_signals = None
+        if effort_rows is not None:
+            # One committed row per request; flagged rows count 1, others 0.
+            n_rows = async_tensor_h2d(
+                sampling_metadata.effort_mask.astype("float32"),
+                device=effort_rows.device,
+            )
+            effort_signals = torch.cat((effort_rows, n_rows[:, None]), dim=-1)
+
         # These are GPU tensors.
         sampler_output = SamplerOutput(
             # The sampled tokens are expanded to 2D tensor with shape
@@ -146,6 +163,8 @@ class Sampler(nn.Module):
             # token per request.
             sampled_token_ids=sampled.unsqueeze(-1),
             logprobs_tensors=logprobs_tensors,
+            effort_signals=effort_signals,
+            effort_flags=sampling_metadata.effort_mask,
         )
         return sampler_output
 
@@ -403,6 +422,15 @@ class Sampler(nn.Module):
 
         # Apply penalties (e.g., freq_penalties).
         logits = self.apply_penalties(logits, sampling_metadata, output_token_ids)
+        # Canonical effort-telemetry stage: after penalties, before the
+        # thinking-budget force and temperature (one row per request here).
+        effort_mask = sampling_metadata.effort_mask
+        self._effort_rows = None
+        if effort_mask is not None:
+            rows = flagged_row_indices(effort_mask)
+            self._effort_rows = effort_row_signals_scattered(
+                logits, async_tensor_h2d(rows, device=logits.device)
+            )
         holder = sampling_metadata.thinking_budget_state_holder
         if holder is not None and holder.has_tracked_requests():
             # Committed outputs only; spec drafts live in ``spec_token_ids``.

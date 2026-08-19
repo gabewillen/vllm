@@ -111,6 +111,23 @@ class ThinkingBudgetStateHolder:
                 if state is not None:
                     self._state[i2] = state
 
+    def update_budget(self, index: int, revision: int, budget: int) -> bool:
+        """Apply a versioned budget update to a tracked request.
+
+        Only strictly increasing revisions are applied. The remaining-budget
+        countdown is shifted by the budget delta; a request already forcing
+        the end sequence keeps forcing (the update landed late).
+        """
+        state = self._state.get(index)
+        if state is None or revision <= state["budget_revision"]:
+            return False
+        state["budget_revision"] = revision
+        budget = max(budget, 0)
+        delta = budget - state["thinking_token_budget"]
+        state["thinking_token_budget"] = budget
+        state["check_count_down"] += delta
+        return True
+
     def update_state(
         self,
         output_token_ids: list[list[int]],
@@ -216,6 +233,7 @@ class ThinkingBudgetStateHolder:
             "prompt_tok_ids": prompt_tok_ids,
             "output_tok_ids": [],
             "thinking_token_budget": thinking_token_budget,
+            "budget_revision": -1,
             "prev_output_length": 0,
             "spec_token_ids": [],
             "force_index": [],

@@ -18,6 +18,7 @@ from vllm.utils.collection_utils import swap_dict_values
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+from vllm.v1.sample.effort_signals import wants_effort_signals
 from vllm.v1.sample.logits_processor import (
     BatchUpdateBuilder,
     LogitsProcessors,
@@ -117,6 +118,8 @@ class InputBatch:
             PIN_MEMORY,
         )
         self.thinking_token_budget_reqs: set[str] = set()
+        # Requests that opted into effort telemetry (entropy / margin).
+        self.effort_telemetry_reqs: set[str] = set()
         self.is_pooling_model = is_pooling_model
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
@@ -470,6 +473,9 @@ class InputBatch:
                 self.bad_words_token_ids[req_index] = (
                     sampling_params.bad_words_token_ids
                 )
+
+            if wants_effort_signals(sampling_params):
+                self.effort_telemetry_reqs.add(req_id)
         elif pooling_params := request.pooling_params:
             pooling_states = request.pooling_states
             assert pooling_states is not None
@@ -581,6 +587,7 @@ class InputBatch:
             self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
         self.bad_words_token_ids.pop(req_index, None)
         self.thinking_token_budget_reqs.discard(req_id)
+        self.effort_telemetry_reqs.discard(req_id)
         return req_index
 
     def swap_states(self, i1: int, i2: int) -> None:
@@ -940,6 +947,17 @@ class InputBatch:
                     req_index = self.req_id_to_index[req_id]
                     logprob_token_ids_by_index[req_index] = token_ids
 
+        effort_mask: np.ndarray | None = None
+        if self.effort_telemetry_reqs:
+            effort_mask = np.fromiter(
+                (
+                    req_id in self.effort_telemetry_reqs
+                    for req_id in self.req_ids[:num_reqs]
+                ),
+                dtype=bool,
+                count=num_reqs,
+            )
+
         return SamplingMetadata(
             temperature=temperature,
             all_greedy=self.all_greedy,
@@ -960,6 +978,7 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
+            effort_mask=effort_mask,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:
@@ -1138,6 +1157,23 @@ class InputBatch:
             and len(self.frequency_penalties_reqs) == 0
             and len(self.repetition_penalties_reqs) == 0
         )
+
+    def update_thinking_budgets(
+        self, updates: dict[str, tuple[int, int]]
+    ) -> dict[str, int]:
+        """Apply versioned thinking budget updates; return req_id -> revision.
+
+        Must run after ``refresh_metadata`` so holder indices match the batch.
+        """
+        holder = self.thinking_budget_state_holder
+        if holder is None or not updates:
+            return {}
+        acks: dict[str, int] = {}
+        for req_id, (revision, budget) in updates.items():
+            index = self.req_id_to_index.get(req_id)
+            if index is not None and holder.update_budget(index, revision, budget):
+                acks[req_id] = revision
+        return acks
 
     @property
     def no_thinking_budget(self) -> bool:

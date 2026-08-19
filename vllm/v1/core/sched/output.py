@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -258,6 +258,9 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
+    # req_id -> (revision, absolute thinking budget) for dynamic effort.
+    thinking_budget_updates: dict[str, tuple[int, int]] = field(default_factory=dict)
+
     # Producer partial-tail offload hand-off for external KV connectors:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
     # the durable boundary block of a producer's last-prompt-boundary partial
@@ -267,6 +270,13 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # req_id -> (revision, absolute thinking token budget). Applied by the
+    # model runner before this step's sampling for strictly increasing
+    # revisions only; acked via ModelRunnerOutput.thinking_budget_acks.
+    thinking_budget_updates: dict[str, tuple[int, int]] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
