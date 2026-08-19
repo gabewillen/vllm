@@ -7549,18 +7549,6 @@ index 0b969c991d..6ef8ae463a 100644
          # Block-aligned token position of a proven shared prefix worth pinning
          # in the (sparse) prefix cache; 0 means none. Set at admission for
          # hybrid/Mamba models when a shared prefix is detected (Marconi-style).
-diff --git a/vllm/v1/spec_decode/draft_lm_head.py b/vllm/v1/spec_decode/draft_lm_head.py
-index d734743903..14e722ba5b 100644
---- a/vllm/v1/spec_decode/draft_lm_head.py
-+++ b/vllm/v1/spec_decode/draft_lm_head.py
-@@ -11,6 +11,7 @@ verifies with its unquantized head, so the output distribution is unchanged.
- 
- import torch
- import torch.nn as nn
-+
- from vllm import _custom_ops as ops
- from vllm.logger import init_logger
- from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
 index 9cd8d4b228..db43db9f2e 100644
 --- a/vllm/v1/worker/gpu/async_utils.py
