@@ -2804,9 +2804,16 @@ class Scheduler(SchedulerInterface):
                 and isinstance(body_len, int)
                 and 0 < body_len < request.num_prompt_tokens
             ):
-                request.effort_body_len = body_len
-                request.effort_tail_variants = [list(t) for t in tails]
-                request.effort_decision_pending = True
+                boundary = self._effort_body_boundary(request, body_len)
+                if boundary:
+                    assert request.prompt_token_ids is not None
+                    # Tokens between the boundary and the frontend's seam are
+                    # the same in every variant, so they ride at the head of
+                    # every tail.
+                    middle = list(request.prompt_token_ids[boundary:body_len])
+                    request.effort_body_len = boundary
+                    request.effort_tail_variants = [middle + list(t) for t in tails]
+                    request.effort_decision_pending = True
         # A deadline needs a clock, which the worker does not have; those
         # requests keep the scheduler-side decision.
         if self._effort_worker_eval and state.deadline_ms is None:
@@ -2965,6 +2972,28 @@ class Scheduler(SchedulerInterface):
                 dict(sorted(self._effort_start_rung_total.items())),
                 dict(sorted(self._effort_decision_skipped.items())),
             )
+
+    def _effort_body_boundary(self, request: Request, body_len: int) -> int:
+        """Where the body prefill may stop, or 0 when it may not stop at all.
+
+        The frontend's seam is the last token of the prompt body, but a Mamba
+        "align" deployment may only end a non-final prefill chunk on a block
+        boundary whose state is cacheable - so there the body stops at the last
+        such boundary at or before the seam, and the vector is the hidden state
+        of that token instead. A prompt with no usable boundary keeps today's
+        single-phase path.
+        """
+        if not self.need_mamba_block_aligned_split:
+            return body_len
+        block = self.block_size
+        # Mirrors _mamba_block_aligned_split: with an eagle-family drafter the
+        # last matching block is pruned, so the last cacheable state sits one
+        # block earlier.
+        last_cacheable = request.num_tokens - request.num_tokens % block
+        if self.use_eagle:
+            last_cacheable = max(last_cacheable - block, 0)
+        aligned = min(body_len, last_cacheable) // block * block
+        return aligned if aligned >= block else 0
 
     def _observe_effort_signals(
         self, signals: dict[str, tuple[float, float, float, int]]

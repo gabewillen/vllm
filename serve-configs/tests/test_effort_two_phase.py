@@ -98,7 +98,7 @@ def _block_hasher():
     return get_request_block_hasher(BLOCK, sha256)
 
 
-def _add(scheduler, req_id: str, seed: int = 7) -> Request:
+def _add(scheduler, req_id: str, seed: int = 7, body_len: int = BODY) -> Request:
     params = SamplingParams(
         max_tokens=60000,
         extra_args={
@@ -107,7 +107,7 @@ def _add(scheduler, req_id: str, seed: int = 7) -> Request:
                 "theta": [0.0, 0.5],
                 "bias": 0.0,
                 "deadline_ms": None,
-                "body_len": BODY,
+                "body_len": body_len,
                 "tails": TAILS,
             }
         },
@@ -359,3 +359,52 @@ def test_split_survives_async_scheduling(async_scheduling):
     )
     assert list(request.prompt_token_ids)[BODY:] == TAILS[2]
     assert request.num_output_placeholders == 0
+
+
+def test_body_stops_at_a_cacheable_block_boundary_under_mamba_align():
+    """Qwen3.5 is hybrid, and "align" mode only caches SSM state on a block
+    boundary, so a body whose seam is mid-block would deadlock the scheduler:
+    the aligned chunk shrinks to zero and the request is never admitted.
+
+    The scheduler therefore stops the body at the last cacheable boundary at or
+    before the frontend's seam, and the tokens in between ride at the head of
+    every tail - they are the same in every variant.
+    """
+    scheduler = _scheduler(q_mid=0.0, q_high=0.0)
+    _fill_memory(scheduler)
+    # The test scheduler builds a full-attention KV spec; the served profile is
+    # hybrid GDN with an MTP drafter, which is what sets these two.
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler.use_eagle = True
+
+    seam = 90  # not a multiple of the 16-token block
+    request = _add(scheduler, "a", body_len=seam)
+    prompt = list(request.prompt_token_ids)
+    boundary = request.effort_body_len
+    assert boundary % BLOCK == 0 and boundary <= seam
+    # One block back from the last full block of the prompt, because an
+    # eagle-family drafter prunes the last matching block.
+    assert boundary == min(seam, len(prompt) - len(prompt) % BLOCK - BLOCK)
+    for tail, variant in zip(request.effort_tail_variants, TAILS):
+        assert tail == prompt[boundary:seam] + variant
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["a"] == boundary
+    assert output.effort_prefill_capture == ["a"]
+    scheduler.update_from_output(
+        output, _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)})
+    )
+    assert list(request.prompt_token_ids) == prompt[:seam] + TAILS[2]
+    # And the rest of the prompt still prefills.
+    assert scheduler.schedule().num_scheduled_tokens["a"] == (seam - boundary) + len(
+        TAILS[2]
+    )
+
+
+def test_a_prompt_with_no_cacheable_boundary_keeps_the_single_phase_path():
+    scheduler = _scheduler()
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler.use_eagle = True
+    request = _add(scheduler, "a", body_len=8)
+    assert not request.effort_decision_pending
+    assert scheduler.schedule().effort_prefill_capture == []
