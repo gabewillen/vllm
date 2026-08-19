@@ -273,6 +273,11 @@ class SchedulerOutput:
     # token-level detector stays in the scheduler).
     effort_vetoes: list[str] = field(default_factory=list)
 
+    # Requests whose dynamic-effort *body* prefill completes in this step, so
+    # the worker returns the last prefill row for the starting-rung decision
+    # (docs/dynamic-reasoning.claude.md §13.3).
+    effort_prefill_capture: list[str] = field(default_factory=list)
+
     # Producer partial-tail offload hand-off for external KV connectors:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
     # the durable boundary block of a producer's last-prompt-boundary partial

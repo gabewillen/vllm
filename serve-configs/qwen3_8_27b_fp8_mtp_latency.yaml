@@ -132,7 +132,25 @@ reasoning-parser: qwen3
 # DEPRECATED, kept for rule="rank"/"score" / evaluation="scheduler" only:
 # calibration {entropy: [0.043, 0.046], margin: [5.9, 4.5]} (13.6k decode steps,
 # 2026-08-18), theta [0, 0.5, 1.0] and grace_tokens 256.
-reasoning-config: '{"dynamic_effort": {"quantile_path": "/data/effort-sketches/qwen38-latency.json"}}'
+#
+# v3 (P8, venv patch 0012, docs/dynamic-reasoning.claude.md §13): the *starting*
+# rung stops being fixed at 0. The prompt is split at the effort sentence into a
+# rung-independent body and one tail per rung; the body prefills alone, its last
+# row - the vector lm_head consumes, computed anyway - is matched by cosine
+# against an online memory of this server's own finished requests (key = pooled
+# state, value = the reasoning tokens that request spent at a natural close),
+# and an asymmetric quantile map picks the tail. Nothing is trained and there is
+# no offline corpus: hidden_effort.enabled=false, an empty memory, or a missing
+# vector all render rung 0 with a byte-identical prompt, which is the pre-v3
+# behaviour. The map raises freely and lowers only when both confidence gates
+# agree (novelty: the memory has nothing similar; spread: the neighbours
+# disagree), because one under-routed step can kill a trajectory while
+# over-routing only costs tokens. Cost: one extra engine step per dynamic
+# request, and the body is byte-identical across rungs so the prefix cache holds
+# one body per conversation instead of one per (conversation, rung).
+# Measured basis: docs/effort-hidden-probe.md (kNN-16 label-free, AUC 0.850
+# out-of-fold vs 0.729 for prompt length and ~chance for entropy/margin).
+reasoning-config: '{"dynamic_effort": {"quantile_path": "/data/effort-sketches/qwen38-latency.json", "hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B

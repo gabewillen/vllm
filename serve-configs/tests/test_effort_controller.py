@@ -512,6 +512,7 @@ def test_late_detection_and_ack():
     assert st.reasoning_tokens == 76
     assert finish_effort(st) == {
         "rung": 1,
+        "start_rung": 0,
         "escalations": 1,
         "reasoning_tokens": 76,
         "late": 1,
@@ -602,6 +603,7 @@ def test_effort_report_shape():
     rep = finish_effort(st)
     assert set(rep) == {
         "rung",
+        "start_rung",
         "escalations",
         "reasoning_tokens",
         "late",
@@ -634,6 +636,10 @@ def _bare_scheduler(cfg):
     sched._effort_policy_age = 0
     sched._effort_worker_eval = False
     sched._effort_worker_reqs = set()
+    sched._effort_memory = None
+    sched._effort_vectors = {}
+    sched._effort_start_rung_total = {}
+    sched._effort_decision_skipped = {}
     sched.running = []
     return sched
 

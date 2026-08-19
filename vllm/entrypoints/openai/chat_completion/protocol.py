@@ -608,6 +608,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
     _dynamic_effort: dict[str, Any] | None = PrivateAttr(default=None)
     """Validated dynamic-effort overrides; set only by `apply_dynamic_effort`."""
+    _dynamic_effort_variant_messages: list[Any] | None = PrivateAttr(default=None)
+    """One message list per rung, each carrying that rung's tail sentence; set
+    by `apply_dynamic_effort` when `hidden_effort` is on. The serving layer
+    renders each of them to find the shared body (§13.3)."""
 
     def build_chat_params(
         self,

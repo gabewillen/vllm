@@ -64,6 +64,83 @@ class SoftLimitConfig:
             raise ValueError("soft_limit.max_bias and curve must be finite")
 
 
+QWEN_HIGH_EFFORT_SENTENCE = (
+    "Reasoning effort is set to high. Think this through carefully and "
+    "completely before answering, checking your work as you go."
+)
+
+
+@config
+class HiddenEffortConfig:
+    """Prefill hidden-state routing of the *starting* rung (§13).
+
+    The last prompt token's final hidden state - the vector `lm_head` consumes,
+    produced by the prefill that was going to happen anyway - is matched against
+    an online memory of the server's own finished requests, keyed by cosine and
+    valued by the reasoning tokens each of them actually spent. Nothing is
+    fitted; the cuts are percentile ranks of running digests.
+
+    Off by default: a deployment that does not set this keeps the pre-v3
+    behaviour, where every dynamic request starts at rung 0.
+    """
+
+    enabled: bool = False
+    """Split the prompt at the effort sentence and choose the starting rung
+    from the body's pooled hidden state."""
+    shadow: bool = False
+    """Compute and log the decision but always start at rung 0 (§13.8 step 1).
+    The memory still fills, so a shadow day warms it for free."""
+    memory_size: int = Field(default=4096, ge=16)
+    """Entries in the ring. 512 already reach the measured AUC of 2048, so
+    4096 is headroom; it costs `memory_size * hidden_size * 4` bytes of host
+    RAM (84 MB at 4096 x 5120) and half that on disk."""
+    min_entries: int = Field(default=128, ge=1)
+    """Entries the memory needs before it may decide. Below this the request
+    is rendered at rung 0 exactly as before, and the query result - which is
+    still computed once there are `k` entries - only warms the digests."""
+    k: int = Field(default=16, ge=1)
+    """Neighbours the value estimate averages over."""
+    temperature: float = Field(default=0.05, gt=0.0)
+    """Softmax temperature on cosine similarity in the neighbour weights."""
+    q_mid: float = Field(default=0.35, ge=0.0, le=1.0)
+    """Estimate rank at or above which the request starts at rung 1."""
+    q_high: float = Field(default=0.60, ge=0.0, le=1.0)
+    """Estimate rank at or above which it starts at rung 2."""
+    novelty_gate_q: float = Field(default=0.60, ge=0.0, le=1.0)
+    """Novelty rank the *downward* band requires: above it the memory has
+    nothing similar, so it cannot be trusted to say "easy"."""
+    spread_gate_q: float = Field(default=0.60, ge=0.0, le=1.0)
+    """Neighbour-disagreement rank the downward band requires."""
+    digest_compression: float = Field(default=100.0, ge=10.0)
+    """t-digest compression of the estimate / novelty / spread digests."""
+    memory_path: str | None = None
+    """`.npz` the memory is persisted to and warmed from. `None` keeps it in
+    memory, so a restart starts cold."""
+    flush_every: int = Field(default=256, ge=0)
+    """Inserts between two writes of `memory_path`; 0 disables."""
+    effort_sentences: list[str] | None = None
+    """One prompt sentence per rung, appended to the *tail* of the last user
+    turn. `None` uses `[low, "", high]` padded to the ladder with `""`
+    (the template's own `medium` rendering). The body before the sentence is
+    byte-identical across rungs, so one body per conversation is cached."""
+
+    def __post_init__(self) -> None:
+        if self.q_high < self.q_mid:
+            raise ValueError("hidden_effort.q_high must be >= q_mid")
+        if self.k > self.memory_size:
+            raise ValueError("hidden_effort.k must not exceed memory_size")
+
+    def sentences_for(self, ladder_len: int) -> list[str]:
+        """The per-rung tail sentences, padded/truncated to the ladder."""
+        if self.effort_sentences is not None:
+            base = list(self.effort_sentences)
+        else:
+            base = [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_HIGH_EFFORT_SENTENCE]
+        if len(base) < ladder_len:
+            base += [base[-1] if base else ""] * (ladder_len - len(base))
+        return base[:ladder_len]
+
+
 @config
 class DynamicEffortConfig:
     """Server defaults for `reasoning_effort: "dynamic"`.
@@ -101,6 +178,9 @@ class DynamicEffortConfig:
     """Ramped close at the cap instead of a hard cut; see `SoftLimitConfig`.
     Honoured by both actuators and by static `thinking_token_budget`
     requests."""
+    hidden_effort: HiddenEffortConfig = field(default_factory=HiddenEffortConfig)
+    """Prefill hidden-state routing of the starting rung; see
+    `HiddenEffortConfig`. Off by default."""
     evaluation: str = "worker"
     """Where the escalation rule runs. `worker` (default) evaluates it in the
     V2 sampler next to the cap actuator, so a decision can never arrive late;

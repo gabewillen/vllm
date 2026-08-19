@@ -367,6 +367,12 @@ class ModelRunnerOutput:
     # evaluated where the cap is applied.
     effort_reports: dict[str, tuple[int, int, int, int]] | None = None
 
+    # req_id -> the last prefill row of that request's dynamic-effort *body*
+    # (fp16 ``[hidden_size]`` numpy), for the requests the scheduler asked to
+    # capture this step. ``None`` unless ``hidden_effort`` is on and a request
+    # is awaiting its starting-rung decision.
+    effort_prefill_states: dict[str, np.ndarray] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

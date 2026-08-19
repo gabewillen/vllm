@@ -1,0 +1,361 @@
+# SPDX-License-Identifier: Apache-2.0
+"""End-to-end scheduler tests for the v3 two-phase prefill decision (§13.3).
+
+These run a real `Scheduler` on the served model's own config (no GPU, no
+weights): the prompt is split at the effort-sentence seam, the body prefills
+alone, the last body row comes back as a pooled hidden state, and the chosen
+rung's tail replaces the rung-0 one before generation starts.
+
+Every failure mode has to land on today's behaviour with a byte-identical
+prompt, because that is what makes the split safe to ship.
+"""
+
+import numpy as np
+import pytest
+
+from vllm.config.reasoning import DynamicEffortConfig, HiddenEffortConfig
+from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+    split_body_and_tails,
+)
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.effort_memory import EffortMemory
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import Request, RequestStatus
+
+MODEL = "Qwen/Qwen3.8-27B-FP8"
+HIDDEN = 5120
+BLOCK = 16
+LADDER = [1024, 4096, 16384]
+START, END = 151667, 151668
+BODY = 96
+TAILS = [[10, 11, 12, 13], [20, 21], [30, 31, 32, 33, 34, 35]]
+
+
+def _scheduler(**hidden_kw):
+    from tests.v1.core.utils import create_scheduler
+
+    scheduler = create_scheduler(
+        model=MODEL,
+        enable_prefix_caching=True,
+        block_size=BLOCK,
+        max_num_batched_tokens=2048,
+        max_model_len=2048,
+        use_v2_model_runner=True,
+    )
+    kwargs = dict(enabled=True, memory_size=128, min_entries=4, k=4, flush_every=0)
+    kwargs.update(hidden_kw)
+    hidden = HiddenEffortConfig(**kwargs)
+    cfg = DynamicEffortConfig(ladder=LADDER, hidden_effort=hidden)
+    scheduler._effort_cfg = cfg
+    scheduler._effort_start_ids = [START]
+    scheduler._effort_end_ids = [END]
+    scheduler._effort_marker_seqs = []
+    scheduler._effort_memory = EffortMemory(
+        HIDDEN, hidden, model=MODEL, ladder=tuple(LADDER)
+    )
+    return scheduler
+
+
+def _fill_memory(scheduler, n=8, tokens=100):
+    """Fill the memory and warm its digests, as a cold-phase server would.
+
+    The digests only see the decisions the server actually faced, so the very
+    first query of a fresh memory has no rank and falls back to the safe rung.
+    """
+    memory = scheduler._effort_memory
+    rng = np.random.default_rng(0)
+    for i in range(n):
+        memory.insert(
+            rng.normal(size=HIDDEN).astype(np.float32),
+            tokens,
+            "natural",
+            session_id=f"warm{i}",
+        )
+    for _ in range(4):
+        result = memory.query(rng.normal(size=HIDDEN).astype(np.float32))
+        memory.ranks(result)
+
+
+def _prompt(seed: int, tail: list[int]) -> list[int]:
+    rng = np.random.default_rng(seed)
+    body = [int(x) for x in rng.integers(1000, 20000, size=BODY)]
+    return body + tail
+
+
+_NONE_HASH_READY = False
+
+
+def _block_hasher():
+    """One `init_none_hash` per process: it re-randomises the sentinel, which
+    would make two identical prompts hash differently."""
+    global _NONE_HASH_READY
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    if not _NONE_HASH_READY:
+        init_none_hash(sha256)
+        _NONE_HASH_READY = True
+    return get_request_block_hasher(BLOCK, sha256)
+
+
+def _add(scheduler, req_id: str, seed: int = 7) -> Request:
+    params = SamplingParams(
+        max_tokens=60000,
+        extra_args={
+            "dynamic_effort": {
+                "ladder": LADDER,
+                "theta": [0.0, 0.5],
+                "bias": 0.0,
+                "deadline_ms": None,
+                "body_len": BODY,
+                "tails": TAILS,
+            }
+        },
+    )
+    request = Request(
+        request_id=req_id,
+        prompt_token_ids=_prompt(seed, TAILS[0]),
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=_block_hasher(),
+    )
+    scheduler.add_request(request)
+    return request
+
+
+def _runner_output(scheduler_output, vectors=None, sampled=None):
+    req_ids = list(scheduler_output.num_scheduled_tokens)
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={r: i for i, r in enumerate(req_ids)},
+        sampled_token_ids=[sampled.get(r, []) if sampled else [] for r in req_ids],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        effort_prefill_states=vectors,
+    )
+
+
+# --------------------------------------------------------------- the frontend
+
+
+def test_split_body_and_tails_keeps_the_lookahead_token_shared():
+    shared = [1, 2, 3, 4, 5]
+    variants = [shared + [90, 91], shared + [80], shared + [70, 71, 72]]
+    body_len, tails = split_body_and_tails(variants)
+    # One token back from the divergence, so the token an eagle drafter reads
+    # ahead at the body boundary is the same whichever rung is chosen.
+    assert body_len == len(shared) - 1
+    assert {t[0] for t in tails} == {shared[-1]}
+    for variant, tail in zip(variants, tails):
+        assert variant[:body_len] + tail == variant
+    # Identical variants still split: the tails match, but the *cap* the rung
+    # picks is an actuator of its own.
+    assert split_body_and_tails([shared, shared]) == (4, [[5], [5]])
+    # A body of fewer than two tokens has no usable seam.
+    assert split_body_and_tails([[1, 2], [1, 3]]) is None
+    assert split_body_and_tails([[1, 2, 3]]) is None
+
+
+# ------------------------------------------------------------- the body phase
+
+
+def test_body_prefill_emits_no_token():
+    scheduler = _scheduler()
+    request = _add(scheduler, "a")
+    assert request.effort_decision_pending
+    assert request.effort_body_len == BODY
+
+    output = scheduler.schedule()
+    # Only the body is scheduled, so the step is a non-final prefill chunk and
+    # the model samples nothing for this request.
+    assert output.num_scheduled_tokens["a"] == BODY
+    assert request.num_computed_tokens == BODY
+    assert request.is_prefill_chunk
+    assert output.effort_prefill_capture == ["a"]
+
+    engine_outputs = scheduler.update_from_output(output, _runner_output(output))
+    assert all(not batch.outputs for batch in engine_outputs.values())
+
+
+def test_a_held_request_is_not_scheduled_before_its_rung_is_chosen():
+    scheduler = _scheduler()
+    _add(scheduler, "a")
+    scheduler.schedule()  # body
+    # No output processed yet: the tail must not prefill, or it would commit
+    # rung 0 before the decision.
+    held = scheduler.schedule()
+    assert "a" not in held.num_scheduled_tokens
+    assert scheduler.requests["a"].effort_decision_skips == 1
+
+
+def test_held_request_falls_back_rather_than_stalling():
+    scheduler = _scheduler()
+    request = _add(scheduler, "a")
+    scheduler.schedule()
+    for _ in range(3):
+        scheduler.schedule()
+    # The vector never arrived; the request resolves to rung 0 instead of
+    # sitting in the running queue forever.
+    assert not request.effort_decision_pending
+    assert scheduler.schedule().num_scheduled_tokens["a"] == len(TAILS[0])
+
+
+# --------------------------------------------------------------- the decision
+
+
+def test_tail_appended_and_budget_set():
+    scheduler = _scheduler(q_mid=0.0, q_high=0.0)  # everything routes to rung 2
+    _fill_memory(scheduler)
+    request = _add(scheduler, "a")
+    body = list(request.prompt_token_ids[:BODY])
+
+    output = scheduler.schedule()
+    vector = np.ones(HIDDEN, dtype=np.float16)
+    scheduler.update_from_output(output, _runner_output(output, {"a": vector}))
+
+    assert not request.effort_decision_pending
+    assert list(request.prompt_token_ids) == body + TAILS[2]
+    assert list(request._all_token_ids) == body + TAILS[2]
+    assert request.num_prompt_tokens == BODY + len(TAILS[2])
+    assert scheduler._effort["a"].start_rung == 2
+    # The cap the worker is told to use is the chosen rung's, at revision 1.
+    assert scheduler._effort_pending["a"] == (1, LADDER[2])
+
+    # The tail prefills next, and only the tail: the body is already computed.
+    tail_step = scheduler.schedule()
+    assert tail_step.num_scheduled_tokens["a"] == len(TAILS[2])
+    assert tail_step.thinking_budget_updates["a"] == (1, LADDER[2])
+
+
+def test_decision_unavailable_falls_back_to_rung0():
+    for kwargs, vector in (
+        ({}, None),  # no vector at all
+        ({"min_entries": 10_000}, np.ones(HIDDEN, dtype=np.float16)),  # cold
+        ({"shadow": True, "q_mid": 0.0, "q_high": 0.0}, np.ones(HIDDEN, np.float16)),
+    ):
+        scheduler = _scheduler(**kwargs)
+        _fill_memory(scheduler)
+        request = _add(scheduler, "a")
+        before = list(request.prompt_token_ids)
+        output = scheduler.schedule()
+        scheduler.update_from_output(
+            output,
+            _runner_output(output, {"a": vector} if vector is not None else None),
+        )
+        assert not request.effort_decision_pending
+        assert list(request.prompt_token_ids) == before  # byte-identical prompt
+        assert "a" not in scheduler._effort_pending
+        assert scheduler._effort["a"].start_rung == 0
+        assert request.status == RequestStatus.RUNNING
+
+
+def test_fully_cached_body_still_yields_a_vector():
+    scheduler = _scheduler()
+    first = _add(scheduler, "a")
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output, _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)})
+    )
+    # Finish the first request so its blocks are cached and freed.
+    tail = scheduler.schedule()
+    scheduler.update_from_output(tail, _runner_output(tail, sampled={"a": [END]}))
+    scheduler.finish_requests("a", RequestStatus.FINISHED_STOPPED)
+
+    # The same prompt again: the body (and the rung-0 tail) are in the prefix
+    # cache, but the decision has not been made, so the last body row must
+    # still be computed and captured.
+    second = _add(scheduler, "b", seed=7)
+    assert list(second.prompt_token_ids) == list(first.prompt_token_ids)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["b"] >= 1
+    assert second.num_computed_tokens == BODY
+    assert output.effort_prefill_capture == ["b"]
+
+
+def test_prefix_cache_body_shared_across_rungs():
+    scheduler = _scheduler(q_mid=0.0, q_high=0.0)
+    _fill_memory(scheduler)
+    first = _add(scheduler, "a")
+    out = scheduler.schedule()
+    scheduler.update_from_output(
+        out, _runner_output(out, {"a": np.ones(HIDDEN, dtype=np.float16)})
+    )
+    assert list(first.prompt_token_ids)[BODY:] == TAILS[2]
+    tail = scheduler.schedule()
+    scheduler.update_from_output(tail, _runner_output(tail, sampled={"a": [END]}))
+    scheduler.finish_requests("a", RequestStatus.FINISHED_STOPPED)
+
+    # A second request with the same body: the body blocks are shared, whatever
+    # rung the first one ended up on.
+    second = _add(scheduler, "b", seed=7)
+    out = scheduler.schedule()
+    cached = second.num_computed_tokens - out.num_scheduled_tokens["b"]
+    assert cached >= (BODY // BLOCK - 1) * BLOCK
+    assert second.num_computed_tokens == BODY
+
+
+def test_memory_records_the_finished_request():
+    scheduler = _scheduler()
+    request = _add(scheduler, "a")
+    out = scheduler.schedule()
+    vector = np.ones(HIDDEN, dtype=np.float16)
+    scheduler.update_from_output(out, _runner_output(out, {"a": vector}))
+    assert scheduler._effort_memory.n_entries == 0
+
+    tail = scheduler.schedule()
+    scheduler.update_from_output(tail, _runner_output(tail, sampled={"a": [START]}))
+    state = scheduler._effort["a"]
+    state.think_count = 321
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _runner_output(step, sampled={"a": [END]}))
+    scheduler.finish_requests("a", RequestStatus.FINISHED_STOPPED)
+
+    assert scheduler._effort_memory.n_entries == 1
+    assert scheduler._effort_memory.n_valued == 1
+    assert "a" not in scheduler._effort_vectors
+    assert request.request_id not in scheduler._effort
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_split_survives_async_scheduling(async_scheduling):
+    from tests.v1.core.utils import create_scheduler
+
+    scheduler = create_scheduler(
+        model=MODEL,
+        enable_prefix_caching=True,
+        block_size=BLOCK,
+        max_num_batched_tokens=2048,
+        max_model_len=2048,
+        use_v2_model_runner=True,
+        async_scheduling=async_scheduling,
+    )
+    hidden = HiddenEffortConfig(
+        enabled=True,
+        memory_size=128,
+        min_entries=4,
+        k=4,
+        flush_every=0,
+        q_mid=0.0,
+        q_high=0.0,
+    )
+    scheduler._effort_cfg = DynamicEffortConfig(ladder=LADDER, hidden_effort=hidden)
+    scheduler._effort_start_ids = [START]
+    scheduler._effort_end_ids = [END]
+    scheduler._effort_marker_seqs = []
+    scheduler._effort_memory = EffortMemory(
+        HIDDEN, hidden, model=MODEL, ladder=tuple(LADDER)
+    )
+    _fill_memory(scheduler)
+    request = _add(scheduler, "a")
+    body_step = scheduler.schedule()
+    assert body_step.num_scheduled_tokens["a"] == BODY
+    # The scheduler runs ahead of the output under async scheduling; the held
+    # request must not be given a decode step in the meantime.
+    ahead = scheduler.schedule()
+    assert "a" not in ahead.num_scheduled_tokens
+    scheduler.update_from_output(
+        body_step, _runner_output(body_step, {"a": np.ones(HIDDEN, dtype=np.float16)})
+    )
+    assert list(request.prompt_token_ids)[BODY:] == TAILS[2]
+    assert request.num_output_placeholders == 0

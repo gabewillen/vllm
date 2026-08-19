@@ -863,6 +863,22 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             for idx in engine_indexes
         }
 
+        # v3 hidden-state start rung. Both label sets are small closed enums
+        # (one per ladder rung; one per decision reason), so the cardinality is
+        # bounded independently of traffic - no request or session ids.
+        histogram_effort_start_rung = self._histogram_cls(
+            name="vllm:effort_start_rung",
+            documentation=(
+                "Starting ladder rung chosen from the prompt's pooled prefill "
+                "hidden state."
+            ),
+            buckets=[0, 1, 2, 3],
+            labelnames=labelnames,
+        )
+        self.histogram_effort_start_rung = create_metric_per_engine(
+            histogram_effort_start_rung, per_engine_labelvalues
+        )
+
         #
         # Histogram of timing intervals
         #
@@ -1353,6 +1369,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         counters = self.counter_effort_close_kind[engine_idx]
         if close_kind in counters:
             counters[close_kind].inc()
+        if "start_rung" in effort:
+            self.histogram_effort_start_rung[engine_idx].observe(effort["start_rung"])
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1

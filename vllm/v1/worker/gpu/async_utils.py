@@ -124,6 +124,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
+        effort_prefill_states: tuple[list[str], torch.Tensor] | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -132,6 +133,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.routed_experts = routed_experts
+        self.effort_prefill_states = effort_prefill_states
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
@@ -155,6 +157,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.effort_reports_np: np.ndarray | None = None
             if sampler_output.effort_reports is not None:
                 self.effort_reports_np = async_copy_to_np(sampler_output.effort_reports)
+            self.effort_prefill_states_np: np.ndarray | None = None
+            if effort_prefill_states is not None:
+                self.effort_prefill_states_np = async_copy_to_np(
+                    effort_prefill_states[1]
+                )
             self.sampling_mask_tensors: SamplingMaskTensors | None = None
             if sampler_output.sampling_mask_tensors is not None:
                 self.sampling_mask_tensors = (
@@ -207,6 +214,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
         if self.effort_reports_np is not None:
             self.model_runner_output.effort_reports = reports_to_dict(
                 self.model_runner_output.req_ids, self.effort_reports_np
+            )
+
+        if self.effort_prefill_states_np is not None:
+            assert self.effort_prefill_states is not None
+            self.model_runner_output.effort_prefill_states = dict(
+                zip(self.effort_prefill_states[0], self.effort_prefill_states_np)
             )
 
         if self.logprobs_tensors is not None:

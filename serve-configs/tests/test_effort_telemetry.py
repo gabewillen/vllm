@@ -4,6 +4,7 @@
 import io
 import json
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -14,7 +15,9 @@ from vllm.v1.sample import effort_signals as es
 from vllm.v1.sample.effort_signals import (
     ENTROPY,
     MARGIN,
+    NUM_ROW_SIGNALS,
     NUM_ROWS,
+    P_END,
     EffortTelemetrySink,
     ThinkTracker,
     commit_order_permutation,
@@ -154,7 +157,9 @@ def test_commit_order_permutation_and_flagged_rows():
 # --------------------------------------------------------------------------
 
 
-def _v1_metadata(num_reqs: int, effort_mask) -> SamplingMetadata:
+def _v1_metadata(
+    num_reqs: int, effort_mask, end_token_id: int | None = None
+) -> SamplingMetadata:
     return SamplingMetadata(
         temperature=None,
         all_greedy=True,
@@ -173,6 +178,7 @@ def _v1_metadata(num_reqs: int, effort_mask) -> SamplingMetadata:
         bad_words_token_ids={},
         logitsprocs=LogitsProcessors(),
         effort_mask=effort_mask,
+        effort_end_token_id=end_token_id,
     )
 
 
@@ -189,17 +195,25 @@ def test_v1_sampler_emits_flagged_rows_only_and_keeps_tokens(monkeypatch):
     logits = torch.randn(4, 96)
     sampler = Sampler()
     mask = np.array([True, False, True, False])
-    out = sampler(logits.clone(), _v1_metadata(4, mask))
+    end_id = 11
+    out = sampler(logits.clone(), _v1_metadata(4, mask, end_token_id=end_id))
     assert calls == [2]
     assert torch.equal(out.sampled_token_ids.view(-1).long(), logits.argmax(-1))
     sig = out.effort_signals
-    assert sig is not None and sig.shape == (4, 4)
-    ref = real(logits[[0, 2]])
-    torch.testing.assert_close(sig[[0, 2], :3], ref)
+    assert sig is not None and sig.shape == (4, NUM_ROW_SIGNALS + 1)
+    ref = real(logits[[0, 2]], end_id)
+    torch.testing.assert_close(sig[[0, 2], :NUM_ROW_SIGNALS], ref)
+    # p(end) is the softmax mass on the reasoning-end token, not a filler zero.
+    torch.testing.assert_close(
+        sig[[0, 2], P_END], torch.softmax(logits[[0, 2]], dim=-1)[:, end_id]
+    )
+    assert torch.equal(sig[[1, 3]], torch.zeros(2, NUM_ROW_SIGNALS + 1))
     assert sig[:, NUM_ROWS].tolist() == [1.0, 0.0, 1.0, 0.0]
     assert out.effort_flags is mask
     d = signals_to_dict(["a", "b", "c", "d"], sig.numpy(), mask)
-    assert set(d) == {"a", "c"} and d["a"][2] == 1
+    assert set(d) == {"a", "c"}
+    assert d["a"] == pytest.approx(sig[0].tolist())
+    assert d["a"][NUM_ROWS] == 1
 
     # No flagged request: no work, no output.
     out2 = sampler(logits.clone(), _v1_metadata(4, None))
@@ -228,27 +242,35 @@ def test_v1_rejection_target_rows_and_committed_reduction(monkeypatch):
     )
     target_logits = torch.randn(total, vocab)
     mask = np.array([True, False, True])
-    rs.apply_logits_processors(target_logits.clone(), _v1_metadata(3, mask), md)
+    end_id = 5
+    rs.apply_logits_processors(
+        target_logits.clone(), _v1_metadata(3, mask, end_token_id=end_id), md
+    )
     # Only request 0's two draft rows are flagged (request 2 has no drafts).
     assert calls == [2]
     rows = rs._effort_target_rows
-    assert rows is not None and rows.shape == (total, 2)
-    torch.testing.assert_close(rows[:2], real(target_logits[:2]))
-    assert torch.equal(rows[2:], torch.zeros(3, 2))
+    assert rows is not None and rows.shape == (total, NUM_ROW_SIGNALS)
+    torch.testing.assert_close(rows[:2], real(target_logits[:2], end_id))
+    torch.testing.assert_close(
+        rows[:2, P_END], torch.softmax(target_logits[:2], dim=-1)[:, end_id]
+    )
+    # Unflagged rows stay zero in every column, p(end) included.
+    assert torch.equal(rows[2:], torch.zeros(3, NUM_ROW_SIGNALS))
 
-    bonus_rows = torch.rand(3, 2)
+    bonus_rows = torch.rand(3, NUM_ROW_SIGNALS)
     # Request 0: 1 of 2 accepted -> rows d0, d1 (recovery at pos 1).
     # Request 1: all 3 accepted -> rows d0..d2 + bonus.
     # Request 2: no drafts -> bonus only.
     p = PLACEHOLDER_TOKEN_ID
     output = torch.tensor([[5, 6, p, p], [1, 2, 3, 4], [9, p, p, p]])
     red = RejectionSampler._reduce_effort_signals(rows, bonus_rows, num_draft, output)
+    assert red.shape == (3, NUM_ROW_SIGNALS + 1)
     assert red[:, NUM_ROWS].tolist() == [2.0, 4.0, 1.0]
-    torch.testing.assert_close(red[0, :2], rows[:2].mean(0))
+    torch.testing.assert_close(red[0, :NUM_ROW_SIGNALS], rows[:2].mean(0))
     torch.testing.assert_close(
-        red[1, :2], torch.cat([rows[2:5], bonus_rows[1:2]]).mean(0)
+        red[1, :NUM_ROW_SIGNALS], torch.cat([rows[2:5], bonus_rows[1:2]]).mean(0)
     )
-    torch.testing.assert_close(red[2, :2], bonus_rows[2])
+    torch.testing.assert_close(red[2, :NUM_ROW_SIGNALS], bonus_rows[2])
 
     # Unflagged batch: nothing computed.
     rs.apply_logits_processors(target_logits.clone(), _v1_metadata(3, None), md)
@@ -295,7 +317,13 @@ def test_v2_effort_state_paths(monkeypatch):
 
     monkeypatch.setattr(es, "effort_row_signals", spy)
     monkeypatch.setattr(v2_effort, "effort_row_signals", spy)
-    st = v2_effort.EffortState(8, torch.device("cpu"))
+    end_id = 9
+    st = v2_effort.EffortState(
+        8,
+        torch.device("cpu"),
+        SimpleNamespace(natural_reasoning_end_token_ids=[end_id, 3]),
+    )
+    assert st.end_token_id == end_id
     st.add_request(2, _sp(effort_telemetry=True))
     st.add_request(5, _sp())
     st.apply_staged_writes()
@@ -314,8 +342,12 @@ def test_v2_effort_state_paths(monkeypatch):
     st.compute(logits, torch.tensor(idx), idx)
     assert calls == [1]
     out = st.finish(torch.tensor([0, 1, 2, 3]), torch.tensor([1, 1, 0]))
-    assert out is not None and out[:, NUM_ROWS].tolist() == [0.0, 1.0, 0.0]
-    torch.testing.assert_close(out[1, :2], real(logits[1:2])[0])
+    assert out is not None and out.shape == (3, NUM_ROW_SIGNALS + 1)
+    assert out[:, NUM_ROWS].tolist() == [0.0, 1.0, 0.0]
+    torch.testing.assert_close(out[1, :NUM_ROW_SIGNALS], real(logits[1:2], end_id)[0])
+    assert out[1, P_END] == pytest.approx(
+        float(torch.softmax(logits[1], dim=-1)[end_id]), abs=1e-6
+    )
     assert st.batch_flags(idx).tolist() == [False, True, False]
 
     # Spec batch (rows != reqs): whole chunk computed, unflagged rows zeroed,
@@ -328,9 +360,12 @@ def test_v2_effort_state_paths(monkeypatch):
     st.compute(logits, expanded, idx)
     assert calls == [1, 5]
     out = st.finish(cu, torch.tensor([2, 2]))
+    assert out.shape == (2, NUM_ROW_SIGNALS + 1)
     assert out[:, NUM_ROWS].tolist() == [2.0, 0.0]
-    torch.testing.assert_close(out[0, :2], real(logits[:2]).mean(0))
-    assert out[1, :2].tolist() == [0.0, 0.0]
+    torch.testing.assert_close(
+        out[0, :NUM_ROW_SIGNALS], real(logits[:2], end_id).mean(0)
+    )
+    assert out[1, :NUM_ROW_SIGNALS].tolist() == [0.0] * NUM_ROW_SIGNALS
 
     # Chunk without flagged requests still keeps row alignment.
     st.begin(np.array([2, 5]))
@@ -339,7 +374,7 @@ def test_v2_effort_state_paths(monkeypatch):
     assert calls == [1, 5, 1]
     out = st.finish(torch.tensor([0, 2, 3]), torch.tensor([1, 1]))
     assert out[:, NUM_ROWS].tolist() == [0.0, 1.0]
-    assert out[0, :2].tolist() == [0.0, 0.0]
+    assert out[0, :NUM_ROW_SIGNALS].tolist() == [0.0] * NUM_ROW_SIGNALS
 
 
 # --------------------------------------------------------------------------

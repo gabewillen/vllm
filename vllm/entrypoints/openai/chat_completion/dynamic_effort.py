@@ -10,6 +10,7 @@ to the *last user turn* (rung-0 prior, prefix-cache safe), the static
 in `SamplingParams.extra_args["dynamic_effort"]` for the scheduler.
 """
 
+import copy
 import math
 from typing import TYPE_CHECKING, Any
 
@@ -161,7 +162,18 @@ def apply_dynamic_effort(
             "chat_template_kwargs.enable_thinking=false"
         )
     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
-    if cfg.low_effort_sentence and not append_to_last_user_message(
+    hidden = cfg.hidden_effort
+    if hidden.enabled:
+        # v3: the rung is chosen from the body's own pooled prefill state, so
+        # every rung's sentence is rendered here and the engine appends the one
+        # it picks. The prompt submitted now is the rung-0 variant, which is
+        # what a missing vector or a cold memory falls back to.
+        variants = _render_effort_variants(
+            request.messages, hidden.sentences_for(len(overrides["ladder"]))
+        )
+        request.messages = variants[0]
+        request._dynamic_effort_variant_messages = variants
+    elif cfg.low_effort_sentence and not append_to_last_user_message(
         request.messages, cfg.low_effort_sentence
     ):
         raise DynamicEffortError(
@@ -170,3 +182,53 @@ def apply_dynamic_effort(
     request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
     request.thinking_token_budget = overrides["ladder"][0]
     request._dynamic_effort = overrides
+
+
+def _render_effort_variants(
+    messages: list[Any], sentences: list[str]
+) -> list[list[Any]]:
+    """One message list per rung, each with that rung's tail sentence."""
+    variants: list[list[Any]] = []
+    for sentence in sentences:
+        rendered = copy.deepcopy(messages)
+        if sentence and not append_to_last_user_message(rendered, sentence):
+            raise DynamicEffortError(
+                "reasoning_effort='dynamic' needs at least one user message"
+            )
+        variants.append(rendered)
+    return variants
+
+
+def split_body_and_tails(
+    variant_token_ids: list[list[int]],
+) -> tuple[int, list[list[int]]] | None:
+    """Split the rendered rung variants into the shared body and per-rung tails.
+
+    The variants differ only in the effort sentence, which sits at the end of
+    the last user turn, so their longest common token prefix *is* the body of
+    the §13.3 seam. The boundary is pulled one token back so that the token at
+    position `body_len` - the one an eagle-family drafter reads ahead at a
+    chunked-prefill boundary - is the same whichever rung is chosen.
+
+    Args:
+        variant_token_ids: the fully rendered prompt of each rung, in rung
+            order.
+
+    Returns:
+        `(body_len, tails)`, or `None` when the variants share no usable body
+        (identical prompts, or a body of fewer than two tokens).
+    """
+    if len(variant_token_ids) < 2 or any(not ids for ids in variant_token_ids):
+        return None
+    first = variant_token_ids[0]
+    common = len(first)
+    for ids in variant_token_ids[1:]:
+        limit = min(common, len(ids))
+        i = 0
+        while i < limit and ids[i] == first[i]:
+            i += 1
+        common = i
+    body_len = common - 1
+    if body_len < 1 or any(len(ids) <= body_len for ids in variant_token_ids):
+        return None
+    return body_len, [list(ids[body_len:]) for ids in variant_token_ids]

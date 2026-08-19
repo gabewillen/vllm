@@ -8,6 +8,8 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
+
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
@@ -46,10 +48,15 @@ from vllm.v1.core.sched.effort_controller import (
     EffortEvent,
     EffortState,
     cap_limit,
+    effective_cap,
     finish_effort,
     new_effort_state,
     resolve_marker_sequences,
     step_effort,
+)
+from vllm.v1.core.sched.effort_memory import (
+    EffortMemory,
+    decide_start_rung,
 )
 from vllm.v1.core.sched.effort_quantiles import SignalSketches
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -78,7 +85,11 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sample.effort_policy import EffortPolicy
 from vllm.v1.sample.effort_signals import EffortTelemetrySink
-from vllm.v1.sample.soft_limit import SoftLimit, soft_limit_from_config
+from vllm.v1.sample.soft_limit import (
+    CLOSE_FORCED,
+    SoftLimit,
+    soft_limit_from_config,
+)
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -324,6 +335,12 @@ class Scheduler(SchedulerInterface):
         self._effort_worker_reqs: set[str] = set()
         self._effort_use_uncertainty = True
         self._effort_soft_limit = SoftLimit(enabled=False)
+        # Dynamic effort v3: the online memory of pooled prefill states and the
+        # per-step capture list (docs/dynamic-reasoning.claude.md §13).
+        self._effort_memory: EffortMemory | None = None
+        self._effort_vectors: dict[str, np.ndarray] = {}
+        self._effort_start_rung_total: dict[int, int] = {}
+        self._effort_decision_skipped: dict[str, int] = {}
         reasoning_config = vllm_config.reasoning_config
         if reasoning_config is not None and reasoning_config.dynamic_effort:
             self._init_effort_controller(reasoning_config)
@@ -626,6 +643,20 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                request.effort_decision_pending
+                and request.num_computed_tokens >= request.effort_body_len
+            ):
+                # v3: the body is prefilled and the starting rung is not chosen
+                # yet, so the tail must not prefill (it would commit rung 0).
+                # The vector arrives with this step's output; the counter is the
+                # liveness guarantee if it never does.
+                request.effort_decision_skips += 1
+                if request.effort_decision_skips > 2:
+                    self._resolve_effort_decision(request, None)
+                req_index += 1
+                continue
+
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
@@ -637,6 +668,11 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if request.effort_decision_pending:
+                num_new_tokens = min(
+                    num_new_tokens,
+                    request.effort_body_len - request.num_computed_tokens,
+                )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
@@ -954,6 +990,29 @@ class Scheduler(SchedulerInterface):
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
 
+                    if (
+                        request.effort_decision_pending
+                        and num_new_local_computed_tokens + num_external_computed_tokens
+                        >= request.effort_body_len
+                    ):
+                        # v3: the blocks past the body hold the *rung-0* tail,
+                        # which the decision has not chosen yet. Keep the body's
+                        # full blocks and recompute the rest, so the last body
+                        # row is produced even for a 100%-cached prompt (§13.3).
+                        if self.connector is not None:
+                            self._resolve_effort_decision(request, None)
+                        else:
+                            keep = (
+                                (request.effort_body_len - 1) // self.block_size
+                            ) * self.block_size
+                            if num_new_local_computed_tokens > keep:
+                                new_computed_blocks = (
+                                    self.kv_cache_manager.truncate_computed_blocks(
+                                        new_computed_blocks, keep
+                                    )
+                                )
+                                num_new_local_computed_tokens = keep
+
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
@@ -1007,6 +1066,11 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if request.effort_decision_pending:
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            request.effort_body_len - num_computed_tokens,
+                        )
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1015,6 +1079,7 @@ class Scheduler(SchedulerInterface):
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
+                        and not request.effort_decision_pending
                         and (scheduled_running_reqs and not prefill_scheduled)
                     ):
                         num_new_tokens = 1 + self.num_spec_tokens
@@ -1490,6 +1555,12 @@ class Scheduler(SchedulerInterface):
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
+            if (
+                request.effort_decision_pending
+                and request.num_computed_tokens >= request.effort_body_len
+            ):
+                # The body's last row is in this step's hidden states (§13.3).
+                scheduler_output.effort_prefill_capture.append(req_id)
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
@@ -1859,6 +1930,8 @@ class Scheduler(SchedulerInterface):
         effort_reports = model_runner_output.effort_reports
         if effort_reports and self._effort:
             self._ingest_effort_reports(effort_reports)
+        effort_prefill_states = model_runner_output.effort_prefill_states
+        effort_requeued: set[Request] = set()
         if effort_signals and self._effort_sketches is not None:
             self._observe_effort_signals(effort_signals)
         effort_now_ms: float | None = None
@@ -1926,6 +1999,19 @@ class Scheduler(SchedulerInterface):
             # Drop-mode stale output (same-step resume) is discarded entirely.
             if output_is_stale and request.drop_stale_output:
                 continue
+
+            if (
+                request.effort_decision_pending
+                and request.num_computed_tokens >= request.effort_body_len
+            ):
+                # v3: the body's last prefill row came back with this step, so
+                # the starting rung is decided here and the chosen tail replaces
+                # the rung-0 one (§13.3 step 4).
+                vector = (
+                    effort_prefill_states.get(req_id) if effort_prefill_states else None
+                )
+                if self._resolve_effort_decision(request, vector):
+                    effort_requeued.add(request)
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
@@ -2168,6 +2254,13 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        if effort_requeued:
+            # Re-admit as a new request so the worker picks up the new prompt
+            # (the same path a streaming-input chunk takes).
+            self.running = remove_all(self.running, effort_requeued)
+            for request in effort_requeued:
+                self.waiting.prepend_request(request)
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -2633,6 +2726,49 @@ class Scheduler(SchedulerInterface):
         self._effort_worker_eval = cfg.evaluation == "worker" and bool(
             envs.VLLM_USE_V2_MODEL_RUNNER
         )
+        self._init_effort_memory(cfg)
+
+    def _init_effort_memory(self, cfg: DynamicEffortConfig) -> None:
+        """Build the v3 hidden-state memory (§13.4) and warm it from disk."""
+        hidden = cfg.hidden_effort
+        if not hidden.enabled:
+            return
+        if not envs.VLLM_USE_V2_MODEL_RUNNER:
+            logger.warning(
+                "dynamic_effort: hidden_effort needs the V2 model runner; "
+                "the starting-rung decision is disabled."
+            )
+            return
+        hidden_size = self.vllm_config.model_config.get_hidden_size()
+        memory = EffortMemory(
+            hidden_size,
+            hidden,
+            model=self.vllm_config.model_config.model,
+            ladder=tuple(cfg.ladder),
+        )
+        try:
+            warmed = memory.load()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "dynamic_effort: could not load %s (%s)", hidden.memory_path, exc
+            )
+            warmed = False
+        self._effort_memory = memory
+        logger.info(
+            "dynamic_effort: hidden-state start rung ON%s - memory %s (%d/%d "
+            "entries, min %d), k=%d, cuts q_mid=%.2f q_high=%.2f, downward "
+            "gates novelty<=%.2f spread<=%.2f",
+            " (shadow)" if hidden.shadow else "",
+            "warm" if warmed else "cold",
+            memory.n_entries,
+            hidden.memory_size,
+            hidden.min_entries,
+            hidden.k,
+            hidden.q_mid,
+            hidden.q_high,
+            hidden.novelty_gate_q,
+            hidden.spread_gate_q,
+        )
 
     def _maybe_add_effort_state(self, request: Request) -> None:
         params = request.sampling_params
@@ -2659,6 +2795,18 @@ class Scheduler(SchedulerInterface):
             now_ms=now_ms,
         )
         self._effort[request.request_id] = state
+        if self._effort_memory is not None:
+            tails = overrides.get("tails")
+            body_len = overrides.get("body_len")
+            if (
+                isinstance(tails, list)
+                and len(tails) == len(state.ladder)
+                and isinstance(body_len, int)
+                and 0 < body_len < request.num_prompt_tokens
+            ):
+                request.effort_body_len = body_len
+                request.effort_tail_variants = [list(t) for t in tails]
+                request.effort_decision_pending = True
         # A deadline needs a clock, which the worker does not have; those
         # requests keep the scheduler-side decision.
         if self._effort_worker_eval and state.deadline_ms is None:
@@ -2675,6 +2823,147 @@ class Scheduler(SchedulerInterface):
                 max_pattern_size=rep.max_pattern_size,
                 min_pattern_size=rep.min_pattern_size,
                 min_count=rep.min_count - 1,
+            )
+
+    def _resolve_effort_decision(
+        self, request: Request, vector: "np.ndarray | None"
+    ) -> bool:
+        """Choose the starting rung from the body's pooled prefill state.
+
+        The prompt already carries the rung-0 tail, so every failure mode -
+        cold memory, a missing vector, a KV connector that already committed to
+        loading past the body - resolves to today's behaviour with a
+        byte-identical prompt and no requeue.
+
+        Args:
+            request: the request whose body prefill just finished.
+            vector: the last body row, or `None` when there is none.
+
+        Returns:
+            Whether the prompt changed and the request must be re-admitted.
+        """
+        if not request.effort_decision_pending:
+            return False
+        request.effort_decision_pending = False
+        request.effort_decision_skips = 0
+        memory = self._effort_memory
+        tails = request.effort_tail_variants
+        state = self._effort.get(request.request_id)
+        rung = 0
+        reason = "no-vector"
+        if memory is not None and tails and vector is not None:
+            self._effort_vectors[request.request_id] = np.asarray(
+                vector, dtype=np.float32
+            )
+            query = memory.query(vector)
+            if query is None:
+                reason = "empty-memory"
+            else:
+                decision = decide_start_rung(
+                    query, memory.ranks(query), memory.cfg, len(tails) - 1
+                )
+                if not memory.ready:
+                    reason = f"cold/{decision.reason}"
+                elif memory.cfg.shadow:
+                    reason = f"shadow/{decision.reason}"
+                else:
+                    reason = decision.reason
+                    rung = decision.rung
+                logger.debug(
+                    "dynamic_effort %s: start rung %d (%s) q=%s novelty=%s "
+                    "spread=%s entries=%d",
+                    request.request_id,
+                    rung,
+                    reason,
+                    decision.estimate_rank,
+                    decision.novelty_rank,
+                    decision.spread_rank,
+                    query.n_entries,
+                )
+        self._effort_start_rung_total[rung] = (
+            self._effort_start_rung_total.get(rung, 0) + 1
+        )
+        if rung == 0:
+            self._effort_decision_skipped[reason] = (
+                self._effort_decision_skipped.get(reason, 0) + 1
+            )
+        if state is not None:
+            state.start_rung = rung
+        if rung != 0 and state is not None and self._effort_cfg is not None:
+            cap = effective_cap(state, self._effort_cfg, rung)
+            if cap <= effective_cap(state, self._effort_cfg, 0):
+                # No `max_tokens` headroom for the higher cap, so the higher
+                # rung's prompt would ask for thinking it cannot do.
+                rung = 0
+                state.start_rung = 0
+        if rung == 0 or not tails:
+            return False
+        self._apply_effort_tail(request, tails[rung])
+        if state is not None and self._effort_cfg is not None:
+            state.rung = rung
+            state.cap = effective_cap(state, self._effort_cfg, rung)
+            state.rung_entry_think = 0
+            state.revision += 1
+            state.pending_is_escalation = False
+            self._effort_pending[request.request_id] = (state.revision, state.cap)
+        return True
+
+    def _apply_effort_tail(self, request: Request, tail: list[int]) -> None:
+        """Replace the rung-0 tail with the chosen one, in place.
+
+        Only positions at or after `effort_body_len` change, and nothing at or
+        before that boundary has been cached yet, so the body's blocks and their
+        hashes stay valid; the hashes covering the tail are recomputed.
+        """
+        body_len = request.effort_body_len
+        prompt = request.prompt_token_ids
+        assert prompt is not None
+        del prompt[body_len:]
+        prompt.extend(tail)
+        del request._all_token_ids[body_len:]
+        request._all_token_ids.extend(tail)
+        request.num_prompt_tokens = len(prompt)
+        del request.block_hashes[body_len // self.hash_block_size :]
+        request.update_block_hashes()
+        request.max_tokens = min(
+            request.max_tokens, max(self.max_model_len - request.num_prompt_tokens, 1)
+        )
+        request.status = RequestStatus.WAITING
+
+    def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
+        """Record a finished request in the memory (§13.4).
+
+        A soft or forced close is right-censored - the length it *would* have
+        spent is unknown - so it enters as a key with no value.
+        """
+        memory = self._effort_memory
+        vector = self._effort_vectors.pop(request.request_id, None)
+        if memory is None or vector is None:
+            return
+        close_kind = state.close_kind
+        if request.status != RequestStatus.FINISHED_STOPPED:
+            # An abort or a length cap truncates the thinking just as a forced
+            # close does, so the length it would have spent is unknown.
+            close_kind = CLOSE_FORCED
+        memory.insert(
+            vector,
+            state.reasoning_tokens,
+            close_kind,
+            session_id=request.session_id,
+            start_rung=state.start_rung,
+            final_rung=state.rung,
+            escalations=state.escalations,
+        )
+        if memory.n_entries and memory.n_entries % 64 == 0:
+            logger.info(
+                "dynamic_effort: memory %d/%d entries (%d valued), hit rate "
+                "%.2f, start rungs %s, rung-0 reasons %s",
+                memory.n_entries,
+                memory.cfg.memory_size,
+                memory.n_valued,
+                memory.hit_rate,
+                dict(sorted(self._effort_start_rung_total.items())),
+                dict(sorted(self._effort_decision_skipped.items())),
             )
 
     def _observe_effort_signals(
@@ -2820,6 +3109,13 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
         self._accepted_ema.pop(request.request_id, None)
+        if self._effort:
+            state = self._effort.get(request.request_id)
+            if state is not None:
+                if not state.finished:
+                    finish_effort(state)
+                self._insert_effort_memory(request, state)
+        self._effort_vectors.pop(request.request_id, None)
         if self._effort:
             self._effort.pop(request.request_id, None)
             self._effort_pending.pop(request.request_id, None)

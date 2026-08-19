@@ -110,6 +110,8 @@ class EffortState:
     """Soft-limit ramp in force for this request; 0 when it is off."""
 
     rung: int = 0
+    start_rung: int = 0
+    """Rung the prefill hidden-state decision chose (§13.5); 0 without it."""
     cap: int = 0
     revision: int = 0
     acked_revision: int = 0
@@ -179,6 +181,7 @@ class EffortState:
     def report(self) -> dict[str, Any]:
         return {
             "rung": self.rung,
+            "start_rung": self.start_rung,
             "escalations": self.escalations,
             "reasoning_tokens": self.reasoning_tokens,
             "late": int(self.late),

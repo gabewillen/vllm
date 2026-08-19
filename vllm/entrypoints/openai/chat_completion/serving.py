@@ -5,6 +5,7 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
+from copy import copy
 from http import HTTPStatus
 from typing import Any, Final, cast
 
@@ -27,6 +28,7 @@ from vllm.entrypoints.generate.base.serving import (
 from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     DynamicEffortError,
     apply_dynamic_effort,
+    split_body_and_tails,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
@@ -225,6 +227,48 @@ class OpenAIServingChat(GenerateBaseServing):
 
         return await self.online_renderer.render_chat(request)
 
+    async def _attach_effort_tails(
+        self,
+        request: ChatCompletionRequest,
+        engine_inputs: list[EngineInput],
+    ) -> ErrorResponse | None:
+        """Render the other rungs and record the §13.3 body/tail seam.
+
+        The prompt already submitted is the rung-0 variant. Rendering the rest
+        costs one chat-template pass and one tokenization each; the engine only
+        ever prefills the body once, because the body is identical across rungs.
+        Anything unexpected (multiple prompts, an empty seam) silently leaves
+        the request on today's single-rung path.
+        """
+        variants = request._dynamic_effort_variant_messages
+        request._dynamic_effort_variant_messages = None
+        if variants is None or request._dynamic_effort is None:
+            return None
+        if len(engine_inputs) != 1:
+            return None
+        rendered = [self._extract_prompt_components(engine_inputs[0]).token_ids]
+        for messages in variants[1:]:
+            variant_request = copy(request)
+            variant_request.messages = messages
+            result = await self.render_chat_request(variant_request)
+            if isinstance(result, ErrorResponse):
+                return result
+            _, variant_inputs = result
+            if len(variant_inputs) != 1:
+                return None
+            rendered.append(
+                self._extract_prompt_components(variant_inputs[0]).token_ids
+            )
+        if any(ids is None for ids in rendered):
+            return None
+        split = split_body_and_tails([list(ids) for ids in rendered])  # type: ignore[arg-type]
+        if split is None:
+            return None
+        body_len, tails = split
+        request._dynamic_effort["body_len"] = body_len
+        request._dynamic_effort["tails"] = tails
+        return None
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -268,6 +312,10 @@ class OpenAIServingChat(GenerateBaseServing):
             return result
 
         conversation, engine_inputs = result
+        if request._dynamic_effort_variant_messages is not None:
+            variant_error = await self._attach_effort_tails(request, engine_inputs)
+            if variant_error is not None:
+                return variant_error
 
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"

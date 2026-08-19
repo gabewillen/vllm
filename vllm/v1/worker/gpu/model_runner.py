@@ -95,6 +95,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
+from vllm.v1.worker.gpu.effort_hidden import gather_prefill_states
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
@@ -1716,6 +1717,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
             routed_experts=routed_experts,
             num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+            effort_prefill_capture=scheduler_output.effort_prefill_capture or None,
         )
 
         if not self.is_last_pp_rank:
@@ -1742,6 +1744,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_spec_tokens_to_schedule = (
             self.execute_model_state.num_spec_tokens_to_schedule
         )
+        effort_prefill_capture = self.execute_model_state.effort_prefill_capture
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1765,6 +1768,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Last rank: sample tokens
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
             self.pcp_manager, hidden_states, input_batch
+        )
+
+        effort_prefill_states = gather_prefill_states(
+            hidden_states, input_batch, effort_prefill_capture
         )
 
         sampler_output, num_sampled, num_rejected = self.sample(
@@ -1808,6 +1815,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
+            effort_prefill_states=effort_prefill_states,
             routed_experts=routed_experts,
         )
 
@@ -2016,6 +2024,8 @@ class ExecuteModelState(NamedTuple):
     routed_experts: RoutedExpertsTensors | None
     # Draft tokens the scheduler will verify next step (dynamic/adaptive SD).
     num_spec_tokens_to_schedule: int = 0
+    # Requests whose dynamic-effort body prefill ends this step (§13.3).
+    effort_prefill_capture: list[str] | None = None
 
 
 class BatchReqState(NamedTuple):
