@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Build the dynamic-effort quantile sketch file for a model.
+
+The P6 controller is self-normalizing: it ranks each request's signals against
+running per-model quantile sketches instead of a hand-fitted mean/sd table.
+Cold sketches never escalate, so a fresh deployment behaves like a fixed rung-0
+cap until it has seen `quantile_min_samples` observations. This script warms
+them up front from a prompt set, so the first request after a restart already
+decides on a full distribution.
+
+Two modes, usually run back to back:
+
+    # 1. drive a running server with the prompt set (server must have
+    #    VLLM_EFFORT_TELEMETRY set to the sink path)
+    python serve-configs/effort_calibrate.py run \\
+        --base-url http://localhost:8012/v1 --model Qwen3.8-27B \\
+        --prompts serve-configs/effort_calibration_prompts.txt
+
+    # 2. turn the sink into the sketch file named by
+    #    --reasoning-config '{"dynamic_effort":{"quantile_path": ...}}'
+    python serve-configs/effort_calibrate.py build \\
+        --telemetry /data/effort-telemetry/latency.jsonl \\
+        --out /data/effort-sketches/qwen38.json --model Qwen3.8-27B
+
+`build` reads only in-think rows (`in_think: true`) and weights each row by its
+committed row count, exactly as the scheduler does at run time, so a warmed
+file and a self-warmed server converge to the same distribution.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
+from typing import Any
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from vllm.v1.core.sched.effort_quantiles import SignalSketches  # noqa: E402
+
+DEFAULT_PROMPTS = [
+    "What is 17 * 23? Answer with the number only.",
+    "Write a Python function that returns the median of a list of numbers.",
+    (
+        "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than "
+        "the ball. How much does the ball cost?"
+    ),
+    "Explain in two sentences why quicksort is O(n log n) on average.",
+    "Find the smallest positive integer divisible by 7 whose digits sum to 20.",
+    "Refactor this to be O(1) memory: `def f(xs): return sum(sorted(xs))`.",
+    (
+        "Five houses in a row, each a different colour, with owners of "
+        "different nationalities. Who owns the fish? Reason briefly."
+    ),
+    "Summarise the trade-offs between a B-tree and an LSM tree in a paragraph.",
+    "Given a stream of integers, describe an algorithm for the running median.",
+    "Prove that the square root of 2 is irrational.",
+    "Debug: a top-k heap returns the k largest but in the wrong order. Why?",
+    "Write a regex matching ISO-8601 timestamps with optional nanoseconds.",
+]
+
+
+def iter_jsonl(path: str) -> Iterator[dict[str, Any]]:
+    """Yield the parsed records of a JSONL file, skipping unparsable lines."""
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def build_sketches(
+    telemetry_paths: list[str],
+    out_path: str,
+    model: str | None,
+    min_samples: int,
+    compression: float,
+    include_all_rows: bool = False,
+) -> dict[str, float]:
+    """Fold a telemetry sink into a sketch file.
+
+    Args:
+        telemetry_paths: JSONL sinks written by `VLLM_EFFORT_TELEMETRY`.
+        out_path: sketch file to write (`dynamic_effort.quantile_path`).
+        model: model name recorded in the file for provenance.
+        min_samples: `quantile_min_samples` of the target server.
+        compression: t-digest compression.
+        include_all_rows: also fold rows outside the think block (debug only).
+
+    Returns:
+        Per-signal observation counts.
+    """
+    sketches = SignalSketches(
+        min_samples=min_samples, compression=compression, path=out_path
+    )
+    sketches.model = model
+    # The scheduler observes a per-request acceptance EMA, not the raw per-step
+    # ratio; mirror that so a warmed file and a self-warmed server agree.
+    acc_ema: dict[str, float] = {}
+    for path in telemetry_paths:
+        for rec in iter_jsonl(path):
+            n_rows = rec.get("n_rows") or 0
+            if n_rows <= 0:
+                continue
+            if not include_all_rows and not rec.get("in_think"):
+                continue
+            weight = float(n_rows)
+            sketches.observe("entropy", float(rec.get("entropy", 0.0)), weight)
+            sketches.observe("margin", float(rec.get("margin", 0.0)), weight)
+            if rec.get("p_end") is not None:
+                sketches.observe("p_end", float(rec["p_end"]), weight)
+            drafted = rec.get("num_draft_tokens")
+            if drafted:
+                req_id = str(rec.get("req_id", ""))
+                ratio = float(rec.get("num_accepted") or 0) / float(drafted)
+                prev = acc_ema.get(req_id)
+                ema = ratio if prev is None else 0.7 * prev + 0.3 * ratio
+                acc_ema[req_id] = ema
+                sketches.observe("acceptance", ema)
+    sketches.save()
+    return {key: sketches.count(key) for key in sketches.digests}
+
+
+def summarise(path: str) -> str:
+    """Human-readable percentile table of a sketch file."""
+    sketches = SignalSketches(min_samples=1, path=path)
+    sketches.load()
+    quantiles = (0.05, 0.25, 0.5, 0.75, 0.85, 0.92, 0.95, 0.99)
+    lines = [f"model: {sketches.model}", ""]
+    header = "signal".ljust(12) + "count".rjust(10)
+    header += "".join(f"{'p' + str(int(q * 100)):>9}" for q in quantiles)
+    lines.append(header)
+    for key, digest in sketches.digests.items():
+        if digest.count <= 0:
+            lines.append(f"{key.ljust(12)}{0:>10}  (cold)")
+            continue
+        row = key.ljust(12) + f"{digest.count:>10.0f}"
+        row += "".join(f"{digest.quantile(q):>9.4f}" for q in quantiles)
+        lines.append(row)
+    return "\n".join(lines)
+
+
+def _post_chat(
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    timeout: float,
+) -> dict[str, Any]:
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "reasoning_effort": "dynamic",
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "vllm_xargs": {"effort_telemetry": True},
+        }
+    ).encode()
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {api_key}"} if api_key else {}),
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def run_prompts(
+    base_url: str,
+    model: str,
+    prompts: list[str],
+    api_key: str | None,
+    max_tokens: int,
+    timeout: float,
+) -> int:
+    """Send the prompt set as dynamic-effort requests; return the failure count."""
+    failures = 0
+    for i, prompt in enumerate(prompts, 1):
+        try:
+            payload = _post_chat(base_url, api_key, model, prompt, max_tokens, timeout)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            print(f"[{i}/{len(prompts)}] FAILED: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        usage = payload.get("usage", {})
+        effort = (payload.get("choices") or [{}])[0].get("effort")
+        print(
+            f"[{i}/{len(prompts)}] completion={usage.get('completion_tokens')} "
+            f"effort={effort}"
+        )
+    return failures
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="drive a running server with a prompt set")
+    run.add_argument("--base-url", default="http://localhost:8012/v1")
+    run.add_argument("--model", required=True)
+    run.add_argument("--prompts", help="file with one prompt per line")
+    run.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
+    run.add_argument("--max-tokens", type=int, default=4096)
+    run.add_argument("--timeout", type=float, default=600.0)
+    run.add_argument("--repeat", type=int, default=1)
+
+    build = sub.add_parser("build", help="fold a telemetry sink into a sketch file")
+    build.add_argument("--telemetry", nargs="+", required=True)
+    build.add_argument("--out", required=True)
+    build.add_argument("--model")
+    build.add_argument("--min-samples", type=int, default=2048)
+    build.add_argument("--compression", type=float, default=100.0)
+    build.add_argument("--include-all-rows", action="store_true")
+
+    show = sub.add_parser("show", help="print a sketch file's percentiles")
+    show.add_argument("--sketch", required=True)
+
+    args = parser.parse_args(argv)
+
+    if args.command == "run":
+        prompts = DEFAULT_PROMPTS
+        if args.prompts:
+            with open(args.prompts, encoding="utf-8") as f:
+                prompts = [line.strip() for line in f if line.strip()]
+        prompts = prompts * max(args.repeat, 1)
+        failures = run_prompts(
+            args.base_url,
+            args.model,
+            prompts,
+            args.api_key,
+            args.max_tokens,
+            args.timeout,
+        )
+        print(f"{len(prompts) - failures}/{len(prompts)} requests completed")
+        return 1 if failures else 0
+
+    if args.command == "build":
+        counts = build_sketches(
+            args.telemetry,
+            args.out,
+            args.model,
+            args.min_samples,
+            args.compression,
+            args.include_all_rows,
+        )
+        print(f"wrote {args.out}")
+        for key, count in counts.items():
+            warm = "warm" if count >= args.min_samples else "COLD"
+            print(f"  {key:<12} {count:>10.0f}  {warm}")
+        return 0
+
+    print(summarise(args.sketch))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
