@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.config.reasoning import DynamicEffortConfig, ReasoningConfig
@@ -44,11 +45,13 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.effort_controller import (
     EffortEvent,
     EffortState,
+    cap_limit,
     finish_effort,
     new_effort_state,
     resolve_marker_sequences,
     step_effort,
 )
+from vllm.v1.core.sched.effort_quantiles import SignalSketches
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -73,6 +76,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.sample.effort_policy import EffortPolicy
 from vllm.v1.sample.effort_signals import EffortTelemetrySink
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -312,6 +316,11 @@ class Scheduler(SchedulerInterface):
         self._effort_start_ids: list[int] = []
         self._effort_end_ids: list[int] = []
         self._effort_marker_seqs: list[tuple[int, ...]] = []
+        self._effort_sketches: SignalSketches | None = None
+        self._effort_policy: EffortPolicy | None = None
+        self._effort_policy_age = 0
+        self._effort_worker_eval = False
+        self._effort_worker_reqs: set[str] = set()
         reasoning_config = vllm_config.reasoning_config
         if reasoning_config is not None and reasoning_config.dynamic_effort:
             self._init_effort_controller(reasoning_config)
@@ -1359,6 +1368,16 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
             thinking_budget_updates=dict(self._effort_pending),
+            effort_policy=self._effort_resolve_policy(len(self.running))
+            if self._effort
+            else None,
+            effort_vetoes=[
+                req_id
+                for req_id, state in self._effort.items()
+                if state.loop_flag or state.churn
+            ]
+            if self._effort
+            else [],
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1834,6 +1853,11 @@ class Scheduler(SchedulerInterface):
         effort_acks = model_runner_output.thinking_budget_acks
         if effort_acks and self._effort:
             self._ingest_effort_acks(effort_acks)
+        effort_reports = model_runner_output.effort_reports
+        if effort_reports and self._effort:
+            self._ingest_effort_reports(effort_reports)
+        if effort_signals and self._effort_sketches is not None:
+            self._observe_effort_signals(effort_signals)
         effort_now_ms: float | None = None
 
         failed_kv_load_req_ids = None
@@ -2553,6 +2577,29 @@ class Scheduler(SchedulerInterface):
         self._effort_start_ids = list(start_ids)
         self._effort_end_ids = list(end_ids)
         self._effort_marker_seqs = marker_seqs
+        self._effort_sketches = SignalSketches(
+            min_samples=cfg.quantile_min_samples,
+            compression=cfg.quantile_compression,
+            path=cfg.quantile_path,
+            flush_every=cfg.quantile_flush_every,
+        )
+        self._effort_sketches.model = self.vllm_config.model_config.model
+        try:
+            warmed = self._effort_sketches.load()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dynamic_effort: could not load %s (%s)", cfg.quantile_path, exc)
+            warmed = False
+        logger.info(
+            "dynamic_effort: rule=%s evaluation=%s sketches=%s (%s)",
+            cfg.rule,
+            cfg.evaluation,
+            "warm" if warmed else "cold",
+            cfg.quantile_path or "in-memory",
+        )
+        # Worker-side evaluation needs the V2 runner's escalation tensors.
+        self._effort_worker_eval = cfg.evaluation == "worker" and bool(
+            envs.VLLM_USE_V2_MODEL_RUNNER
+        )
 
     def _maybe_add_effort_state(self, request: Request) -> None:
         params = request.sampling_params
@@ -2567,7 +2614,7 @@ class Scheduler(SchedulerInterface):
             if overrides.get("deadline_ms") is not None
             else None
         )
-        self._effort[request.request_id] = new_effort_state(
+        state = new_effort_state(
             request.request_id,
             self._effort_cfg,
             overrides,
@@ -2578,6 +2625,15 @@ class Scheduler(SchedulerInterface):
             request.max_tokens,
             now_ms=now_ms,
         )
+        self._effort[request.request_id] = state
+        # A deadline needs a clock, which the worker does not have; those
+        # requests keep the scheduler-side decision.
+        if self._effort_worker_eval and state.deadline_ms is None:
+            self._effort_worker_reqs.add(request.request_id)
+            overrides["worker_eval"] = True
+            overrides["cap_max"] = cap_limit(
+                state, self._effort_cfg, state.ladder[state.top_rung]
+            )
         rep = params.repetition_detection
         if rep is not None and rep.max_pattern_size > 0 and rep.min_count > 2:
             # Read-only early evidence: the stop's own pattern at one repeat
@@ -2587,6 +2643,75 @@ class Scheduler(SchedulerInterface):
                 min_pattern_size=rep.min_pattern_size,
                 min_count=rep.min_count - 1,
             )
+
+    def _observe_effort_signals(
+        self, signals: dict[str, tuple[float, float, float, int]]
+    ) -> None:
+        """Feed every request's step means into the per-model sketches."""
+        sketches = self._effort_sketches
+        assert sketches is not None
+        for req_id, (entropy, margin, p_end, n_rows) in signals.items():
+            if n_rows <= 0 or req_id not in self._effort:
+                continue
+            state = self._effort[req_id]
+            if not state.in_think:
+                continue
+            weight = float(n_rows)
+            sketches.observe("entropy", entropy, weight)
+            sketches.observe("margin", margin, weight)
+            sketches.observe("p_end", p_end, weight)
+            if state.acc_ema is not None:
+                sketches.observe("acceptance", state.acc_ema)
+        if sketches.maybe_save():
+            self._effort_policy = None
+
+    def _effort_resolve_policy(self, batch_size: int) -> EffortPolicy | None:
+        """Resolve the sketches into this step's absolute policy.
+
+        The grids are recomputed lazily (they move slowly); only the
+        batch-size rung cap is refreshed every step.
+        """
+        cfg = self._effort_cfg
+        sketches = self._effort_sketches
+        if cfg is None or sketches is None:
+            return None
+        if self._effort_policy is None or self._effort_policy_age >= 256:
+            self._effort_policy_age = 0
+            edges = cfg.quantile_edges
+            self._effort_policy = EffortPolicy(
+                p_uncertain=list(cfg.p_uncertain or []),
+                entropy_edges=sketches.edges("entropy", edges),
+                margin_edges=sketches.edges("margin", edges),
+                acceptance_edges=sketches.edges("acceptance", edges),
+                check_at=cfg.check_at,
+                final_check_at=cfg.final_check_at,
+                baseline_tokens=cfg.baseline_tokens,
+                baseline_rise=cfg.baseline_rise,
+                min_signal_rows=cfg.min_samples,
+                dwell_tokens=cfg.dwell_tokens,
+                grace_tokens=cfg.grace_tokens,
+                p_end_rise_eps=cfg.p_end_rise_eps,
+                acc_veto_rank=cfg.acc_veto_rank,
+                warm=sketches.warm("entropy") and sketches.warm("margin"),
+            )
+        self._effort_policy_age += 1
+        self._effort_policy.max_rung = cfg.max_rung_for_batch_size(batch_size)
+        return self._effort_policy
+
+    def _ingest_effort_reports(
+        self, reports: dict[str, tuple[int, int, int, int]]
+    ) -> None:
+        """Mirror the worker's escalation counters into the request report."""
+        for req_id, (rung, escalations, grace, late) in reports.items():
+            state = self._effort.get(req_id)
+            if state is None:
+                continue
+            state.rung = rung
+            state.escalations = escalations
+            state.grace_granted = grace
+            state.late = bool(late)
+            if rung < len(state.ladder):
+                state.cap = state.ladder[rung] + grace
 
     def _ingest_effort_acks(self, acks: dict[str, int]) -> None:
         for req_id, revision in acks.items():
@@ -2604,7 +2729,7 @@ class Scheduler(SchedulerInterface):
         request: Request,
         state: EffortState,
         new_token_ids: list[int],
-        signals: tuple[float, float, int] | None,
+        signals: tuple[float, float, float, int] | None,
         num_draft_tokens: int,
         num_accepted_tokens: int,
         now_ms: float | None,
@@ -2615,7 +2740,8 @@ class Scheduler(SchedulerInterface):
             new_token_ids=new_token_ids,
             entropy=signals[0] if signals is not None else None,
             margin=signals[1] if signals is not None else None,
-            n_rows=signals[2] if signals is not None else 0,
+            p_end=signals[2] if signals is not None else None,
+            n_rows=signals[3] if signals is not None else 0,
             num_draft_tokens=num_draft_tokens,
             num_accepted_tokens=num_accepted_tokens,
             batch_size=len(self.running),
@@ -2626,7 +2752,13 @@ class Scheduler(SchedulerInterface):
                 and check_sequence_repetition(request.output_token_ids, rep_params)
             ),
         )
-        decision = step_effort(state, self._effort_cfg, event)
+        if request.request_id in self._effort_worker_reqs:
+            # The worker owns escalation and grace for this request; the
+            # scheduler keeps only the token bookkeeping and the stall clamp.
+            policy = EffortPolicy(warm=False, grace_tokens=0)
+        else:
+            policy = self._effort_resolve_policy(len(self.running))
+        decision = step_effort(state, self._effort_cfg, event, policy)
         if decision.budget_update is not None:
             self._effort_pending[request.request_id] = decision.budget_update
         if decision.checked or decision.stall_clamp or decision.late:
@@ -2649,6 +2781,7 @@ class Scheduler(SchedulerInterface):
             self._effort.pop(request.request_id, None)
             self._effort_pending.pop(request.request_id, None)
             self._effort_rep_params.pop(request.request_id, None)
+            self._effort_worker_reqs.discard(request.request_id)
         if self.effort_sink is not None:
             self.effort_sink.forget(request.request_id)
 
