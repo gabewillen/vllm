@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import fcntl
 import functools
 import time
 from collections import deque
@@ -203,21 +204,49 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     rank = region.rank
 
     base_ptr = region._base.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
-    if result.value != 0:
-        logger.warning(
-            "cudaHostRegister failed for rank=%d (code=%d) — "
-            "transfers will still work but may be slower (unpinned DMA)",
-            rank,
-            result,
-        )
-    else:
-        logger.debug(
-            "cudaHostRegister rank=%d %.2f GB",
-            rank,
-            region.total_size_bytes / 1e9,
-        )
-        region.is_pinned = True
+    total = region.total_size_bytes
+    # Concurrent whole-region cudaHostRegister from every TP rank contends in
+    # the driver on the same tmpfs pages; with large regions (observed: 48 GiB
+    # at TP4) the ioctl can stall past the engine-ready timeout and deadlock
+    # startup. Serialize ranks via flock on the region file and register in
+    # bounded chunks so each driver call stays short. Registration remains a
+    # best-effort optimization: on chunk failure, roll back and run unpinned.
+    # Chunks must align to row_stride: a copy descriptor targets one block row,
+    # and cuMemcpyBatchAsync rejects ranges spanning two separately-registered
+    # regions (CUDA_ERROR_INVALID_VALUE). Rows are page-aligned by construction.
+    row_stride = region._row_stride
+    chunk_bytes = max(row_stride, ((1 << 30) // row_stride) * row_stride)
+    pinned_chunks: list[tuple[int, int]] = []
+    start = time.monotonic()
+    with open(region.mmap_path, "rb") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        offset = 0
+        while offset < total:
+            n = min(chunk_bytes, total - offset)
+            result = torch.cuda.cudart().cudaHostRegister(base_ptr + offset, n, 0)
+            if result.value != 0:
+                logger.warning(
+                    "cudaHostRegister failed for rank=%d at offset=%d "
+                    "(code=%d) — rolling back; transfers will still work "
+                    "but may be slower (unpinned DMA)",
+                    rank,
+                    offset,
+                    result,
+                )
+                for ptr, _ in pinned_chunks:
+                    torch.cuda.cudart().cudaHostUnregister(ptr)
+                return
+            pinned_chunks.append((base_ptr + offset, n))
+            offset += n
+    logger.info(
+        "cudaHostRegister rank=%d %.2f GB in %d chunks (%.1f s)",
+        rank,
+        total / 1e9,
+        len(pinned_chunks),
+        time.monotonic() - start,
+    )
+    region.pinned_chunks = pinned_chunks
+    region.is_pinned = True
 
 
 def _new_descriptor_buffers(
