@@ -187,18 +187,26 @@ def test_a_held_request_is_not_scheduled_before_its_level_is_chosen():
 
 
 def test_held_request_falls_back_rather_than_stalling():
+    """Liveness: a vector that never arrives must not park the request forever.
+
+    The bound is generous on purpose - the async batch queue can put several
+    schedule() calls between the body prefill and its output, and giving up
+    early silently drops the decision.
+    """
+    from vllm.v1.core.sched.scheduler import MAX_EFFORT_DECISION_SKIPS
+
     scheduler = _scheduler()
     request = _add(scheduler, "a")
     scheduler.schedule()
-    for _ in range(3):
-        scheduler.schedule()
-    # The vector never arrived; the request resolves to rung 0 instead of
-    # sitting in the running queue forever.
+    for _ in range(MAX_EFFORT_DECISION_SKIPS):
+        assert "a" not in scheduler.schedule().num_scheduled_tokens
+        assert request.effort_decision_pending
+    scheduler.schedule()
+    # The vector never arrived; the request resolves to the default level
+    # instead of sitting in the running queue forever.
     assert not request.effort_decision_pending
+    assert scheduler._effort_held_timeouts == 1
     assert scheduler.schedule().num_scheduled_tokens["a"] == len(TAILS[0])
-
-
-# --------------------------------------------------------------- the decision
 
 
 def test_tail_appended_and_no_budget_shipped():

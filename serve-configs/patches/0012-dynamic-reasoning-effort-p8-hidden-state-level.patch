@@ -1,53 +1,96 @@
 diff --git a/docs/dynamic-reasoning-v3-results.md b/docs/dynamic-reasoning-v3-results.md
 new file mode 100644
-index 0000000000..c9fdda48db
+index 0000000000..6183e1931e
 --- /dev/null
 +++ b/docs/dynamic-reasoning-v3-results.md
-@@ -0,0 +1,142 @@
-+# P8 on the box: what the hidden-state start rung actually does
+@@ -0,0 +1,176 @@
++# P8 on the box: the effort level, decided before thinking
 +
 +Status: **implemented and benchmarked 2026-08-19** on the 4x L4 trial arm
-+(`:8013`, `/shared/vllm/.venv-effort-v3`, branch `qwen3.8-27B-effort-v3`,
-+venv patch `serve-configs/patches/0012`). Design:
-+[`dynamic-reasoning.claude.md`](dynamic-reasoning.claude.md) §13. Measurement the
-+design rests on: [`effort-hidden-probe.md`](effort-hidden-probe.md).
++(`:8013`, `/shared/vllm/.venv-effort-v3`, branch `qwen3.8-27B-effort-v3`, venv
++patch `serve-configs/patches/0012`). Design:
++[`dynamic-reasoning.claude.md`](dynamic-reasoning.claude.md) §13. The
++measurement the signal rests on: [`effort-hidden-probe.md`](effort-hidden-probe.md).
 +
-+This file records three things: what §13 turned into once it met the real
-+serving profile, the VulcanBench v3 `dynamic-v3` column, and what is still open.
++What shipped is narrower and stricter than §13 as written:
++
++> `reasoning_effort: "dynamic"` chooses **one effort level per request, before
++> the model thinks**, from the prompt's own pooled prefill hidden state, and
++> renders that level's **sentence at the true tail of the prompt**. Nothing else
++> touches the think block — no cap, no ramp, no forced close, no escalation, no
++> stall detector. The model ends its own reasoning, bounded only by the client's
++> `max_tokens` and timeouts, exactly as it is at a fixed effort level.
++
++This file records what that took, the placement measurement it rests on, the
++`dynamic-v3` VulcanBench column, and what is still open.
 +
 +## 1. Headline
 +
-+_(filled in from the run; see §4)_
++_(filled in from the run; see §5)_
 +
-+## 2. What §13 said and what shipped
++## 2. Where the effort sentence has to go (measured 2026-08-19)
 +
-+§13.3 assumed the prompt splits cleanly at the effort sentence:
++§2b measured sentence placement on **single-turn** prompts, where the last user
++message *is* the end of the prompt. An agent turn is not like that: the last
++message is a tool result, so appending to the last user message buries the
++sentence thousands of tokens above the generation point. Nothing in the design
++had ever measured that case, so this run measured it before building on it.
 +
-+```
-+[ body ................................. ][ tail ]
-+system + every turn + last user content    effort sentence + <|im_start|>assistant\n<think>\n
-+```
++Harness: `work/../scratchpad/effort-placement/agent_grid2.py` — six problems
++known to make this model deliberate, each delivered as the **content of the last
++tool result** in a system / user / assistant-tool-call / tool-result
++conversation, greedy, one sample each, `max_tokens=20000`, on the `:8013` arm.
++Four placements, all prefix-cache-safe:
 +
-+Two properties of this deployment break that seam, and both were only visible on
-+the GPU. They are the substance of this run.
++| placement | where the sentence goes |
++|---|---|
++| `last_user` | appended to the last **user** message (what patch 0009 ships) |
++| `tool_tail` | appended to the last message whatever its role (inside the tool result) |
++| `user_tail` | a trailing user message carrying only the sentence |
++| `none` | no sentence (the chat template's own `medium`) |
 +
-+### 2.1 The seam is not at the tail of an agent prompt
++Reasoning tokens per prompt:
 +
-+`apply_dynamic_effort` appends the effort sentence to the last **user** message
-+(§2b measured that placement, and patch 0009 shipped it). In a VulcanBench agent
-+turn the last message is a *tool result*, so the seam lands early: measured on
-+the live run, the first turn of a task has its seam at ~96 % of the prompt, but
-+every later turn puts it at a fraction of a prompt that grows to tens of
-+thousands of tokens. The body the decision would read is then a small prefix of
-+what the model actually reads — and the last few thousand tokens of an agent
-+prompt (the diff, the failing test, the tool output) are exactly the part that
-+says how hard the step is.
++| prompt | none | last_user low | tool_tail low | user_tail low | last_user high | tool_tail high | user_tail high |
++|---|---:|---:|---:|---:|---:|---:|---:|
++| aime | 567 | 663 | 403 | 543 | 351 | 918 | 391 |
++| algo | 64 | 120 | 126 | 113 | 973 | 1123 | 783 |
++| count | 422 | 364 | 204 | 235 | 214 | 387 | 434 |
++| debug | 63 | 160 | 254 | 217 | 3446 | **9680** | 1864 |
++| puzzle | 286 | 333 | 315 | 373 | 349 | 370 | 399 |
++| sched | 293 | 250 | 355 | 179 | 312 | 294 | 314 |
 +
-+Moving the sentence to the true tail was rejected: it would put an instruction
-+sentence inside a tool-result message, and it would change the rung-0 rendering,
-+which is the thing `dynamic-v2` is the control for.
++Medians, and the ratios that matter:
 +
-+### 2.2 The KV block is 1648 tokens wide
++| placement | high / low | high / none (all 6) | low / none (the 4 that already deliberate) |
++|---|---:|---:|---:|
++| `last_user` | 1.15x | 1.14x | 1.01x |
++| `tool_tail` | 2.09x | 1.46x | 0.91x |
++| `user_tail` | 1.80x | 1.23x | **0.78x** |
++
++**Read: at the placement the deployment ships, the sentence is inert on agent
++traffic.** `last_user` moves reasoning length by 1.01–1.15x in either direction
++— noise. Both tail placements are honoured in both directions. `tool_tail` is
++the strongest upward (1.46x vs no sentence, driven by `debug` at 9680 tokens);
++`user_tail` is the strongest downward (0.78x) and is semantically clean — the
++instruction is not text pasted inside a tool result — so **`user_tail` is what
++shipped**. Every configuration solved 5 of 6 and every one finished on `stop`;
++no placement broke the agent loop.
++
++Caveats: six prompts, one greedy sample each, one model. The direction is
++unambiguous; the magnitudes are not tight.
++
++## 3. What §13 said and what shipped
++
++### 3.1 The seam is at the tail now, by construction
++
++§13.3 assumed the prompt splits at the effort sentence with the body being
++"system + every turn + last user content". With the sentence moved to a trailing
++user message, the body is *everything the model reads except the sentence*, for
++any conversation shape. That is what makes the two-phase form apply to ordinary
++agent turns rather than only to single-turn prompts.
++
++### 3.2 The KV block is 1648 tokens wide
 +
 +The served profile is hybrid GDN with prefix caching, so vLLM picks the Mamba
 +`align` cache mode and widens the attention block so its page covers the mamba
@@ -58,47 +101,40 @@ index 0000000000..c9fdda48db
 +is >= mamba page size
 +```
 +
-+In `align` mode a **non-final prefill chunk may only end on a block boundary
-+whose SSM state is cacheable** (`Scheduler._mamba_block_aligned_split`). The
-+body chunk ended at the frontend's seam, an arbitrary token, so the aligning
++In `align` mode a **non-final prefill chunk may only end on a block boundary**.
++The body chunk ended at the frontend's seam, an arbitrary token, so the aligning
 +split clipped it to zero and the request was never admitted: the engine spun at
-+`num_requests_waiting 1, reason capacity` with no forward progress, and every
-+`reasoning_effort: "dynamic"` request hung. That is the first thing this run
-+found, and it is a hard blocker for the §13.3 mechanism as written.
++`num_requests_waiting 1, reason capacity` and every `dynamic` request hung. That
++was the first thing this run found and it is a hard blocker for §13.3 as
++written.
 +
-+The fix (`_effort_body_boundary`) moves the boundary to the last cacheable block
-+boundary at or before the seam — one further block back, because an
-+eagle-family drafter prunes the last matching block. With a 1648-token block
-+that is up to 3 296 tokens before the seam, and a prompt shorter than two blocks
-+has no usable boundary at all.
-+
-+### 2.3 So the shipped mechanism has two forms
-+
-+`hidden_effort.split_min_fraction` (default 0.75) decides between them per
-+request:
-+
-+| | two-phase (§13.3) | cap-only (this run) |
-+|---|---|---|
-+| when | the body still covers ≥ `split_min_fraction` of the prompt | otherwise |
-+| prompt | body prefills alone, chosen rung's tail appended after the decision | untouched, prefills in one go |
-+| vector | last row of the body | last row of the **whole prompt** — the `last_final` the probe measured |
-+| decision sets | the rung's prompt sentence **and** the starting cap | the starting cap only |
-+| cost | one extra engine step | none |
-+
-+Both forms share everything else: the same online memory, the same kNN, the same
-+asymmetric map, the same fallbacks. `hidden_effort.enabled=false`, a cold
-+memory, a missing vector, `shadow=true`, the V1 runner, or a rung whose cap the
-+`max_tokens` headroom cannot honour all render rung 0 with a byte-identical
++The boundary is now the largest multiple of the block at or before the seam. The
++first attempt also subtracted one block (mirroring the eagle-pruned "last
++cacheable position"), which cost a further 1648 tokens for nothing: an
++intermediate chunk that stops at that position is simply followed by one that
++runs on to the boundary. Dropping the backoff moves a 4 100-token prompt's body
++from 1 648 to 3 296 tokens. `hidden_effort.split_min_fraction` (0.5) is the
++remaining safety net: a prompt with no boundary covering at least that much of
++itself takes no decision and runs at `default_level`, with a byte-identical
 +prompt.
 +
-+On VulcanBench v3 **every** request took the cap-only form, so this column
-+measures the hidden-state signal and the asymmetric map without the prompt-tail
-+half of §13.5. That is a strictly cleaner comparison against `dynamic-v2` — the
-+prompt is byte-identical — but it does not answer §13.5's open question about
-+the token cost of the higher starting rungs' *sentences*, because no sentence
-+changed.
++### 3.3 Everything that touched the think block is gone
 +
-+## 3. Method
++Removed from the dynamic path: the rung ladder and per-rung caps, mid-generation
++escalation, the running quantile sketches and the rank rule, the soft-limit
++close and its ramp, the graceful forced close, and the loop-stall clamp. A
++dynamic request sets **no thinking budget at all**, so the cap actuator is never
++armed for it, and `close_kind` reduces to `natural` (the model closed its own
++think block) or `client-limit` (`max_tokens`, a timeout or an abort ended it
++first — a right-censored entry the memory will not value).
++
++Deleted with them: `vllm/v1/sample/effort_policy.py`,
++`vllm/v1/worker/gpu/sample/effort_escalation.py` (see §7),
++`serve-configs/effort_calibrate.py`, and their tests. The static
++`thinking_token_budget` feature and its soft-limit close are untouched — they
++are a separate, explicitly requested capability.
++
++## 4. Method
 +
 +- Server: the `B_mtp.yaml` latency profile (Qwen3.8-27B-FP8, TP4, MTP K=7
 +  adaptive, V2 runner, `TRITON_ATTN`, `NCCL_P2P_LEVEL=SYS`, fp8 lm_head, fp8 KV)
@@ -106,51 +142,49 @@ index 0000000000..c9fdda48db
 +  `{"dynamic_effort": {"hidden_effort": {"enabled": true, "memory_path": ..., "min_entries": 128, "flush_every": 128}}}`.
 +  Production (`vllm-qwen38`, `:8012`) stayed stopped throughout.
 +- Harness: `vulcanbench run --suite v3 --model qwen:Qwen3.8-27B --effort dynamic-v3`,
-+  greedy sampling, `--no-judges`, `--override-budgets`, `--timeout 7200`,
-+  `--max-steps 300`, same as the other v3 columns **except**
++  greedy, `--no-judges`, `--override-budgets`, `--timeout 7200`,
++  `--max-steps 300` — same as the other v3 columns **except**
 +  `--max-concurrency 12` (the `dynamic` and `dynamic-v2` columns ran at 5).
 +  Per-task wall clock is therefore **not** comparable to those columns; solved
-+  counts, tokens and rung mixes are.
-+- **Cold start is part of the measurement.** The memory was not warmed with the
-+  bench tasks: the server started with an empty ring (3 synthetic entries from
-+  the smoke test, far below the 128-entry `min_entries` threshold, so no
-+  decision could fire), and the first ~128 finished requests of the run got
-+  today's rung-0 behaviour by construction while filling it.
++  counts, tokens and level mixes are.
++- **Cold start is part of the measurement.** The server started with an empty
++  memory and was not warmed with the bench tasks; the first ~128 finished
++  requests got `default_level` (the `low` sentence, which is what `dynamic`
++  rendered before v3) while filling it.
 +
-+## 4. The `dynamic-v3` column
++## 5. The `dynamic-v3` column
 +
 +_(filled in from the run)_
 +
-+## 5. Bugs found and fixed on the way
++## 6. Bugs found and fixed on the way
 +
 +| symptom | cause | fix |
 +|---|---|---|
 +| every `dynamic` request hangs; engine spins with one request `waiting/capacity` | the body chunk ended mid-block, and Mamba `align` clips a non-final chunk to a block boundary — to zero | `_effort_body_boundary` (commit `f621e16c5a`) |
-+| decision never fires; memory stays empty on agent traffic | the seam sits ~20 % into an agent prompt, and the 1648-token block quantises the boundary below it | `split_min_fraction` + the cap-only form (commit `17d46c0c23`) |
-+| `start_rung` absent from the response | `EffortInfo` did not carry it | added; it is also `vllm:effort_start_rung` |
++| the split never engages on agent traffic | the sentence sat on the last *user* message, ~20 % into the prompt | tail placement + the §2 grid (commit `38d474cd53`) |
++| the boundary is a further 1648 tokens early for nothing | the eagle "last cacheable position" backoff was copied into the boundary rule, where it is not a constraint | dropped (commit `38d474cd53`) |
++| engine dies at request finish | a periodic log still read the pre-rename counter attribute | renamed with the rest |
 +
-+## 6. What this run does not settle
++## 7. What this run does not settle
 +
-+- **The prompt-sentence half of §13.5.** No request took the two-phase form, so
-+  the token cost of a higher starting *sentence* is still unmeasured. Getting it
-+  on this profile needs either the effort sentence at the true prompt tail or a
-+  narrower attention block, and both change the rung-0 rendering that
-+  `dynamic-v2` is the control for.
-+- **The §13.6 deletions.** `rule="score"` and its `theta`/`w_*`/`calibration`
-+  surface, the backtrack markers, `p_uncertain`/`baseline_*`/
-+  `uncertainty_min_auc` and `grace_tokens` are all still present. Every one of
-+  them is inert at the shipped defaults (the AUC gate has kept the entropy and
-+  margin features off since P7), and deleting them churns the worker-side torch
-+  rule that this benchmark depends on, so the cutover was deferred rather than
-+  landed in the same change as the measurement. It is the next thing to do on
-+  this branch.
++- **The worker-side escalation tensors** (`effort_escalation.py`,
++  `effort_policy.py` is deleted but the worker module stays) are still in the
++  tree, permanently unarmed because nothing sets `worker_eval`. Cutting them out
++  touches `sampler.py`, `rejection_sampler.py`, `async_utils.py` and
++  `model_runner.py` and was not worth doing between a benchmark and its rerun.
++  It is the next thing on this branch.
++- **The placement grid is six prompts, one sample each.** It is enough to
++  choose a placement, not to quote a coefficient.
++- **`split_min_fraction` still excludes short prompts.** With a 1648-token
++  block, a prompt under one block gets no decision at all. On the v3 suite that
++  is the opening turn of a task.
 +- Multimodality: the traces are text-only, as in the probe doc.
 +- One model, one box, 23 tasks.
 diff --git a/docs/dynamic-reasoning.claude.md b/docs/dynamic-reasoning.claude.md
-index 179d8360fc..7be5ae713e 100644
+index 179d8360fc..5315849015 100644
 --- a/docs/dynamic-reasoning.claude.md
 +++ b/docs/dynamic-reasoning.claude.md
-@@ -828,3 +828,38 @@ Explicitly *not* on this list: counterfactual replay by re-running saved
+@@ -828,3 +828,48 @@ Explicitly *not* on this list: counterfactual replay by re-running saved
  requests with forced closes at each rung. Item 1 subsumes it and is strictly
  cheaper — a forced close at rung *r* is a prefix of the unbounded trace, so the
  label comes out of the recording instead of a fresh generation.
@@ -159,36 +193,46 @@ index 179d8360fc..7be5ae713e 100644
 +
 +P8 is implemented (venv patch `serve-configs/patches/0012`, branch
 +`qwen3.8-27B-effort-v3`) and benchmarked as the VulcanBench v3 `dynamic-v3`
-+column. Results, method and the full bug list:
-+[`dynamic-reasoning-v3-results.md`](dynamic-reasoning-v3-results.md). Two
-+corrections to §13.3, both found only on the GPU:
++column. Results, the placement measurement and the full bug list:
++[`dynamic-reasoning-v3-results.md`](dynamic-reasoning-v3-results.md).
 +
-+1. **The §13.3 seam does not exist on agent traffic.** The effort sentence goes
-+   on the last *user* message, and an agent turn ends in a tool result, so the
-+   seam sits a fraction of the way into the prompt rather than at its tail. The
-+   body the decision would read is then a small prefix of what the model reads.
++**What `dynamic` is now.** One effort **level** per request, decided from the
++prompt's pooled prefill hidden state *before the model thinks*, rendered as that
++level's sentence at the **true tail** of the prompt. That sentence is the whole
++actuator. Everything in §1-§12 that acted on the think block is removed from
++this path: the rung ladder and its caps, mid-generation escalation, the quantile
++sketches and the rank rule, the soft-limit ramp, the forced close, and the
++loop-stall clamp. A dynamic request sets no thinking budget at all; the model
++ends its own reasoning, bounded only by the client's `max_tokens` and timeouts,
++exactly as it is at a fixed effort level. `close_kind` is `natural` or
++`client-limit`, and only a natural close contributes a value to the memory.
++
++Three corrections to §13.3, all found on the GPU:
++
++1. **The sentence has to move to the tail, and that is a measurement, not a
++   preference.** §2b measured placement on single-turn prompts, where the last
++   user message is the end of the prompt. An agent turn ends in a tool result,
++   and there the last-user-message placement is *inert*: the `xhigh` wording
++   moves reasoning length 1.14x against no sentence, versus 1.23x up / 0.78x
++   down for a trailing user message. So §13.3's seam is not where the sentence
++   was, and moving it there is what makes the split cover agent traffic at all.
 +2. **A non-final prefill chunk cannot end wherever it likes.** The served
 +   profile is hybrid GDN with prefix caching, so vLLM uses the Mamba `align`
 +   cache mode and widens the attention block to **1648 tokens**; in that mode a
-+   non-final chunk may only end on a cacheable block boundary. The body chunk
-+   ended at the seam, the aligning split clipped it to zero, and every dynamic
-+   request hung with the engine spinning on one waiting request. The boundary is
-+   now the last cacheable block boundary at or before the seam (one further
-+   block back, because an eagle drafter prunes the last matching block), which is
-+   up to 3 296 tokens earlier — and a prompt under two blocks has none at all.
++   non-final chunk may only end on a block boundary. The body chunk ended at the
++   seam, the aligning split clipped it to zero, and every dynamic request hung
++   with the engine spinning on one waiting request. The boundary is now the
++   largest multiple of the block at or before the seam.
++3. **`split_min_fraction` is the safety net, not the router.** A prompt with no
++   boundary covering at least that fraction of itself takes no decision and runs
++   at `default_level` with a byte-identical prompt. With a 1648-token block that
++   is prompts under about one block.
 +
-+So the shipped mechanism has two forms, chosen per request by
-+`hidden_effort.split_min_fraction` (0.75): the §13.3 **two-phase** form when the
-+body still covers that much of the prompt, and a **cap-only** form otherwise —
-+no split, nothing held back, the vector is the last row of the *whole* prompt
-+(the `last_final` the probe measured), and the decision moves the starting cap
-+alone, leaving the prompt byte-identical to pre-v3. Every VulcanBench v3 request
-+took the cap-only form.
-+
-+This means §13.5's open question — the token cost of a higher starting
-+*sentence* — is still open, because no sentence changed. §13.6's deletions are
-+also still pending; they are inert at the shipped defaults and were deferred so
-+the benchmark and the cutover would not land in one change.
++§13.5's open question is answered differently than it framed itself: the token
++cost of a higher level is now *entirely* the sentence, because there is no cap
++to grant. §13.6's deletions are done and then some — what remains is the
++worker-side escalation tensors, which are inert (nothing sets `worker_eval`) and
++are the next cutover on this branch.
 diff --git a/serve-configs/effort_calibrate.py b/serve-configs/effort_calibrate.py
 deleted file mode 100644
 index 4dff18e6bd..0000000000
@@ -695,7 +739,7 @@ index 4dff18e6bd..0000000000
 -if __name__ == "__main__":
 -    raise SystemExit(main())
 diff --git a/serve-configs/patches/README.md b/serve-configs/patches/README.md
-index 9f04f5dcc2..4c48cd646a 100644
+index 9f04f5dcc2..60163e677a 100644
 --- a/serve-configs/patches/README.md
 +++ b/serve-configs/patches/README.md
 @@ -1,7 +1,7 @@
@@ -711,7 +755,7 @@ index 9f04f5dcc2..4c48cd646a 100644
  | `5e67ad3e4` | l4-configs: L4-tuned block-fp8 GEMM configs for the Qwen3.8-27B TP4 shapes |
  | branch `qwen3.8-27B-effort-v2` | 0010 dynamic reasoning effort P6 - rank rule over running quantile sketches, p(`</think>`) grace, worker-side decision |
  | branch `qwen3.8-27B-effort-v2` | 0011 dynamic reasoning effort P7 - soft-limit close at the cap, termination/length rule with the uncertainty features gated by a measured AUC |
-+| branch `qwen3.8-27B-effort-v3` | 0012 dynamic reasoning effort P8 - hidden-state starting rung: two-phase prefill, online memory, asymmetric quantile map |
++| branch `qwen3.8-27B-effort-v3` | 0012 dynamic reasoning effort P8 - the effort *level* is chosen from the prefill hidden state and rendered at the prompt tail; the ladder, the caps and every mid-generation actuator are removed |
  
  The rest of this file documents what each change does and why.
  
@@ -719,7 +763,7 @@ index 9f04f5dcc2..4c48cd646a 100644
  | 0009 config/reasoning.py, entrypoints/openai/chat_completion/{dynamic_effort.py (new), protocol.py, serving.py}, outputs.py, v1/core/sched/{effort_controller.py (new), scheduler.py, output.py}, v1/engine/{__init__.py, output_processor.py}, v1/metrics/{loggers.py, stats.py}, v1/outputs.py, v1/sample/{effort_signals.py (new), sampler.py, metadata.py, rejection_sampler.py, thinking_budget_state.py}, v1/worker/{gpu_input_batch.py, gpu_model_runner.py}, v1/worker/gpu/{async_utils.py, model_runner.py, sample/{effort.py (new), output.py, sampler.py, thinking_budget.py}, spec_decode/rejection_sampler.py} | Dynamic reasoning effort (`docs/dynamic-reasoning.claude.md`): (a) P0 telemetry — per-request entropy (÷log V) and top1-top2 margin at the canonical stage (after penalties, before budget force/temperature/top-k/p), committed rows only, both runners, opt-in per request via `vllm_xargs.effort_telemetry`, JSONL sink `VLLM_EFFORT_TELEMETRY=/path`; zero work when no request is flagged. (b) Versioned thinking-budget updates `SchedulerOutput.thinking_budget_updates` (req -> (revision, budget)) applied by both runners with acks in `ModelRunnerOutput.thinking_budget_acks`; V2 fix: greedy budgeted requests were never forced (`_requires_logits_processing` ignored the budget); CPU torch reference of the V2 Triton budget kernels. (c) `reasoning_effort: "dynamic"` — rendered as template `medium` + the Qwen `low` sentence appended to the last user turn (block 0 stays effort-free, §2b), `thinking_token_budget = ladder[0]`, scheduler-side controller (`--reasoning-config '{"dynamic_effort": {...}}'`: ladder 1k/4k/16k/64k, checks at 75/90 % of the cap, entropy/margin/trend/MTP score vs θ per rung, stall clamp, batch-size rung cap, max_tokens headroom, deadline), `effort` object on the chat response, Prometheus `vllm:effort_*` | Without it: no per-request uncertainty telemetry, no mid-request budget raise, `dynamic` is rejected by the template. GPU-validated 2026-08-18 on the latency profile (static caps force at exactly N tokens under MTP K=7; `dynamic` escalates 0->1 on an open-ended prompt and stays capped on a confident grind; acks land, no `late`; Triton-vs-torch budget kernels 300/300 identical; docs §2c); CPU tests: `serve-configs/tests/test_effort_telemetry.py`, `test_v2_thinking_budget.py`, `test_effort_controller.py` (124 total pass) |
  | 0010 v1/core/sched/{effort_quantiles.py (new), effort_controller.py, scheduler.py, output.py}, v1/sample/{effort_policy.py (new), effort_signals.py, metadata.py, sampler.py, rejection_sampler.py}, v1/outputs.py, config/reasoning.py, v1/worker/{gpu_input_batch.py, gpu_model_runner.py}, v1/worker/gpu/{async_utils.py, model_runner.py, sample/{effort_escalation.py (new), effort.py, output.py, sampler.py, thinking_budget.py}, spec_decode/rejection_sampler.py} | Dynamic reasoning effort P6 (`docs/dynamic-reasoning.claude.md` §11, defaults from `docs/dynamic-reasoning-v3-analysis.md`): (a) running per-model quantile sketches (t-digest, persisted to `dynamic_effort.quantile_path`, warmed by `serve-configs/effort_calibrate.py`) replace the fixed `(mean, sd)` calibration table; features become percentile ranks plus a within-request baseline and the rule reduces to one tunable per rung (`p_uncertain`). (b) p(`</think>`) joins the frozen signal tuple (entropy, margin, p_end, n_rows) on both runners; a rising p(end) near the cap buys one `grace_tokens` window instead of a hard cut, and the forced close uses `ReasoningConfig.force_end_str` (Qwen's own transition phrase) while detection stays on `reasoning_end_str`. (c) language-agnostic n-gram novelty churn replaces the English backtrack-marker list (weight 0, still configurable). (d) the rule is evaluated on the V2 worker next to the cap actuator, so `late` is 0 by construction; the scheduler ships only policy, vetoes and stall clamps. `rule="score"` / `evaluation="scheduler"` keep the P2 behaviour; V1 always uses the scheduler path | Without it: the controller needs a hand-fitted calibration per model/quantization, escalates on absolute z-scores, cuts hard at the cap, and can apply a raised cap 1-2 steps late. CPU tests: `serve-configs/tests/test_effort_p6.py` plus the updated `test_effort_controller.py` / `test_effort_telemetry.py` (163 pass; 3 pinned-memory tests need a free GPU). GPU validation pending |
  | 0011 v1/sample/{soft_limit.py (new), thinking_budget_state.py, effort_policy.py}, v1/worker/gpu/sample/{thinking_budget.py, effort_escalation.py}, v1/core/sched/{effort_controller.py, effort_quantiles.py, scheduler.py}, config/reasoning.py, v1/metrics/{stats.py, loggers.py}, v1/engine/__init__.py, outputs.py, entrypoints/openai/chat_completion/protocol.py | Dynamic reasoning effort P7 (`docs/dynamic-reasoning.claude.md` §12; §11.0 is the standing model-agnostic-signal constraint): (a) **soft-limit close** - from the cap onward the first token of the *natural* reasoning end marker gets a bias `max_bias * clamp((t - cap)/ramp_tokens, 0, 1) ** curve` and the hard force moves to `cap + ramp_tokens`, so a model that is nearly done closes itself and nothing is forced. One formula (`vllm/v1/sample/soft_limit.py`), both actuators (V1 holder, V2 Triton kernel + torch reference), spec-decode aware on the target rows, and it applies to plain `thinking_token_budget` requests too. Every request reports `close_kind` natural/soft/forced on the response `effort` object and as `vllm:effort_close_total{kind}`. The `max_tokens` headroom and the stall clamp both subtract the ramp so their hard guarantees still land where they did; the P6 p(end) grace window is retired into the ramp. (b) **`rule="length"` is the default** - escalate when the request is still thinking at the check point, is not looping/churning, is not converging (p(end) rising) and passes the MTP veto; the entropy/margin rank terms are consulted only when the calibration file reports a discriminative AUC >= `uncertainty_min_auc` (0.60) for that model. `serve-configs/effort_calibrate.py build` measures and stores that AUC with the method of `docs/dynamic-reasoning-v3-analysis.md` §4; the scheduler logs at startup which features are active and why. `rule="rank"` / `"score"` keep the P6 / P2 behaviour | Without it: the cap cuts the model off mid-sentence (2.9 % of requests in the v3 sweep) and escalation keys on entropy/margin features measured at chance (AUC 0.41-0.54) on this model. CPU tests: `serve-configs/tests/test_effort_soft_limit.py` (new) plus the extended `test_effort_p6.py` / `test_effort_controller.py` / `test_v2_thinking_budget.py` (224 pass; 3 pinned-memory tests in `test_effort_telemetry.py` need a free GPU). GPU validation pending |
-+| 0012 config/reasoning.py, entrypoints/openai/chat_completion/{dynamic_effort.py, protocol.py, serving.py}, v1/request.py, v1/outputs.py, v1/core/sched/{effort_memory.py (new), effort_controller.py, output.py, scheduler.py}, v1/metrics/loggers.py, v1/worker/gpu/{effort_hidden.py (new), async_utils.py, model_runner.py} | Dynamic reasoning effort P8 (`docs/dynamic-reasoning.claude.md` §13, measurement in `docs/effort-hidden-probe.md`; still inside the §11.0 model-agnostic constraint - the signal is retrieval over the model's own vectors, nothing is fitted): the **starting** rung stops being fixed at 0. (a) **Two-phase prefill.** The frontend renders one prompt per rung and ships their longest common token prefix minus one as the body plus one tail per rung (`dynamic_effort.body_len` / `tails`); the scheduler caps the first chunk at the body so it is a non-final prefill chunk - no token is sampled, no draft is proposed - and asks the worker for the body's last row. Cached blocks past the body are never adopted, so a 100%-prefix-cached prompt still produces a row. (b) **Online memory** (`vllm/v1/core/sched/effort_memory.py`): a FIFO ring (per-session cap `memory_size/64`) of L2-normalised pooled states inserted at request finish, valued by the reasoning tokens the request spent - **only at a natural close**, since a soft/forced close or an abort is right-censored and enters as a key with no value. Query = cosine kNN-16, `novelty = (1 - max cos)/2`, `spread` = the weighted stdev of the neighbours' values; persisted as fp16 `.npz` to `hidden_effort.memory_path` and dropped on a model / hidden-size / ladder change. (c) **Asymmetric map** (§13.5): percentile ranks of running digests, `q >= q_high` -> rung 2, `q >= q_mid` -> rung 1, and the *downward* band alone is gated on `novelty` and `spread`, because one under-routed step can kill a trajectory while over-routing only costs tokens. The chosen tail replaces the rung-0 one in place and the cap ships through the existing versioned `thinking_budget_updates`. `hidden_effort.enabled=false`, a cold memory, a missing vector, `shadow=true`, the V1 runner or a rung whose cap the `max_tokens` headroom cannot honour all render rung 0 with a **byte-identical prompt**. New `start_rung` on the response `effort` object and `vllm:effort_start_rung` | Without it every dynamic request starts at the 1k cap with the "keep it brief" sentence: 12.3 % of the measured natural closes were under-provisioned at the start and the p90 of what those requests actually wanted was 1 471 think tokens (§13.5). The label-free kNN separates them at AUC 0.850 out-of-fold, against 0.729 for prompt length and ~chance for entropy/margin. Cost: one extra engine step per dynamic request; the body is byte-identical across rungs, so the prefix cache holds one body per conversation instead of one per (conversation, rung). CPU tests: `serve-configs/tests/test_effort_memory.py`, `test_effort_two_phase.py` (a real `Scheduler` on the served model's config, sync and async), `test_effort_hidden_pooling.py` (253 pass) |
++| 0012 config/reasoning.py, entrypoints/openai/chat_completion/{dynamic_effort.py, protocol.py, serving.py}, v1/request.py, v1/outputs.py, v1/core/sched/{effort_memory.py (new), effort_controller.py, output.py, scheduler.py}, v1/metrics/loggers.py, v1/worker/gpu/{effort_hidden.py (new), async_utils.py, model_runner.py}; **deletes** v1/sample/effort_policy.py, v1/worker/gpu/sample/effort_escalation.py and serve-configs/effort_calibrate.py | Dynamic reasoning effort P8 (`docs/dynamic-reasoning.claude.md` §13, measurement in `docs/effort-hidden-probe.md`, results in `docs/dynamic-reasoning-v3-results.md`; still inside the §11.0 model-agnostic constraint - the signal is retrieval over the model's own vectors and nothing is fitted). `reasoning_effort: "dynamic"` becomes: **one effort level per request, decided before the model thinks, rendered as that level's sentence at the true tail of the prompt** (a trailing user message after the last turn - measured: on the last *user* message of an agent turn the xhigh wording moves reasoning length 1.14x, at the tail 1.23x up and 0.78x down, because a tool result otherwise sits between it and the generation point). (a) **Two-phase prefill.** The frontend renders one prompt per level and ships their longest common token prefix minus one as the body plus one tail per level; the scheduler caps the first chunk at the body so it is a non-final prefill chunk - no token sampled, no draft proposed - and asks the worker for the body's last row. The boundary is quantised to a KV block (1648 tokens on this hybrid profile); cached blocks past the body are never adopted, so a fully prefix-cached prompt still produces a row. (b) **Online memory** (`vllm/v1/core/sched/effort_memory.py`): a FIFO ring (per-session cap `memory_size/64`) of L2-normalised pooled states inserted at request finish, valued by the reasoning tokens the request spent - **only at a natural close**, since a client-limited one is right-censored and enters as a key with no value. Query = cosine kNN-16, `novelty = (1 - max cos)/2`, `spread` = the weighted stdev of the neighbours' values; persisted as fp16 `.npz`. (c) **Asymmetric map** (§13.5) over running digests: `q >= q_high` -> top level, `q >= q_mid` -> middle, and the *downward* band alone is gated on novelty and spread. (d) **Everything that touched the think block is removed from this path**: the rung ladder and per-rung caps, mid-generation escalation, the quantile sketches and rank rule, the soft-limit ramp, the forced close and the loop-stall clamp. A dynamic request sets **no thinking budget at all**; the model ends its own reasoning, bounded only by the client's `max_tokens` and timeouts, and `close_kind` is `natural` or `client-limit`. The response `effort` object carries `level`, `decided`, `reasoning_tokens`, `close_kind`, `memory_entries`, `neighbours`; metrics are `vllm:effort_level`, `vllm:effort_decided`, `vllm:effort_close{kind}`, `vllm:reasoning_tokens` | Without it every dynamic request gets the same "keep it brief" sentence and a 1k cap it has to escalate out of: 12.3 % of measured natural closes were under-provisioned at the start and the p90 of what those requests wanted was 1 471 think tokens (§13.5), while the label-free kNN separates them at AUC 0.850 out of fold against 0.729 for prompt length and ~chance for entropy/margin. Cost: one extra engine step per dynamic request; the body is byte-identical across levels, so the prefix cache holds one body per conversation instead of one per (conversation, level). CPU tests: `serve-configs/tests/test_effort_levels.py`, `test_effort_memory.py`, `test_effort_two_phase.py` (a real `Scheduler` on the served model's config, sync and async), `test_effort_hidden_pooling.py` (117 pass; 3 pinned-memory tests in `test_effort_telemetry.py` need a free GPU). Still in the tree but permanently unarmed: the worker-side escalation tensors (`vllm/v1/worker/gpu/sample/effort_escalation.py`) - nothing sets `worker_eval` |
  | l4-configs/*.json (data, copied by apply-to-venv.sh) | L4-tuned Triton block-fp8 GEMM configs for the five per-rank TP4 shapes of Qwen3.8-27B (N,K = 4096/8704/3584x5120, 5120x4352, 5120x1536), keyed by M; from an HBM-realistic sweep (weights rotated past the 48 MB L2) | vLLM has no NVIDIA_L4 entries and falls back to BLOCK_M=64/N=128 for every M; the tuned tiles are +5-18% per GEMM (M<=32 and 96-128), measured in-model: single-stream 68/59/106/143 -> 72/63/112/150 tok/s |
  | 0004 model_loader/weight_utils.py | `get_quant_config` tolerates a callable `hf_overrides` (draft models compose one) instead of raising | `speculative-config` with `"quantization"` on a dspark/eagle draft crashes at load with "hf_overrides must be a dict" (note: online-fp8 for the DSpark drafter still fails later in the DFlash precompute path on SM89 — Marlin-repacked weight; keep the drafter bf16) |
  
@@ -3951,10 +3995,10 @@ index 37788a665e..729dd1ff53 100644
  # --------------------------------------------------------------------------
 diff --git a/serve-configs/tests/test_effort_two_phase.py b/serve-configs/tests/test_effort_two_phase.py
 new file mode 100644
-index 0000000000..fb16b4dd13
+index 0000000000..c4afb16a5d
 --- /dev/null
 +++ b/serve-configs/tests/test_effort_two_phase.py
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,442 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""End-to-end scheduler tests for the v3 two-phase prefill decision (§13.3).
 +
@@ -4144,18 +4188,26 @@ index 0000000000..fb16b4dd13
 +
 +
 +def test_held_request_falls_back_rather_than_stalling():
++    """Liveness: a vector that never arrives must not park the request forever.
++
++    The bound is generous on purpose - the async batch queue can put several
++    schedule() calls between the body prefill and its output, and giving up
++    early silently drops the decision.
++    """
++    from vllm.v1.core.sched.scheduler import MAX_EFFORT_DECISION_SKIPS
++
 +    scheduler = _scheduler()
 +    request = _add(scheduler, "a")
 +    scheduler.schedule()
-+    for _ in range(3):
-+        scheduler.schedule()
-+    # The vector never arrived; the request resolves to rung 0 instead of
-+    # sitting in the running queue forever.
++    for _ in range(MAX_EFFORT_DECISION_SKIPS):
++        assert "a" not in scheduler.schedule().num_scheduled_tokens
++        assert request.effort_decision_pending
++    scheduler.schedule()
++    # The vector never arrived; the request resolves to the default level
++    # instead of sitting in the running queue forever.
 +    assert not request.effort_decision_pending
++    assert scheduler._effort_held_timeouts == 1
 +    assert scheduler.schedule().num_scheduled_tokens["a"] == len(TAILS[0])
-+
-+
-+# --------------------------------------------------------------- the decision
 +
 +
 +def test_tail_appended_and_no_budget_shipped():
@@ -6476,7 +6528,7 @@ index e48596cc02..a7c5a79322 100644
      # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
      # the durable boundary block of a producer's last-prompt-boundary partial
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 7895359227..56c7897e70 100644
+index 7895359227..e5f9848ce1 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -8,6 +8,8 @@ from collections.abc import Iterable
@@ -6535,7 +6587,20 @@ index 7895359227..56c7897e70 100644
  from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
  from vllm.v1.spec_decode.metrics import SpecDecodingStats
  from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
-@@ -311,19 +311,18 @@ class Scheduler(SchedulerInterface):
+@@ -86,6 +86,12 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+ 
++MAX_EFFORT_DECISION_SKIPS = 16
++"""Scheduler steps a request awaiting its effort decision may be held for
++before it gives up and runs at the default level. Purely a liveness bound: the
++request is simply not scheduled while it waits, and the vector normally arrives
++on the first step after the body prefill."""
++
+ 
+ def adaptive_num_spec_tokens(
+     emas: list[float | None],
+@@ -311,19 +317,19 @@ class Scheduler(SchedulerInterface):
          # Dynamic reasoning effort: per-request controller state, pending
          # (unacked) budget updates, and relaxed repetition params.
          self._effort: dict[str, EffortState] = {}
@@ -6557,6 +6622,7 @@ index 7895359227..56c7897e70 100644
 +        self._effort_memory: EffortMemory | None = None
 +        self._effort_vectors: dict[str, np.ndarray] = {}
 +        self._effort_level_total: dict[int, int] = {}
++        self._effort_held_timeouts = 0
 +        self._effort_default_reason: dict[str, int] = {}
 +        # First few decisions are logged at INFO so a deployment can see the
 +        # split arm and the vector arrive without turning on debug logging.
@@ -6564,7 +6630,7 @@ index 7895359227..56c7897e70 100644
          reasoning_config = vllm_config.reasoning_config
          if reasoning_config is not None and reasoning_config.dynamic_effort:
              self._init_effort_controller(reasoning_config)
-@@ -626,6 +625,20 @@ class Scheduler(SchedulerInterface):
+@@ -626,6 +632,25 @@ class Scheduler(SchedulerInterface):
                  req_index += 1
                  continue
  
@@ -6577,7 +6643,12 @@ index 7895359227..56c7897e70 100644
 +                # The vector arrives with this step's output; the counter is the
 +                # liveness guarantee if it never does.
 +                request.effort_decision_skips += 1
-+                if request.effort_decision_skips > 2:
++                if request.effort_decision_skips > MAX_EFFORT_DECISION_SKIPS:
++                    # Liveness only. The vector normally arrives with the very
++                    # next output, but the async batch queue and a busy step can
++                    # put several schedule() calls in between, and giving up too
++                    # early silently drops the decision.
++                    self._effort_held_timeouts += 1
 +                    self._resolve_effort_decision(request, None)
 +                req_index += 1
 +                continue
@@ -6585,7 +6656,7 @@ index 7895359227..56c7897e70 100644
              if defer_prefills and request.is_prefill_chunk:
                  # DP prefill balancing: defer this in-progress prefill chunk to a
                  # cadence-aligned step; decodes still run to fill this step.
-@@ -637,6 +650,11 @@ class Scheduler(SchedulerInterface):
+@@ -637,6 +662,11 @@ class Scheduler(SchedulerInterface):
                  + request.num_output_placeholders
                  - request.num_computed_tokens
              )
@@ -6597,7 +6668,7 @@ index 7895359227..56c7897e70 100644
              if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                  num_new_tokens = self.scheduler_config.long_prefill_token_threshold
              num_new_tokens = min(
-@@ -954,6 +972,29 @@ class Scheduler(SchedulerInterface):
+@@ -954,6 +984,29 @@ class Scheduler(SchedulerInterface):
                          )
                          connector_prefix_cache_hits = num_external_computed_tokens
  
@@ -6627,7 +6698,7 @@ index 7895359227..56c7897e70 100644
                      # Total computed tokens (local + external).
                      num_computed_tokens = (
                          num_new_local_computed_tokens + num_external_computed_tokens
-@@ -1007,6 +1048,11 @@ class Scheduler(SchedulerInterface):
+@@ -1007,6 +1060,11 @@ class Scheduler(SchedulerInterface):
                      # `request.num_prompt_tokens` to consider the resumed
                      # requests, which have output tokens.
                      num_new_tokens = request.num_tokens - num_computed_tokens
@@ -6639,7 +6710,7 @@ index 7895359227..56c7897e70 100644
  
                      # Pad new decode requests to uniform spec decoding size to
                      # preserve full cudagraph for this step.
-@@ -1015,6 +1061,7 @@ class Scheduler(SchedulerInterface):
+@@ -1015,6 +1073,7 @@ class Scheduler(SchedulerInterface):
                          (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                          and self.num_sampled_tokens_per_step > 0
                          and num_new_tokens == 1
@@ -6647,7 +6718,7 @@ index 7895359227..56c7897e70 100644
                          and (scheduled_running_reqs and not prefill_scheduled)
                      ):
                          num_new_tokens = 1 + self.num_spec_tokens
-@@ -1370,17 +1417,7 @@ class Scheduler(SchedulerInterface):
+@@ -1370,17 +1429,7 @@ class Scheduler(SchedulerInterface):
              partial_tail_offloads=pending_partial_tail_offloads,
              num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
              ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
@@ -6666,7 +6737,7 @@ index 7895359227..56c7897e70 100644
          )
  
          # NOTE(Kuntai): this function is designed for multiple purposes:
-@@ -1490,6 +1527,12 @@ class Scheduler(SchedulerInterface):
+@@ -1490,6 +1539,12 @@ class Scheduler(SchedulerInterface):
              request.is_prefill_chunk = request.num_computed_tokens < (
                  request.num_tokens + request.num_output_placeholders
              )
@@ -6679,7 +6750,7 @@ index 7895359227..56c7897e70 100644
              scheduler_output.has_structured_output_requests |= (
                  request.use_structured_output and not request.is_prefill_chunk
              )
-@@ -1853,15 +1896,8 @@ class Scheduler(SchedulerInterface):
+@@ -1853,15 +1908,8 @@ class Scheduler(SchedulerInterface):
          outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
          spec_decoding_stats: SpecDecodingStats | None = None
  
@@ -6697,7 +6768,7 @@ index 7895359227..56c7897e70 100644
  
          failed_kv_load_req_ids = None
          if kv_connector_output and kv_connector_output.invalid_block_ids:
-@@ -1927,6 +1963,19 @@ class Scheduler(SchedulerInterface):
+@@ -1927,6 +1975,19 @@ class Scheduler(SchedulerInterface):
              if output_is_stale and request.drop_stale_output:
                  continue
  
@@ -6717,7 +6788,7 @@ index 7895359227..56c7897e70 100644
              req_index = model_runner_output.req_id_to_index[req_id]
              generated_token_ids = (
                  sampled_token_ids[req_index] if sampled_token_ids else []
-@@ -1935,7 +1984,6 @@ class Scheduler(SchedulerInterface):
+@@ -1935,7 +1996,6 @@ class Scheduler(SchedulerInterface):
              scheduled_spec_token_ids = (
                  scheduler_output.scheduled_spec_decode_tokens.get(req_id)
              )
@@ -6725,7 +6796,7 @@ index 7895359227..56c7897e70 100644
              effort_num_draft: int | None = None
              effort_num_accepted: int | None = None
              if scheduled_spec_token_ids and (
-@@ -1945,7 +1993,6 @@ class Scheduler(SchedulerInterface):
+@@ -1945,7 +2005,6 @@ class Scheduler(SchedulerInterface):
                  num_sampled = self.num_sampled_tokens_per_step
                  num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                  num_rejected = num_draft_tokens - num_accepted
@@ -6733,7 +6804,7 @@ index 7895359227..56c7897e70 100644
                  effort_num_draft, effort_num_accepted = num_draft_tokens, num_accepted
                  if self.adaptive_draft:
                      self._update_accepted_ema(req_id=req_id, num_accepted=num_accepted)
-@@ -2004,16 +2051,11 @@ class Scheduler(SchedulerInterface):
+@@ -2004,16 +2063,11 @@ class Scheduler(SchedulerInterface):
  
              effort_state = self._effort.get(req_id) if self._effort else None
              if effort_state is not None and new_token_ids:
@@ -6754,7 +6825,7 @@ index 7895359227..56c7897e70 100644
                  )
              if effort_sink is not None:
                  effort_signal = effort_signals.get(req_id)
-@@ -2169,6 +2211,13 @@ class Scheduler(SchedulerInterface):
+@@ -2169,6 +2223,13 @@ class Scheduler(SchedulerInterface):
                  # Invariant: EngineCore returns no partial prefill outputs.
                  assert not prompt_logprobs_tensors
  
@@ -6768,7 +6839,7 @@ index 7895359227..56c7897e70 100644
          # Remove the stopped requests from the running and waiting queues.
          if stopped_running_reqs:
              self.running = remove_all(self.running, stopped_running_reqs)
-@@ -2560,78 +2609,58 @@ class Scheduler(SchedulerInterface):
+@@ -2560,78 +2621,58 @@ class Scheduler(SchedulerInterface):
              return
          cfg = reasoning_config.dynamic_effort
          assert cfg is not None
@@ -6888,7 +6959,7 @@ index 7895359227..56c7897e70 100644
          )
  
      def _maybe_add_effort_state(self, request: Request) -> None:
-@@ -2642,189 +2671,251 @@ class Scheduler(SchedulerInterface):
+@@ -2642,189 +2683,252 @@ class Scheduler(SchedulerInterface):
          if not isinstance(overrides, dict):
              return
          assert self._effort_cfg is not None
@@ -7056,13 +7127,7 @@ index 7895359227..56c7897e70 100644
 +                request.effort_body_len,
 +                "present" if vector is not None else "MISSING",
 +                memory.n_entries if memory is not None else -1,
-             )
--        self._effort_policy_age += 1
--        # A fresh object per step: the same policy may still be in flight in an
--        # already-scheduled SchedulerOutput under async scheduling.
--        return replace(
--            self._effort_policy,
--            max_rung=cfg.max_rung_for_batch_size(batch_size),
++            )
 +        if memory is not None and vector is not None:
 +            self._effort_vectors[request.request_id] = np.asarray(
 +                vector, dtype=np.float32
@@ -7104,7 +7169,13 @@ index 7895359227..56c7897e70 100644
 +        if level == default_level:
 +            self._effort_default_reason[reason] = (
 +                self._effort_default_reason.get(reason, 0) + 1
-+            )
+             )
+-        self._effort_policy_age += 1
+-        # A fresh object per step: the same policy may still be in flight in an
+-        # already-scheduled SchedulerOutput under async scheduling.
+-        return replace(
+-            self._effort_policy,
+-            max_rung=cfg.max_rung_for_batch_size(batch_size),
 +        if state is not None:
 +            state.level = level
 +        if level == default_level or not tails:
@@ -7229,13 +7300,14 @@ index 7895359227..56c7897e70 100644
 +        if memory.n_entries and memory.n_entries % 64 == 0:
 +            logger.info(
 +                "dynamic_effort: memory %d/%d entries (%d valued), hit rate "
-+                "%.2f, levels %s, default-level reasons %s",
++                "%.2f, levels %s, default-level reasons %s, held timeouts %d",
 +                memory.n_entries,
 +                memory.cfg.memory_size,
 +                memory.n_valued,
 +                memory.hit_rate,
 +                dict(sorted(self._effort_level_total.items())),
 +                dict(sorted(self._effort_default_reason.items())),
++                self._effort_held_timeouts,
              )
  
 +    def _effort_split_worth_it(self, request: Request, boundary: int) -> int:

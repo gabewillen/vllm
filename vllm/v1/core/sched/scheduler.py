@@ -86,6 +86,12 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+MAX_EFFORT_DECISION_SKIPS = 16
+"""Scheduler steps a request awaiting its effort decision may be held for
+before it gives up and runs at the default level. Purely a liveness bound: the
+request is simply not scheduled while it waits, and the vector normally arrives
+on the first step after the body prefill."""
+
 
 def adaptive_num_spec_tokens(
     emas: list[float | None],
@@ -319,6 +325,7 @@ class Scheduler(SchedulerInterface):
         self._effort_memory: EffortMemory | None = None
         self._effort_vectors: dict[str, np.ndarray] = {}
         self._effort_level_total: dict[int, int] = {}
+        self._effort_held_timeouts = 0
         self._effort_default_reason: dict[str, int] = {}
         # First few decisions are logged at INFO so a deployment can see the
         # split arm and the vector arrive without turning on debug logging.
@@ -634,7 +641,12 @@ class Scheduler(SchedulerInterface):
                 # The vector arrives with this step's output; the counter is the
                 # liveness guarantee if it never does.
                 request.effort_decision_skips += 1
-                if request.effort_decision_skips > 2:
+                if request.effort_decision_skips > MAX_EFFORT_DECISION_SKIPS:
+                    # Liveness only. The vector normally arrives with the very
+                    # next output, but the async batch queue and a busy step can
+                    # put several schedule() calls in between, and giving up too
+                    # early silently drops the decision.
+                    self._effort_held_timeouts += 1
                     self._resolve_effort_decision(request, None)
                 req_index += 1
                 continue
@@ -2854,13 +2866,14 @@ class Scheduler(SchedulerInterface):
         if memory.n_entries and memory.n_entries % 64 == 0:
             logger.info(
                 "dynamic_effort: memory %d/%d entries (%d valued), hit rate "
-                "%.2f, levels %s, default-level reasons %s",
+                "%.2f, levels %s, default-level reasons %s, held timeouts %d",
                 memory.n_entries,
                 memory.cfg.memory_size,
                 memory.n_valued,
                 memory.hit_rate,
                 dict(sorted(self._effort_level_total.items())),
                 dict(sorted(self._effort_default_reason.items())),
+                self._effort_held_timeouts,
             )
 
     def _effort_split_worth_it(self, request: Request, boundary: int) -> int:
