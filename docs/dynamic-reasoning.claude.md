@@ -833,33 +833,43 @@ label comes out of the recording instead of a fresh generation.
 
 P8 is implemented (venv patch `serve-configs/patches/0012`, branch
 `qwen3.8-27B-effort-v3`) and benchmarked as the VulcanBench v3 `dynamic-v3`
-column. Results, method and the full bug list:
-[`dynamic-reasoning-v3-results.md`](dynamic-reasoning-v3-results.md). Two
-corrections to §13.3, both found only on the GPU:
+column. Results, the placement measurement and the full bug list:
+[`dynamic-reasoning-v3-results.md`](dynamic-reasoning-v3-results.md).
 
-1. **The §13.3 seam does not exist on agent traffic.** The effort sentence goes
-   on the last *user* message, and an agent turn ends in a tool result, so the
-   seam sits a fraction of the way into the prompt rather than at its tail. The
-   body the decision would read is then a small prefix of what the model reads.
+**What `dynamic` is now.** One effort **level** per request, decided from the
+prompt's pooled prefill hidden state *before the model thinks*, rendered as that
+level's sentence at the **true tail** of the prompt. That sentence is the whole
+actuator. Everything in §1-§12 that acted on the think block is removed from
+this path: the rung ladder and its caps, mid-generation escalation, the quantile
+sketches and the rank rule, the soft-limit ramp, the forced close, and the
+loop-stall clamp. A dynamic request sets no thinking budget at all; the model
+ends its own reasoning, bounded only by the client's `max_tokens` and timeouts,
+exactly as it is at a fixed effort level. `close_kind` is `natural` or
+`client-limit`, and only a natural close contributes a value to the memory.
+
+Three corrections to §13.3, all found on the GPU:
+
+1. **The sentence has to move to the tail, and that is a measurement, not a
+   preference.** §2b measured placement on single-turn prompts, where the last
+   user message is the end of the prompt. An agent turn ends in a tool result,
+   and there the last-user-message placement is *inert*: the `xhigh` wording
+   moves reasoning length 1.14x against no sentence, versus 1.23x up / 0.78x
+   down for a trailing user message. So §13.3's seam is not where the sentence
+   was, and moving it there is what makes the split cover agent traffic at all.
 2. **A non-final prefill chunk cannot end wherever it likes.** The served
    profile is hybrid GDN with prefix caching, so vLLM uses the Mamba `align`
    cache mode and widens the attention block to **1648 tokens**; in that mode a
-   non-final chunk may only end on a cacheable block boundary. The body chunk
-   ended at the seam, the aligning split clipped it to zero, and every dynamic
-   request hung with the engine spinning on one waiting request. The boundary is
-   now the last cacheable block boundary at or before the seam (one further
-   block back, because an eagle drafter prunes the last matching block), which is
-   up to 3 296 tokens earlier — and a prompt under two blocks has none at all.
+   non-final chunk may only end on a block boundary. The body chunk ended at the
+   seam, the aligning split clipped it to zero, and every dynamic request hung
+   with the engine spinning on one waiting request. The boundary is now the
+   largest multiple of the block at or before the seam.
+3. **`split_min_fraction` is the safety net, not the router.** A prompt with no
+   boundary covering at least that fraction of itself takes no decision and runs
+   at `default_level` with a byte-identical prompt. With a 1648-token block that
+   is prompts under about one block.
 
-So the shipped mechanism has two forms, chosen per request by
-`hidden_effort.split_min_fraction` (0.75): the §13.3 **two-phase** form when the
-body still covers that much of the prompt, and a **cap-only** form otherwise —
-no split, nothing held back, the vector is the last row of the *whole* prompt
-(the `last_final` the probe measured), and the decision moves the starting cap
-alone, leaving the prompt byte-identical to pre-v3. Every VulcanBench v3 request
-took the cap-only form.
-
-This means §13.5's open question — the token cost of a higher starting
-*sentence* — is still open, because no sentence changed. §13.6's deletions are
-also still pending; they are inert at the shipped defaults and were deferred so
-the benchmark and the cutover would not land in one change.
+§13.5's open question is answered differently than it framed itself: the token
+cost of a higher level is now *entirely* the sentence, because there is no cap
+to grant. §13.6's deletions are done and then some — what remains is the
+worker-side escalation tensors, which are inert (nothing sets `worker_eval`) and
+are the next cutover on this branch.
