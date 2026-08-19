@@ -196,6 +196,13 @@ class Request:
         self.effort_body_len = 0
         self.effort_tail_variants: list[list[int]] | None = None
         self.effort_decision_pending = False
+        # True only for the two-phase form: the prefill stops at
+        # `effort_body_len` and the request is held until the rung is chosen.
+        # False means the decision rides on the natural end of the prefill and
+        # sets the starting *cap* alone, which is what a prompt whose effort
+        # sentence is not at its tail (an agent loop ending in a tool result)
+        # or a model whose KV block is wider than the seam falls back to.
+        self.effort_hold_prefill = False
         # Steps the scheduler has held this request waiting for its vector; the
         # decision falls back to rung 0 rather than stalling forever.
         self.effort_decision_skips = 0

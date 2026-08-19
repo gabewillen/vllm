@@ -118,6 +118,14 @@ class HiddenEffortConfig:
     memory, so a restart starts cold."""
     flush_every: int = Field(default=256, ge=0)
     """Inserts between two writes of `memory_path`; 0 disables."""
+    split_min_fraction: float = Field(default=0.75, ge=0.0, le=1.0)
+    """Fraction of the prompt the body must cover before the *two-phase* form
+    (which also chooses the rung's prompt sentence) is used instead of the
+    cap-only form. An agent turn that ends in a tool result puts the effort
+    sentence - and so the seam - thousands of tokens from the end of the
+    prompt, and a wide KV block quantises the boundary further; below this
+    fraction the vector would describe a small prefix of what the model reads,
+    and reading the whole prompt and moving only the cap is better informed."""
     effort_sentences: list[str] | None = None
     """One prompt sentence per rung, appended to the *tail* of the last user
     turn. `None` uses `[low, "", high]` padded to the ladder with `""`

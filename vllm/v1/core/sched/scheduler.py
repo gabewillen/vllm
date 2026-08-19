@@ -647,7 +647,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if (
-                request.effort_decision_pending
+                request.effort_hold_prefill
                 and request.num_computed_tokens >= request.effort_body_len
             ):
                 # v3: the body is prefilled and the starting rung is not chosen
@@ -671,7 +671,7 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if request.effort_decision_pending:
+            if request.effort_hold_prefill:
                 num_new_tokens = min(
                     num_new_tokens,
                     request.effort_body_len - request.num_computed_tokens,
@@ -994,7 +994,7 @@ class Scheduler(SchedulerInterface):
                         connector_prefix_cache_hits = num_external_computed_tokens
 
                     if (
-                        request.effort_decision_pending
+                        request.effort_hold_prefill
                         and num_new_local_computed_tokens + num_external_computed_tokens
                         >= request.effort_body_len
                     ):
@@ -1069,7 +1069,7 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    if request.effort_decision_pending:
+                    if request.effort_hold_prefill:
                         num_new_tokens = min(
                             num_new_tokens,
                             request.effort_body_len - num_computed_tokens,
@@ -1082,7 +1082,7 @@ class Scheduler(SchedulerInterface):
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
-                        and not request.effort_decision_pending
+                        and not request.effort_hold_prefill
                         and (scheduled_running_reqs and not prefill_scheduled)
                     ):
                         num_new_tokens = 1 + self.num_spec_tokens
@@ -2808,17 +2808,7 @@ class Scheduler(SchedulerInterface):
                 and 0 < body_len < request.num_prompt_tokens
             ):
                 boundary = self._effort_body_boundary(request, body_len)
-                if self._effort_trace_budget > 0:
-                    logger.info(
-                        "dynamic_effort %s: seam at %d of %d prompt tokens, "
-                        "body boundary %d, tails %s",
-                        request.request_id,
-                        body_len,
-                        request.num_prompt_tokens,
-                        boundary,
-                        [len(t) for t in tails],
-                    )
-                if boundary:
+                if boundary and self._effort_split_worth_it(request, boundary):
                     assert request.prompt_token_ids is not None
                     # Tokens between the boundary and the frontend's seam are
                     # the same in every variant, so they ride at the head of
@@ -2826,7 +2816,25 @@ class Scheduler(SchedulerInterface):
                     middle = list(request.prompt_token_ids[boundary:body_len])
                     request.effort_body_len = boundary
                     request.effort_tail_variants = [middle + list(t) for t in tails]
-                    request.effort_decision_pending = True
+                    request.effort_hold_prefill = True
+                else:
+                    # Cap-only: no split, no hold. The vector is the last row of
+                    # the prompt's own prefill and the decision moves the
+                    # starting cap; the prompt is byte-identical to pre-v3.
+                    request.effort_body_len = request.num_prompt_tokens
+                    boundary = 0
+                request.effort_decision_pending = True
+                if self._effort_trace_budget > 0:
+                    logger.info(
+                        "dynamic_effort %s: seam at %d of %d prompt tokens, "
+                        "tails %s -> %s (body %d)",
+                        request.request_id,
+                        body_len,
+                        request.num_prompt_tokens,
+                        [len(t) for t in tails],
+                        "two-phase" if request.effort_hold_prefill else "cap-only",
+                        request.effort_body_len,
+                    )
         # A deadline needs a clock, which the worker does not have; those
         # requests keep the scheduler-side decision.
         if self._effort_worker_eval and state.deadline_ms is None:
@@ -2865,6 +2873,7 @@ class Scheduler(SchedulerInterface):
         if not request.effort_decision_pending:
             return False
         request.effort_decision_pending = False
+        request.effort_hold_prefill = False
         request.effort_decision_skips = 0
         memory = self._effort_memory
         tails = request.effort_tail_variants
@@ -2881,7 +2890,7 @@ class Scheduler(SchedulerInterface):
                 "present" if vector is not None else "MISSING",
                 memory.n_entries if memory is not None else -1,
             )
-        if memory is not None and tails and vector is not None:
+        if memory is not None and vector is not None:
             self._effort_vectors[request.request_id] = np.asarray(
                 vector, dtype=np.float32
             )
@@ -2889,8 +2898,11 @@ class Scheduler(SchedulerInterface):
             if query is None:
                 reason = "empty-memory"
             else:
+                top_rung = (
+                    len(tails) - 1 if tails else (len(state.ladder) - 1 if state else 0)
+                )
                 decision = decide_start_rung(
-                    query, memory.ranks(query), memory.cfg, len(tails) - 1
+                    query, memory.ranks(query), memory.cfg, top_rung
                 )
                 if not memory.ready:
                     reason = f"cold/{decision.reason}"
@@ -2926,9 +2938,10 @@ class Scheduler(SchedulerInterface):
                 # rung's prompt would ask for thinking it cannot do.
                 rung = 0
                 state.start_rung = 0
-        if rung == 0 or not tails:
+        if rung == 0:
             return False
-        self._apply_effort_tail(request, tails[rung])
+        if tails is not None:
+            self._apply_effort_tail(request, tails[rung])
         if state is not None and self._effort_cfg is not None:
             state.rung = rung
             state.cap = effective_cap(state, self._effort_cfg, rung)
@@ -2936,7 +2949,7 @@ class Scheduler(SchedulerInterface):
             state.revision += 1
             state.pending_is_escalation = False
             self._effort_pending[request.request_id] = (state.revision, state.cap)
-        return True
+        return tails is not None
 
     def _apply_effort_tail(self, request: Request, tail: list[int]) -> None:
         """Replace the rung-0 tail with the chosen one, in place.
@@ -2995,6 +3008,24 @@ class Scheduler(SchedulerInterface):
                 dict(sorted(self._effort_start_rung_total.items())),
                 dict(sorted(self._effort_decision_skipped.items())),
             )
+
+    def _effort_split_worth_it(self, request: Request, boundary: int) -> int:
+        """Whether choosing the prompt tail beats reading the whole prompt.
+
+        The two-phase form buys the rung's *sentence*, but only if the vector it
+        decides from is nearly the whole prompt. An agent turn that ends in a
+        tool result puts the last user message - where the effort sentence goes
+        - thousands of tokens from the end, and the body would then be a small
+        prefix of what the model actually reads. Below `split_min_fraction` of
+        the prompt the cap-only form is strictly better informed.
+        """
+        cfg = self._effort_cfg
+        assert cfg is not None
+        if request.num_prompt_tokens <= 0:
+            return False
+        return (
+            boundary / request.num_prompt_tokens >= cfg.hidden_effort.split_min_fraction
+        )
 
     def _effort_body_boundary(self, request: Request, body_len: int) -> int:
         """Where the body prefill may stop, or 0 when it may not stop at all.

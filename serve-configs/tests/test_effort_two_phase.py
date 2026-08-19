@@ -163,7 +163,7 @@ def test_split_body_and_tails_keeps_the_lookahead_token_shared():
 def test_body_prefill_emits_no_token():
     scheduler = _scheduler()
     request = _add(scheduler, "a")
-    assert request.effort_decision_pending
+    assert request.effort_decision_pending and request.effort_hold_prefill
     assert request.effort_body_len == BODY
 
     output = scheduler.schedule()
@@ -401,10 +401,47 @@ def test_body_stops_at_a_cacheable_block_boundary_under_mamba_align():
     )
 
 
-def test_a_prompt_with_no_cacheable_boundary_keeps_the_single_phase_path():
-    scheduler = _scheduler()
-    scheduler.need_mamba_block_aligned_split = True
-    scheduler.use_eagle = True
+def test_no_usable_seam_falls_back_to_cap_only():
+    """No cacheable boundary, or a seam far from the prompt's tail, drops the
+    tail selection and keeps only the cap.
+
+    The prompt is then byte-identical to the pre-v3 rendering, the whole prompt
+    prefills in one go with nothing held back, and the vector the memory sees is
+    the last row of the *whole* prompt rather than a prefix of it.
+    """
+    scheduler = _scheduler(q_mid=0.0, q_high=0.0)
+    _fill_memory(scheduler)
     request = _add(scheduler, "a", body_len=8)
+    before = list(request.prompt_token_ids)
+    assert request.effort_decision_pending and not request.effort_hold_prefill
+    assert request.effort_body_len == request.num_prompt_tokens
+
+    output = scheduler.schedule()
+    # The whole prompt is scheduled - no body/tail split - and the last row of
+    # it is what the scheduler asks for.
+    assert output.num_scheduled_tokens["a"] == len(before)
+    assert output.effort_prefill_capture == ["a"]
+
+    scheduler.update_from_output(
+        output, _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)})
+    )
+    assert list(request.prompt_token_ids) == before  # byte-identical prompt
     assert not request.effort_decision_pending
-    assert scheduler.schedule().effort_prefill_capture == []
+    assert scheduler._effort["a"].start_rung == 2
+    assert scheduler._effort_pending["a"] == (1, LADDER[2])
+    assert request.status == RequestStatus.RUNNING
+
+
+def test_a_seam_far_from_the_prompt_tail_is_not_worth_a_split():
+    # An agent turn ending in a tool result: the last *user* message, where the
+    # effort sentence goes, sits far from the end of the prompt.
+    scheduler = _scheduler(split_min_fraction=0.75)
+    _fill_memory(scheduler)
+    request = _add(scheduler, "a", body_len=32)  # 32 of 100 prompt tokens
+    assert request.effort_decision_pending and not request.effort_hold_prefill
+    assert request.effort_body_len == request.num_prompt_tokens
+    # The same seam is worth a split when it does cover the prompt.
+    lenient = _scheduler(split_min_fraction=0.1)
+    _fill_memory(lenient)
+    other = _add(lenient, "a", body_len=32)
+    assert other.effort_hold_prefill and other.effort_body_len == 32
