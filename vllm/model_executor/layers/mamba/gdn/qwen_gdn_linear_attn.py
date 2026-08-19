@@ -27,7 +27,9 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
+import vllm.model_executor.layers.mamba.gdn.skinny_linear  # noqa: F401 (op)
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -426,6 +428,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+        # The bf16 ba projection is unquantized: route small decode batches
+        # through the skinny GEMM (cuBLAS is slow at 2..16 rows on Ada).
+        self._ba_use_skinny = (
+            current_platform.is_cuda()
+            and isinstance(self.in_proj_ba.quant_method, UnquantizedLinearMethod)
+            and not self.disable_tp_for_ba_proj
+        )
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -610,6 +619,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b = b[:, ba_start : ba_start + ba_chunk]
             a = a[:, ba_start : ba_start + ba_chunk]
         return b, a
+
+    def _project_ba(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``in_proj_ba`` with a skinny-GEMM fast path for small decode batches
+        (unquantized bf16 weight, tiny N): see gdn/skinny_linear.py."""
+        if self._ba_use_skinny:
+            return torch.ops.vllm.gdn_skinny_linear(
+                hidden_states, self.in_proj_ba.weight
+            )
+        ba, _ = self.in_proj_ba(hidden_states)
+        return ba
 
     def fix_query_key_value_ordering(
         self,
@@ -887,7 +906,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        ba = self._project_ba(hidden_states)
 
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode
