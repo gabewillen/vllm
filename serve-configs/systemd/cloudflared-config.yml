@@ -1,5 +1,5 @@
 tunnel: 2684162e-f788-43d7-baed-5566ff7b411d
-credentials-file: <redacted>
+credentials-file: /etc/cloudflared/2684162e-f788-43d7-baed-5566ff7b411d.json
 
 ingress:
   - hostname: vllm.willen.dev
@@ -9,4 +9,14 @@ ingress:
       connectTimeout: 30s
       # Disable buffering-unfriendly timeouts for streaming completions.
       noTLSVerify: false
+  - hostname: vbench.willen.dev
+    path: ^/api/.*
+    service: http://localhost:8000
+  # Raw run artifacts (replay.html, trace.jsonl, final.patch) are mounted by the
+  # backend at /runs/<id>/..., outside the /api prefix.
+  - hostname: vbench.willen.dev
+    path: ^/runs/.*
+    service: http://localhost:8000
+  - hostname: vbench.willen.dev
+    service: http://localhost:3000
   - service: http_status:404
