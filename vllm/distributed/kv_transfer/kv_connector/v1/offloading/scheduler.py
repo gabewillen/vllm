@@ -228,6 +228,19 @@ class SchedulerOffloadConfig(NamedTuple):
             and vllm_config.speculative_config.use_eagle()
         )
         if use_eagle and not eagle_groups:
+            # Prefer name-based detection of the draft tower (MTP drafters
+            # register under an "mtp" prefix) over marking every group
+            # volatile, which permanently desyncs store and lookup for
+            # non-draft groups.
+            eagle_groups = {
+                idx
+                for idx, g in enumerate(kv_cache_config.kv_cache_groups)
+                if any(
+                    n == "mtp" or n.startswith("mtp.") or ".mtp." in n
+                    for n in g.layer_names
+                )
+            }
+        if use_eagle and not eagle_groups:
             eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
 
         if eagle_groups:
