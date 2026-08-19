@@ -11,6 +11,7 @@ import math
 from types import SimpleNamespace
 
 import pytest
+
 from vllm.config.reasoning import (
     QWEN_LOW_EFFORT_SENTENCE,
     DynamicEffortConfig,
@@ -59,15 +60,15 @@ def _cfg(**kw) -> DynamicEffortConfig:
 
 def test_config_defaults_and_theta():
     cfg = DynamicEffortConfig()
-    assert cfg.ladder == [1024, 4096, 16384, 65536]
-    assert cfg.theta == [0.0, 0.5, 1.0]
-    assert cfg.p_uncertain == [0.75, 0.85, 0.92]
+    assert cfg.ladder == [1024, 4096, 16384]
+    assert cfg.theta == [0.0, 0.5]
+    assert cfg.p_uncertain == [0.85, 0.92]
     assert cfg.rule == "rank" and cfg.evaluation == "worker"
     assert cfg.check_at == 0.75 and cfg.final_check_at == 0.9
     assert cfg.loop_ngram == 16 and cfg.loop_repeats == 3 and cfg.loop_window == 512
     assert cfg.floor_enabled is False
     assert cfg.low_effort_sentence == QWEN_LOW_EFFORT_SENTENCE
-    assert cfg.top_rung == 3
+    assert cfg.top_rung == 2
 
 
 @pytest.mark.parametrize(
@@ -81,7 +82,7 @@ def test_config_defaults_and_theta():
         ({"calibration": {"entropy": (0.0, 1.0)}}, "missing 'margin'"),
         ({"floor_enabled": True}, "not implemented"),
         ({"max_rung_by_batch_size": [(1, 8, 9)]}, "outside"),
-        ({"max_rung_by_batch_size": [(1, 8, 3), (4, 16, 2)]}, "non-overlapping"),
+        ({"max_rung_by_batch_size": [(1, 8, 2), (4, 16, 1)]}, "non-overlapping"),
         ({"hash_window": 8}, "hash_window"),
     ],
 )
@@ -135,8 +136,8 @@ def test_frontend_dynamic_string_content():
     assert params.thinking_token_budget == 1024
     assert params.extra_args["effort_telemetry"] is True
     assert params.extra_args["dynamic_effort"] == {
-        "ladder": [1024, 4096, 16384, 65536],
-        "theta": [0.0, 0.5, 1.0],
+        "ladder": [1024, 4096, 16384],
+        "theta": [0.0, 0.5],
         "bias": 0.0,
         "deadline_ms": None,
     }
