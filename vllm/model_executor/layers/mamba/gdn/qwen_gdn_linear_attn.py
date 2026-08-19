@@ -9,6 +9,7 @@ import torch
 from einops import rearrange
 from torch import nn
 
+import vllm.model_executor.layers.mamba.gdn.skinny_linear  # noqa: F401 (op)
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
@@ -29,7 +30,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
-import vllm.model_executor.layers.mamba.gdn.skinny_linear  # noqa: F401 (op)
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (

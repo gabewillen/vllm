@@ -25,7 +25,7 @@ from vllm.v1.request import Request, RequestStatus
 MODEL = "Qwen/Qwen3.8-27B-FP8"
 HIDDEN = 5120
 BLOCK = 16
-LADDER = [1024, 4096, 16384]
+NUM_LEVELS = 3
 START, END = 151667, 151668
 BODY = 96
 TAILS = [[10, 11, 12, 13], [20, 21], [30, 31, 32, 33, 34, 35]]
@@ -45,13 +45,13 @@ def _scheduler(**hidden_kw):
     kwargs = dict(enabled=True, memory_size=128, min_entries=4, k=4, flush_every=0)
     kwargs.update(hidden_kw)
     hidden = HiddenEffortConfig(**kwargs)
-    cfg = DynamicEffortConfig(ladder=LADDER, hidden_effort=hidden)
+    cfg = DynamicEffortConfig(hidden_effort=hidden)
     scheduler._effort_cfg = cfg
     scheduler._effort_start_ids = [START]
     scheduler._effort_end_ids = [END]
     scheduler._effort_marker_seqs = []
     scheduler._effort_memory = EffortMemory(
-        HIDDEN, hidden, model=MODEL, ladder=tuple(LADDER)
+        HIDDEN, hidden, model=MODEL, levels=NUM_LEVELS
     )
     return scheduler
 
@@ -103,10 +103,7 @@ def _add(scheduler, req_id: str, seed: int = 7, body_len: int = BODY) -> Request
         max_tokens=60000,
         extra_args={
             "dynamic_effort": {
-                "ladder": LADDER,
-                "theta": [0.0, 0.5],
-                "bias": 0.0,
-                "deadline_ms": None,
+                "default_level": 0,
                 "body_len": body_len,
                 "tails": TAILS,
             }
@@ -178,7 +175,7 @@ def test_body_prefill_emits_no_token():
     assert all(not batch.outputs for batch in engine_outputs.values())
 
 
-def test_a_held_request_is_not_scheduled_before_its_rung_is_chosen():
+def test_a_held_request_is_not_scheduled_before_its_level_is_chosen():
     scheduler = _scheduler()
     _add(scheduler, "a")
     scheduler.schedule()  # body
@@ -204,7 +201,7 @@ def test_held_request_falls_back_rather_than_stalling():
 # --------------------------------------------------------------- the decision
 
 
-def test_tail_appended_and_budget_set():
+def test_tail_appended_and_no_budget_shipped():
     scheduler = _scheduler(q_mid=0.0, q_high=0.0)  # everything routes to rung 2
     _fill_memory(scheduler)
     request = _add(scheduler, "a")
@@ -218,17 +215,17 @@ def test_tail_appended_and_budget_set():
     assert list(request.prompt_token_ids) == body + TAILS[2]
     assert list(request._all_token_ids) == body + TAILS[2]
     assert request.num_prompt_tokens == BODY + len(TAILS[2])
-    assert scheduler._effort["a"].start_rung == 2
+    assert scheduler._effort["a"].level == 2
     # The cap the worker is told to use is the chosen rung's, at revision 1.
-    assert scheduler._effort_pending["a"] == (1, LADDER[2])
 
     # The tail prefills next, and only the tail: the body is already computed.
+    # No thinking budget is shipped - the level is the whole actuator.
     tail_step = scheduler.schedule()
     assert tail_step.num_scheduled_tokens["a"] == len(TAILS[2])
-    assert tail_step.thinking_budget_updates["a"] == (1, LADDER[2])
+    assert "a" not in tail_step.thinking_budget_updates
 
 
-def test_decision_unavailable_falls_back_to_rung0():
+def test_decision_unavailable_falls_back_to_the_default_level():
     for kwargs, vector in (
         ({}, None),  # no vector at all
         ({"min_entries": 10_000}, np.ones(HIDDEN, dtype=np.float16)),  # cold
@@ -245,8 +242,7 @@ def test_decision_unavailable_falls_back_to_rung0():
         )
         assert not request.effort_decision_pending
         assert list(request.prompt_token_ids) == before  # byte-identical prompt
-        assert "a" not in scheduler._effort_pending
-        assert scheduler._effort["a"].start_rung == 0
+        assert scheduler._effort["a"].level == 0
         assert request.status == RequestStatus.RUNNING
 
 
@@ -273,7 +269,7 @@ def test_fully_cached_body_still_yields_a_vector():
     assert output.effort_prefill_capture == ["b"]
 
 
-def test_prefix_cache_body_shared_across_rungs():
+def test_prefix_cache_body_shared_across_levels():
     scheduler = _scheduler(q_mid=0.0, q_high=0.0)
     _fill_memory(scheduler)
     first = _add(scheduler, "a")
@@ -339,12 +335,12 @@ def test_split_survives_async_scheduling(async_scheduling):
         q_mid=0.0,
         q_high=0.0,
     )
-    scheduler._effort_cfg = DynamicEffortConfig(ladder=LADDER, hidden_effort=hidden)
+    scheduler._effort_cfg = DynamicEffortConfig(hidden_effort=hidden)
     scheduler._effort_start_ids = [START]
     scheduler._effort_end_ids = [END]
     scheduler._effort_marker_seqs = []
     scheduler._effort_memory = EffortMemory(
-        HIDDEN, hidden, model=MODEL, ladder=tuple(LADDER)
+        HIDDEN, hidden, model=MODEL, levels=NUM_LEVELS
     )
     _fill_memory(scheduler)
     request = _add(scheduler, "a")
@@ -382,9 +378,7 @@ def test_body_stops_at_a_cacheable_block_boundary_under_mamba_align():
     prompt = list(request.prompt_token_ids)
     boundary = request.effort_body_len
     assert boundary % BLOCK == 0 and boundary <= seam
-    # One block back from the last full block of the prompt, because an
-    # eagle-family drafter prunes the last matching block.
-    assert boundary == min(seam, len(prompt) - len(prompt) % BLOCK - BLOCK)
+    assert boundary == min(seam, len(prompt) - len(prompt) % BLOCK) // BLOCK * BLOCK
     for tail, variant in zip(request.effort_tail_variants, TAILS):
         assert tail == prompt[boundary:seam] + variant
 
@@ -401,45 +395,38 @@ def test_body_stops_at_a_cacheable_block_boundary_under_mamba_align():
     )
 
 
-def test_no_usable_seam_falls_back_to_cap_only():
-    """No cacheable boundary, or a seam far from the prompt's tail, drops the
-    tail selection and keeps only the cap.
+def test_no_usable_seam_keeps_the_default_level():
+    """No cacheable boundary, or a seam far from the prompt's tail, means no
+    decision at all: the request runs at the server default level.
 
     The prompt is then byte-identical to the pre-v3 rendering, the whole prompt
-    prefills in one go with nothing held back, and the vector the memory sees is
-    the last row of the *whole* prompt rather than a prefix of it.
+    prefills in one go with nothing held back, and - since the level is the only
+    actuator - nothing else about the request changes either.
     """
     scheduler = _scheduler(q_mid=0.0, q_high=0.0)
     _fill_memory(scheduler)
     request = _add(scheduler, "a", body_len=8)
     before = list(request.prompt_token_ids)
-    assert request.effort_decision_pending and not request.effort_hold_prefill
-    assert request.effort_body_len == request.num_prompt_tokens
+    assert not request.effort_decision_pending
+    assert not request.effort_hold_prefill
+    assert scheduler._effort["a"].level == 0
 
     output = scheduler.schedule()
-    # The whole prompt is scheduled - no body/tail split - and the last row of
-    # it is what the scheduler asks for.
     assert output.num_scheduled_tokens["a"] == len(before)
-    assert output.effort_prefill_capture == ["a"]
+    assert output.effort_prefill_capture == []
 
-    scheduler.update_from_output(
-        output, _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)})
-    )
-    assert list(request.prompt_token_ids) == before  # byte-identical prompt
-    assert not request.effort_decision_pending
-    assert scheduler._effort["a"].start_rung == 2
-    assert scheduler._effort_pending["a"] == (1, LADDER[2])
+    scheduler.update_from_output(output, _runner_output(output, sampled={"a": [START]}))
+    assert list(request.prompt_token_ids) == before
     assert request.status == RequestStatus.RUNNING
 
 
 def test_a_seam_far_from_the_prompt_tail_is_not_worth_a_split():
-    # An agent turn ending in a tool result: the last *user* message, where the
-    # effort sentence goes, sits far from the end of the prompt.
+    # An agent turn whose effort sentence is not at the tail: the body would
+    # describe a small prefix of what the model reads, so no split is made.
     scheduler = _scheduler(split_min_fraction=0.75)
     _fill_memory(scheduler)
     request = _add(scheduler, "a", body_len=32)  # 32 of 100 prompt tokens
-    assert request.effort_decision_pending and not request.effort_hold_prefill
-    assert request.effort_body_len == request.num_prompt_tokens
+    assert not request.effort_decision_pending and not request.effort_hold_prefill
     # The same seam is worth a split when it does cover the prompt.
     lenient = _scheduler(split_min_fraction=0.1)
     _fill_memory(lenient)

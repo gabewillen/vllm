@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Frontend half of `reasoning_effort: "dynamic"` (docs/dynamic-reasoning §2b, §7).
+"""Frontend half of `reasoning_effort: "dynamic"` (docs/dynamic-reasoning §13).
 
 `dynamic` never reaches the chat template. The request is rewritten in place:
-the template sees `render_effort` (medium: no effort sentence, so block 0 of
-the prompt is identical for every effort), the low-effort sentence is appended
-to the *last user turn* (rung-0 prior, prefix-cache safe), the static
-`thinking_token_budget` becomes `ladder[0]`, and the validated overrides ride
-in `SamplingParams.extra_args["dynamic_effort"]` for the scheduler.
+the template sees `render_effort` (medium: no effort sentence, so block 0 of the
+prompt is identical for every level), and each effort level is rendered as a
+**trailing user message carrying only that level's sentence**, after the last
+message of the conversation. That is the true tail of the prompt, which is where
+the model actually honours it - measured on this box 2026-08-19: with the
+sentence on the last *user* message of an agent turn (the placement patch 0009
+shipped) the `xhigh` wording moves reasoning length 1.14x against no sentence,
+because a tool result sits between it and the generation point; as a trailing
+user message it moves it 1.23x up and 0.78x down.
+
+The engine gets the shared body and one tail per level and picks the level from
+the body's own pooled hidden state before the model thinks. No thinking budget
+is set: on this path the model ends its own think block.
 """
 
 import copy
-import math
 from typing import TYPE_CHECKING, Any
 
 from vllm.config.reasoning import DynamicEffortConfig
@@ -21,39 +28,11 @@ if TYPE_CHECKING:
         ChatCompletionRequest,
     )
 
-_LADDER_KEY = "dynamic_effort_ladder"
-_THETA_KEY = "dynamic_effort_theta"
-_BIAS_KEY = "effort_bias"
-_DEADLINE_KEY = "deadline_ms"
-_FLOOR_KEY = "dynamic_effort_floor"
+_LEVEL_KEY = "dynamic_effort_level"
 
 
 class DynamicEffortError(ValueError):
     """Client error in a dynamic-effort request (rendered as HTTP 400)."""
-
-
-def _int_list(value: Any, key: str) -> list[int]:
-    if not isinstance(value, list) or not value:
-        raise DynamicEffortError(f"vllm_xargs.{key} must be a non-empty list")
-    out: list[int] = []
-    for x in value:
-        if isinstance(x, bool) or not isinstance(x, int | float) or x != int(x):
-            raise DynamicEffortError(f"vllm_xargs.{key} must contain integers")
-        out.append(int(x))
-    return out
-
-
-def _float_list(value: Any, key: str) -> list[float]:
-    if not isinstance(value, list) or not value:
-        raise DynamicEffortError(f"vllm_xargs.{key} must be a non-empty list")
-    out: list[float] = []
-    for x in value:
-        if isinstance(x, bool) or not isinstance(x, int | float):
-            raise DynamicEffortError(f"vllm_xargs.{key} must contain numbers")
-        if not math.isfinite(float(x)):
-            raise DynamicEffortError(f"vllm_xargs.{key} must be finite")
-        out.append(float(x))
-    return out
 
 
 def build_dynamic_effort_overrides(
@@ -61,78 +40,25 @@ def build_dynamic_effort_overrides(
 ) -> dict[str, Any]:
     """Validate the per-request `vllm_xargs` and merge them over `cfg`."""
     xargs = xargs or {}
-    ladder = list(cfg.ladder)
-    theta = list(cfg.theta or [])
-    if _LADDER_KEY in xargs:
-        ladder = _int_list(xargs[_LADDER_KEY], _LADDER_KEY)
-        if len(ladder) < 2 or ladder[0] <= 0:
+    overrides: dict[str, Any] = {}
+    if _LEVEL_KEY in xargs and xargs[_LEVEL_KEY] is not None:
+        raw = xargs[_LEVEL_KEY]
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise DynamicEffortError(f"vllm_xargs.{_LEVEL_KEY} must be an integer")
+        if not 0 <= raw < cfg.num_levels:
             raise DynamicEffortError(
-                f"vllm_xargs.{_LADDER_KEY} needs at least two positive rungs"
+                f"vllm_xargs.{_LEVEL_KEY} must be in [0, {cfg.num_levels - 1}]"
             )
-        if any(b <= a for a, b in zip(ladder, ladder[1:])):
-            raise DynamicEffortError(
-                f"vllm_xargs.{_LADDER_KEY} must be strictly increasing"
-            )
-        if _THETA_KEY not in xargs and len(theta) != len(ladder) - 1:
-            theta = [0.5 * i for i in range(len(ladder) - 1)]
-    if _THETA_KEY in xargs:
-        theta = _float_list(xargs[_THETA_KEY], _THETA_KEY)
-    if len(theta) != len(ladder) - 1:
-        raise DynamicEffortError(
-            f"vllm_xargs.{_THETA_KEY} needs one entry per ladder transition "
-            f"({len(ladder) - 1}), got {len(theta)}"
-        )
-    bias = 0.0
-    if _BIAS_KEY in xargs:
-        raw = xargs[_BIAS_KEY]
-        if isinstance(raw, bool) or not isinstance(raw, int | float):
-            raise DynamicEffortError(f"vllm_xargs.{_BIAS_KEY} must be a number")
-        bias = float(raw)
-        if not math.isfinite(bias):
-            raise DynamicEffortError(f"vllm_xargs.{_BIAS_KEY} must be finite")
-    deadline_ms = None
-    if _DEADLINE_KEY in xargs and xargs[_DEADLINE_KEY] is not None:
-        raw = xargs[_DEADLINE_KEY]
-        if (
-            isinstance(raw, bool)
-            or not isinstance(raw, int | float)
-            or not math.isfinite(float(raw))
-            or raw <= 0
-        ):
-            raise DynamicEffortError(
-                f"vllm_xargs.{_DEADLINE_KEY} must be a positive number"
-            )
-        deadline_ms = float(raw)
-    if xargs.get(_FLOOR_KEY):
-        raise DynamicEffortError(f"vllm_xargs.{_FLOOR_KEY} is not implemented")
-    return {
-        "ladder": ladder,
-        "theta": theta,
-        "bias": bias,
-        "deadline_ms": deadline_ms,
-    }
+        overrides["forced_level"] = raw
+    return overrides
 
 
-def append_to_last_user_message(messages: list[Any], sentence: str) -> bool:
-    """Append `sentence` (after a blank line) to the last user turn in place.
-
-    String content is extended; list-of-parts content gets a text part.
-    Returns False when there is no user message.
-    """
-    for msg in reversed(messages):
-        if not isinstance(msg, dict) or msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if content is None or isinstance(content, str):
-            msg["content"] = f"{content}\n\n{sentence}" if content else sentence
-        elif isinstance(content, list):
-            content.append({"type": "text", "text": sentence})
-        else:
-            raise DynamicEffortError(
-                "dynamic reasoning_effort needs string or list user content"
-            )
-        return True
-    return False
+def append_to_last_message(messages: list[Any], sentence: str) -> bool:
+    """Append `sentence` as a trailing user message; True if it was added."""
+    if not sentence:
+        return False
+    messages.append({"role": "user", "content": sentence})
+    return True
 
 
 def apply_dynamic_effort(
@@ -153,7 +79,8 @@ def apply_dynamic_effort(
         )
     if request.thinking_token_budget is not None:
         raise DynamicEffortError(
-            "reasoning_effort='dynamic' conflicts with a static thinking_token_budget"
+            "reasoning_effort='dynamic' does not cap thinking; drop "
+            "thinking_token_budget or ask for a fixed effort level"
         )
     kwargs = request.chat_template_kwargs or {}
     if "enable_thinking" in kwargs and not kwargs["enable_thinking"]:
@@ -162,39 +89,23 @@ def apply_dynamic_effort(
             "chat_template_kwargs.enable_thinking=false"
         )
     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
-    hidden = cfg.hidden_effort
-    if hidden.enabled:
-        # v3: the rung is chosen from the body's own pooled prefill state, so
-        # every rung's sentence is rendered here and the engine appends the one
-        # it picks. The prompt submitted now is the rung-0 variant, which is
-        # what a missing vector or a cold memory falls back to.
-        variants = _render_effort_variants(
-            request.messages, hidden.sentences_for(len(overrides["ladder"]))
-        )
-        request.messages = variants[0]
-        request._dynamic_effort_variant_messages = variants
-    elif cfg.low_effort_sentence and not append_to_last_user_message(
-        request.messages, cfg.low_effort_sentence
-    ):
-        raise DynamicEffortError(
-            "reasoning_effort='dynamic' needs at least one user message"
-        )
+    default_level = overrides.get("forced_level", cfg.hidden_effort.default_level)
+    variants = render_effort_variants(request.messages, cfg.level_sentences)
+    request.messages = variants[default_level]
+    request._dynamic_effort_variant_messages = variants
+    overrides["default_level"] = default_level
     request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
-    request.thinking_token_budget = overrides["ladder"][0]
     request._dynamic_effort = overrides
 
 
-def _render_effort_variants(
+def render_effort_variants(
     messages: list[Any], sentences: list[str]
 ) -> list[list[Any]]:
-    """One message list per rung, each with that rung's tail sentence."""
+    """One message list per level, each with that level's tail sentence."""
     variants: list[list[Any]] = []
     for sentence in sentences:
         rendered = copy.deepcopy(messages)
-        if sentence and not append_to_last_user_message(rendered, sentence):
-            raise DynamicEffortError(
-                "reasoning_effort='dynamic' needs at least one user message"
-            )
+        append_to_last_message(rendered, sentence)
         variants.append(rendered)
     return variants
 
@@ -202,21 +113,20 @@ def _render_effort_variants(
 def split_body_and_tails(
     variant_token_ids: list[list[int]],
 ) -> tuple[int, list[list[int]]] | None:
-    """Split the rendered rung variants into the shared body and per-rung tails.
+    """Split the rendered level variants into the shared body and per-level tails.
 
-    The variants differ only in the effort sentence, which sits at the end of
-    the last user turn, so their longest common token prefix *is* the body of
-    the §13.3 seam. The boundary is pulled one token back so that the token at
-    position `body_len` - the one an eagle-family drafter reads ahead at a
-    chunked-prefill boundary - is the same whichever rung is chosen.
+    The variants differ only in the trailing sentence message, so their longest
+    common token prefix *is* the body of the §13.3 seam. The boundary is pulled
+    one token back so that the token at position `body_len` - the one an
+    eagle-family drafter reads ahead at a chunked-prefill boundary - is the same
+    whichever level is chosen.
 
     Args:
-        variant_token_ids: the fully rendered prompt of each rung, in rung
+        variant_token_ids: the fully rendered prompt of each level, in level
             order.
 
     Returns:
-        `(body_len, tails)`, or `None` when the variants share no usable body
-        (identical prompts, or a body of fewer than two tokens).
+        `(body_len, tails)`, or `None` when the variants share no usable body.
     """
     if len(variant_token_ids) < 2 or any(not ids for ids in variant_token_ids):
         return None

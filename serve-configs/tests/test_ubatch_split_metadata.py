@@ -2,6 +2,7 @@
 """Micro-batch slicing keeps one state slot for a split request (patch 0006)."""
 
 import torch
+
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.worker.ubatch_utils import UBatchSlice, _make_metadata_with_slice
 

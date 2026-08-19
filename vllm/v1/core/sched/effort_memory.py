@@ -32,8 +32,8 @@ import numpy as np
 
 from vllm.config.reasoning import HiddenEffortConfig
 from vllm.logger import init_logger
+from vllm.v1.core.sched.effort_controller import CLOSE_NATURAL
 from vllm.v1.core.sched.effort_quantiles import TDigest
-from vllm.v1.sample.soft_limit import CLOSE_NATURAL
 
 logger = init_logger(__name__)
 
@@ -63,10 +63,10 @@ class MemoryQuery:
 
 
 @dataclass(frozen=True)
-class StartRungDecision:
+class LevelDecision:
     """The asymmetric map's verdict for one request (§13.5)."""
 
-    rung: int
+    level: int
     reason: str
     estimate_rank: float | None = None
     novelty_rank: float | None = None
@@ -92,19 +92,17 @@ class EffortMemory:
         hidden_size: int,
         cfg: HiddenEffortConfig,
         model: str = "",
-        ladder: tuple[int, ...] = (),
+        levels: int = 0,
     ) -> None:
         self.hidden_size = hidden_size
         self.cfg = cfg
         self.model = model
-        self.ladder = tuple(int(x) for x in ladder)
+        self.levels = int(levels)
         size = int(cfg.memory_size)
         self._keys = np.zeros((size, hidden_size), dtype=np.float32)
         self._values = np.full(size, np.nan, dtype=np.float32)
         self._sessions: list[str | None] = [None] * size
-        self._start_rungs = np.zeros(size, dtype=np.int8)
-        self._final_rungs = np.zeros(size, dtype=np.int8)
-        self._escalations = np.zeros(size, dtype=np.int8)
+        self._levels_used = np.zeros(size, dtype=np.int8)
         self._by_session: dict[str, deque[int]] = {}
         self._next = 0
         self._n = 0
@@ -133,7 +131,7 @@ class EffortMemory:
 
     @property
     def ready(self) -> bool:
-        """The memory may decide a starting rung."""
+        """The memory may decide an effort level."""
         return self._n >= self.cfg.min_entries
 
     # --------------------------------------------------------------- insert
@@ -144,9 +142,7 @@ class EffortMemory:
         reasoning_tokens: int | None,
         close_kind: str,
         session_id: str | None = None,
-        start_rung: int = 0,
-        final_rung: int = 0,
-        escalations: int = 0,
+        level: int = 0,
     ) -> None:
         """Record one finished request.
 
@@ -157,9 +153,7 @@ class EffortMemory:
                 carries a value - the other two are right-censored, so they
                 enter as keys with no value.
             session_id: conversation key for the per-session eviction cap.
-            start_rung: rung the prefill decision chose.
-            final_rung: rung the request ended at.
-            escalations: mid-generation escalations it took.
+            level: effort level the prefill decision chose.
         """
         key = _unit(vec)
         if key.shape[0] != self.hidden_size:
@@ -174,9 +168,7 @@ class EffortMemory:
             math.log1p(max(int(reasoning_tokens or 0), 0)) if valued else np.nan
         )
         self._sessions[slot] = session_id
-        self._start_rungs[slot] = np.int8(max(-128, min(127, start_rung)))
-        self._final_rungs[slot] = np.int8(max(-128, min(127, final_rung)))
-        self._escalations[slot] = np.int8(max(-128, min(127, escalations)))
+        self._levels_used[slot] = np.int8(max(-128, min(127, level)))
         if session_id is not None:
             self._by_session.setdefault(session_id, deque()).append(slot)
         self._inserts += 1
@@ -273,7 +265,7 @@ class EffortMemory:
             "version": MEMORY_VERSION,
             "model": self.model,
             "hidden_size": self.hidden_size,
-            "ladder": list(self.ladder),
+            "levels": self.levels,
             "memory_size": int(self._keys.shape[0]),
             "n": self._n,
             "next": self._next,
@@ -300,9 +292,7 @@ class EffortMemory:
                     ),
                     keys=self._keys[: self._n].astype(np.float16),
                     values=self._values[: self._n],
-                    start_rungs=self._start_rungs[: self._n],
-                    final_rungs=self._final_rungs[: self._n],
-                    escalations=self._escalations[: self._n],
+                    levels_used=self._levels_used[: self._n],
                 )
             os.replace(tmp, path)
         except BaseException:
@@ -329,10 +319,10 @@ class EffortMemory:
                 meta.get("version") != MEMORY_VERSION
                 or meta.get("hidden_size") != self.hidden_size
                 or (self.model and meta.get("model") not in ("", self.model))
-                or (self.ladder and tuple(meta.get("ladder", ())) != self.ladder)
+                or (self.levels and meta.get("levels") != self.levels)
             ):
                 logger.warning(
-                    "dynamic_effort: dropping %s (model/dim/ladder/version "
+                    "dynamic_effort: dropping %s (model/dim/levels/version "
                     "mismatch: %s)",
                     path,
                     {k: meta.get(k) for k in ("version", "model", "hidden_size")},
@@ -342,9 +332,7 @@ class EffortMemory:
             n = min(keys.shape[0], self._keys.shape[0])
             self._keys[:n] = keys[:n]
             self._values[:n] = data["values"][:n]
-            self._start_rungs[:n] = data["start_rungs"][:n]
-            self._final_rungs[:n] = data["final_rungs"][:n]
-            self._escalations[:n] = data["escalations"][:n]
+            self._levels_used[:n] = data["levels_used"][:n]
         sessions = list(meta.get("sessions") or [])[:n]
         sessions += [None] * (n - len(sessions))
         self._sessions[:n] = sessions
@@ -361,12 +349,12 @@ class EffortMemory:
         return True
 
 
-def decide_start_rung(
+def decide_effort_level(
     query: MemoryQuery | None,
     ranks: tuple[float | None, float | None, float | None],
     cfg: HiddenEffortConfig,
-    top_rung: int,
-) -> StartRungDecision:
+    top_level: int,
+) -> LevelDecision:
     """The asymmetric quantile map (§13.5).
 
     Raise freely, lower only on confidence: one under-routed step can kill a
@@ -378,21 +366,21 @@ def decide_start_rung(
         query: the kNN result, or `None` when the memory could not answer.
         ranks: `(estimate, novelty, spread)` percentile ranks.
         cfg: hidden-effort settings.
-        top_rung: highest rung of the request's ladder.
+        top_level: highest effort level the request has.
 
     Returns:
-        The starting rung and why it was chosen.
+        The effort level and why it was chosen.
     """
-    safe = min(1, top_rung)
+    safe = min(1, top_level)
     est_rank, nov_rank, spread_rank = ranks
     if query is None or est_rank is None:
-        return StartRungDecision(safe, "no-estimate", est_rank, nov_rank, spread_rank)
+        return LevelDecision(safe, "no-estimate", est_rank, nov_rank, spread_rank)
     if est_rank >= cfg.q_high:
-        return StartRungDecision(
-            min(2, top_rung), "q>=q_high", est_rank, nov_rank, spread_rank
+        return LevelDecision(
+            min(2, top_level), "q>=q_high", est_rank, nov_rank, spread_rank
         )
     if est_rank >= cfg.q_mid:
-        return StartRungDecision(safe, "q>=q_mid", est_rank, nov_rank, spread_rank)
+        return LevelDecision(safe, "q>=q_mid", est_rank, nov_rank, spread_rank)
     gates_pass = (
         nov_rank is not None
         and spread_rank is not None
@@ -400,5 +388,5 @@ def decide_start_rung(
         and spread_rank <= cfg.spread_gate_q
     )
     if gates_pass:
-        return StartRungDecision(0, "low-band", est_rank, nov_rank, spread_rank)
-    return StartRungDecision(safe, "gated", est_rank, nov_rank, spread_rank)
+        return LevelDecision(0, "low-band", est_rank, nov_rank, spread_rank)
+    return LevelDecision(safe, "gated", est_rank, nov_rank, spread_rank)

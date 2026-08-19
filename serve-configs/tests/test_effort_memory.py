@@ -19,7 +19,7 @@ from vllm.v1.core.sched.effort_memory import (
     MEMORY_VERSION,
     EffortMemory,
     MemoryQuery,
-    decide_start_rung,
+    decide_effort_level,
 )
 
 DIM = 8
@@ -32,7 +32,7 @@ def _cfg(**kw) -> HiddenEffortConfig:
 
 
 def _mem(**kw) -> EffortMemory:
-    return EffortMemory(DIM, _cfg(**kw), model="test-model", ladder=(1024, 4096, 16384))
+    return EffortMemory(DIM, _cfg(**kw), model="test-model", levels=3)
 
 
 def _vec(seed: int) -> np.ndarray:
@@ -142,7 +142,7 @@ def test_persistence_roundtrip_and_version_mismatch(tmp_path):
     memory.query(_vec(0))  # feeds the digests, which must survive too
     memory.save()
 
-    warm = EffortMemory(DIM, memory.cfg, model="test-model", ladder=(1024, 4096, 16384))
+    warm = EffortMemory(DIM, memory.cfg, model="test-model", levels=3)
     assert warm.load()
     assert warm.n_entries == memory.n_entries
     np.testing.assert_allclose(
@@ -153,13 +153,13 @@ def test_persistence_roundtrip_and_version_mismatch(tmp_path):
     np.testing.assert_allclose(warm._values[: warm.n_entries], memory._values[:10])
     assert set(warm._by_session) == set(memory._by_session)
 
-    # A different model, hidden size or ladder invalidates the stored values.
-    other_model = EffortMemory(DIM, memory.cfg, model="other", ladder=(1024, 4096))
+    # A different model, hidden size or level count invalidates the stored values.
+    other_model = EffortMemory(DIM, memory.cfg, model="other", levels=2)
     assert not other_model.load()
-    other_dim = EffortMemory(DIM + 1, memory.cfg, model="test-model", ladder=())
+    other_dim = EffortMemory(DIM + 1, memory.cfg, model="test-model", levels=0)
     assert not other_dim.load()
-    other_ladder = EffortMemory(DIM, memory.cfg, model="test-model", ladder=(512, 1024))
-    assert not other_ladder.load()
+    other_levels = EffortMemory(DIM, memory.cfg, model="test-model", levels=4)
+    assert not other_levels.load()
     assert memory.state_dict()["version"] == MEMORY_VERSION
 
 
@@ -195,32 +195,32 @@ def test_asymmetric_map_never_lowers_without_both_gates():
     q = _query()
 
     # Upward band: no gate, ever.
-    assert decide_start_rung(q, (0.99, 0.99, 0.99), cfg, top).rung == 2
-    assert decide_start_rung(q, (0.60, 0.99, 0.99), cfg, top).rung == 2
-    assert decide_start_rung(q, (0.35, 0.99, 0.99), cfg, top).rung == 1
+    assert decide_effort_level(q, (0.99, 0.99, 0.99), cfg, top).level == 2
+    assert decide_effort_level(q, (0.60, 0.99, 0.99), cfg, top).level == 2
+    assert decide_effort_level(q, (0.35, 0.99, 0.99), cfg, top).level == 1
 
     # Downward band needs BOTH gates. Either one above its rank keeps the
     # request at the safe rung.
-    assert decide_start_rung(q, (0.10, 0.10, 0.10), cfg, top).rung == 0
-    assert decide_start_rung(q, (0.10, 0.90, 0.10), cfg, top).rung == 1
-    assert decide_start_rung(q, (0.10, 0.10, 0.90), cfg, top).rung == 1
-    assert decide_start_rung(q, (0.10, 0.90, 0.90), cfg, top).rung == 1
+    assert decide_effort_level(q, (0.10, 0.10, 0.10), cfg, top).level == 0
+    assert decide_effort_level(q, (0.10, 0.90, 0.10), cfg, top).level == 1
+    assert decide_effort_level(q, (0.10, 0.10, 0.90), cfg, top).level == 1
+    assert decide_effort_level(q, (0.10, 0.90, 0.90), cfg, top).level == 1
     # A missing gate rank is not a passing gate.
-    assert decide_start_rung(q, (0.10, None, 0.10), cfg, top).rung == 1
-    assert decide_start_rung(q, (0.10, 0.10, None), cfg, top).rung == 1
+    assert decide_effort_level(q, (0.10, None, 0.10), cfg, top).level == 1
+    assert decide_effort_level(q, (0.10, 0.10, None), cfg, top).level == 1
 
     # Exactly at a gate is inside it; exactly at a cut is inside the band above.
-    assert decide_start_rung(q, (0.10, 0.60, 0.60), cfg, top).rung == 0
-    assert decide_start_rung(q, (0.35, 0.10, 0.10), cfg, top).rung == 1
-    assert decide_start_rung(q, (0.60, 0.10, 0.10), cfg, top).rung == 2
+    assert decide_effort_level(q, (0.10, 0.60, 0.60), cfg, top).level == 0
+    assert decide_effort_level(q, (0.35, 0.10, 0.10), cfg, top).level == 1
+    assert decide_effort_level(q, (0.60, 0.10, 0.10), cfg, top).level == 2
 
 
 def test_map_falls_back_to_the_safe_rung_without_an_estimate():
     cfg = _cfg()
-    assert decide_start_rung(None, (None, None, None), cfg, 2).rung == 1
-    assert decide_start_rung(_query(), (None, 0.1, 0.1), cfg, 2).rung == 1
-    # A two-rung ladder cannot reach rung 2.
-    assert decide_start_rung(_query(), (0.99, 0.1, 0.1), cfg, 1).rung == 1
+    assert decide_effort_level(None, (None, None, None), cfg, 2).level == 1
+    assert decide_effort_level(_query(), (None, 0.1, 0.1), cfg, 2).level == 1
+    # A two-level server cannot reach level 2.
+    assert decide_effort_level(_query(), (0.99, 0.1, 0.1), cfg, 1).level == 1
 
 
 def test_ranks_are_streaming_and_absorb_the_observation():

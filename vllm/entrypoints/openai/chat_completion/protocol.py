@@ -51,11 +51,7 @@ from vllm.sampling_params import (
     ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
-from vllm.v1.sample.soft_limit import (
-    CLOSE_FORCED,
-    CLOSE_NATURAL,
-    CLOSE_SOFT,
-)
+from vllm.v1.core.sched.effort_controller import CLOSE_CLIENT_LIMIT, CLOSE_NATURAL
 
 logger = init_logger(__name__)
 
@@ -132,32 +128,36 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
 class EffortInfo(OpenAIBaseModel):
     """Dynamic reasoning-effort outcome (`reasoning_effort: "dynamic"` only)."""
 
-    rung: int
-    start_rung: int = 0
-    """Rung the prefill hidden-state decision chose (`hidden_effort`); 0 when
-    it is off, the memory is cold or no vector reached the scheduler."""
-    escalations: int
+    level: int
+    """Effort level the request ran at: an index into the server's level
+    sentences, lowest first."""
+    decided: bool = False
+    """The level came from the prompt's pooled prefill hidden state rather than
+    the server default (a cold memory or a prompt with no usable seam)."""
     reasoning_tokens: int
-    late: bool = False
-    close_kind: Literal["natural", "soft", "forced"] = "natural"
-    """How the think block ended: `natural` before the cap, `soft` inside the
-    soft-limit ramp (the biased end token won, nothing was forced) or `forced`
-    at the end of the ramp."""
+    close_kind: Literal["natural", "client-limit"] = "natural"
+    """How the think block ended: `natural` (the model closed it - nothing on
+    this path caps or forces the close) or `client-limit` (the request ran out
+    of `max_tokens` or was aborted while still thinking)."""
+    memory_entries: int = 0
+    """Entries the decision memory held when this request was decided."""
+    neighbours: int = 0
+    """Valued neighbours the kNN estimate averaged over."""
 
     @classmethod
     def from_report(cls, report: dict[str, Any] | None) -> "EffortInfo | None":
         if report is None:
             return None
         close_kind = report.get("close_kind", CLOSE_NATURAL)
-        if close_kind not in (CLOSE_NATURAL, CLOSE_SOFT, CLOSE_FORCED):
+        if close_kind not in (CLOSE_NATURAL, CLOSE_CLIENT_LIMIT):
             close_kind = CLOSE_NATURAL
         return cls(
-            rung=report.get("rung", 0),
-            start_rung=report.get("start_rung", 0),
-            escalations=report.get("escalations", 0),
+            level=report.get("level", 0),
+            decided=bool(report.get("decided", 0)),
             reasoning_tokens=report.get("reasoning_tokens", 0),
-            late=bool(report.get("late", 0)),
             close_kind=close_kind,
+            memory_entries=report.get("memory_entries", 0),
+            neighbours=report.get("neighbours", 0),
         )
 
 

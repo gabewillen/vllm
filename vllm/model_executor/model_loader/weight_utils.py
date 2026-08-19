@@ -294,7 +294,7 @@ def get_quant_config(
         # they carry no quantization_config_* keys, so treat as empty and
         # fall through to online quantization / checkpoint lookup.
         hf_overrides = {}
-    quantization_config_file = hf_overrides.get("quantization_config_file", None)
+    quantization_config_file = hf_overrides.get("quantization_config_file")
     if quantization_config_file is not None:
         if hasattr(quant_cls, "from_config_file"):
             return quant_cls.from_config_file(quantization_config_file)
@@ -304,7 +304,7 @@ def get_quant_config(
                 "but quant_cls.from_config_file is not implemented in "
                 f"{quant_cls}"
             )
-    quantization_config_json = hf_overrides.get("quantization_config_dict_json", None)
+    quantization_config_json = hf_overrides.get("quantization_config_dict_json")
     if quantization_config_json is not None:
         if hasattr(quant_cls, "from_config_dict_json"):
             return quant_cls.from_config_dict_json(quantization_config_json)

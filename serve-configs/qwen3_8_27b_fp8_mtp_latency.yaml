@@ -104,53 +104,33 @@ compilation-config: '{"max_cudagraph_capture_size": 96}'
 speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
 kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
 reasoning-parser: qwen3
-# Dynamic reasoning effort (docs/dynamic-reasoning.claude.md, §11 = P6,
-# §12 = P7; §11.0 is the standing model-agnostic-signals constraint).
-# reasoning_effort "dynamic" starts every request at a 1k thinking cap rendered as
-# template medium + the Qwen "low" sentence on the last user turn (block 0 stays
-# effort-free), and the cap is raised 1k -> 4k -> 16k by the default rule
-# ("length"): the request is still in the think block at the check point, is not
-# looping or churning, p(</think>) is not rising, and MTP acceptance does not
-# veto it. The entropy/margin percentile-rank features are *measured but not
-# consulted* unless the sketch file at quantile_path reports a discriminative
-# AUC >= uncertainty_min_auc (0.60) for this model - on Qwen3.8 the v3 sweep put
-# them at chance (0.41-0.54, length controlled), so by default they are inert.
-# The startup log states which features are active and why.
+# Dynamic reasoning effort (venv patches 0009-0012,
+# docs/dynamic-reasoning.claude.md §13; results in
+# docs/dynamic-reasoning-v3-results.md).
 #
-# The cap is no longer a cliff: from the cap onward the </think> logit is biased
-# by up to +10 over 256 tokens (soft_limit, linear) and only then is the close
-# forced, as Qwen's own transition phrase. A model that was nearly done closes
-# itself inside the ramp - the response effort object reports close_kind
-# natural/soft/forced and vllm:effort_close_total{kind} counts them. This
-# replaces the old conditional p(</think>) grace window and also applies to
-# plain thinking_token_budget requests. On this V2 runner the rule is evaluated
-# in the sampler next to the cap actuator, so a raised cap is never late.
-# Defaults from DynamicEffortConfig; non-dynamic requests are untouched.
-# Warm/refresh the sketch file (and its AUC block) with
-# serve-configs/effort_calibrate.py build.
+# `reasoning_effort: "dynamic"` gives a request one effort LEVEL before it
+# thinks and renders that level's sentence at the TRUE TAIL of the prompt (a
+# trailing user message, after the last turn - measured on this box: with the
+# sentence on the last *user* message of an agent turn the xhigh wording moves
+# reasoning length 1.14x, at the tail 1.23x up and 0.78x down, because a tool
+# result otherwise sits between it and the generation point). The level comes
+# from the prompt body's own last prefill row - the vector lm_head consumes,
+# computed anyway - matched by cosine against an online memory this server
+# fills from its own finished requests: key = pooled state, value = the
+# reasoning tokens that request spent at a natural close. An asymmetric
+# quantile map over running digests picks the level: it raises freely and
+# lowers only when both confidence gates agree (novelty: nothing similar in the
+# memory; spread: the neighbours disagree), because one under-thought step can
+# kill a trajectory while over-thinking only costs tokens.
 #
-# DEPRECATED, kept for rule="rank"/"score" / evaluation="scheduler" only:
-# calibration {entropy: [0.043, 0.046], margin: [5.9, 4.5]} (13.6k decode steps,
-# 2026-08-18), theta [0, 0.5, 1.0] and grace_tokens 256.
-#
-# v3 (P8, venv patch 0012, docs/dynamic-reasoning.claude.md §13): the *starting*
-# rung stops being fixed at 0. The prompt is split at the effort sentence into a
-# rung-independent body and one tail per rung; the body prefills alone, its last
-# row - the vector lm_head consumes, computed anyway - is matched by cosine
-# against an online memory of this server's own finished requests (key = pooled
-# state, value = the reasoning tokens that request spent at a natural close),
-# and an asymmetric quantile map picks the tail. Nothing is trained and there is
-# no offline corpus: hidden_effort.enabled=false, an empty memory, or a missing
-# vector all render rung 0 with a byte-identical prompt, which is the pre-v3
-# behaviour. The map raises freely and lowers only when both confidence gates
-# agree (novelty: the memory has nothing similar; spread: the neighbours
-# disagree), because one under-routed step can kill a trajectory while
-# over-routing only costs tokens. Cost: one extra engine step per dynamic
-# request, and the body is byte-identical across rungs so the prefix cache holds
-# one body per conversation instead of one per (conversation, rung).
-# Measured basis: docs/effort-hidden-probe.md (kNN-16 label-free, AUC 0.850
-# out-of-fold vs 0.729 for prompt length and ~chance for entropy/margin).
-reasoning-config: '{"dynamic_effort": {"quantile_path": "/data/effort-sketches/qwen38-latency.json", "hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
+# There is NO thinking cap on this path: no rung ladder, no mid-generation
+# escalation, no soft-limit ramp. The model closes its own think block, and the
+# only thing that can cut it short is the loop-stall guard (n-gram + rolling
+# hash + the request's own repetition_detection), which reports
+# close_kind=stall. Nothing is trained and there is no offline corpus: a cold
+# memory, a missing vector or a prompt with no usable seam all render the
+# default level with a byte-identical prompt.
+reasoning-config: '{"dynamic_effort": {"hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
