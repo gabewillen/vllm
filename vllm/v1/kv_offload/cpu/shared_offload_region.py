@@ -270,14 +270,21 @@ class SharedOffloadRegion:
     def cleanup(self) -> None:
         if self.is_pinned and self._base is not None:
             if current_platform.is_cuda_alike():
-                base_ptr = self._base.data_ptr()
-                result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
-                if result.value != 0:
-                    logger.warning(
-                        "cudaHostUnregister failed for rank=%d (code=%d)",
-                        self.rank,
-                        result,
-                    )
+                # Chunked registration (see pin_mmap_region) must be
+                # unregistered chunk by chunk; fall back to the single
+                # whole-region call for regions pinned the old way.
+                chunks = getattr(self, "pinned_chunks", None) or [
+                    (self._base.data_ptr(), self.total_size_bytes)
+                ]
+                for ptr, _ in chunks:
+                    result = torch.cuda.cudart().cudaHostUnregister(ptr)
+                    if result.value != 0:
+                        logger.warning(
+                            "cudaHostUnregister failed for rank=%d (code=%d)",
+                            self.rank,
+                            result,
+                        )
+                self.pinned_chunks = None
             self.is_pinned = False
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts
