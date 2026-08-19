@@ -5,8 +5,12 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
+from vllm.v1.spec_decode.draft_lm_head import maybe_quantize_shared_lm_head
+
+logger = init_logger(__name__)
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -82,12 +86,30 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(eagle_model, "lm_head", None)
-    if target_lm_head is not None and _should_share(
+    share_lm_head = target_lm_head is not None and _should_share(
         eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head
+    )
+    spec_cfg = vllm_config.speculative_config
+    if (
+        not share_lm_head
+        and spec_cfg is not None
+        and spec_cfg.draft_lm_head_dtype != "auto"
     ):
+        logger.warning(
+            "draft_lm_head_dtype=%s only applies to a shared target lm_head; "
+            "the drafter keeps its own head.",
+            spec_cfg.draft_lm_head_dtype,
+        )
+    if share_lm_head:
         if draft_lm_head is not None:
             del eagle_model.lm_head
         eagle_model.lm_head = target_lm_head
+        if spec_cfg is not None:
+            maybe_quantize_shared_lm_head(
+                draft_model=eagle_model,
+                target_lm_head=target_lm_head,
+                dtype=spec_cfg.draft_lm_head_dtype,
+            )
 
         # MTP layers route logits through layer.shared_head.head, not
         # eagle_model.lm_head, so the per-layer copies need fixing up too.
@@ -98,7 +120,7 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 sh = getattr(layer, "shared_head", None)
                 if sh is not None and hasattr(sh, "head"):
                     del sh.head
-                    sh.head = target_lm_head
+                    sh.head = eagle_model.lm_head
 
     # MTP shares topk_indices_buffer with the target model. We update
     # every module in the draft that holds a buffer reference so that

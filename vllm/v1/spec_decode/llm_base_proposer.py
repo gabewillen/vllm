@@ -49,6 +49,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
+from vllm.v1.spec_decode.draft_lm_head import maybe_quantize_shared_lm_head
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -1558,6 +1559,12 @@ class SpecDecodeBaseProposer:
                     "Detected EAGLE model with distinct lm_head weights. "
                     "Keeping separate lm_head weights from the target model."
                 )
+                if self.speculative_config.draft_lm_head_dtype != "auto":
+                    logger.warning(
+                        "draft_lm_head_dtype=%s only applies to a shared "
+                        "target lm_head; the drafter keeps its own head.",
+                        self.speculative_config.draft_lm_head_dtype,
+                    )
         else:
             # MTP model
             share_lm_head = True
@@ -1570,6 +1577,11 @@ class SpecDecodeBaseProposer:
             if hasattr(self.model, "lm_head"):
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
+            maybe_quantize_shared_lm_head(
+                draft_model=self.model,
+                target_lm_head=target_language_model.lm_head,
+                dtype=self.speculative_config.draft_lm_head_dtype,
+            )
 
             # MTP models call compute_logits via shared_head.head (a
             # ParallelLMHead inside each MTP layer), not self.model.lm_head.
@@ -1584,7 +1596,7 @@ class SpecDecodeBaseProposer:
                     sh = getattr(layer, "shared_head", None)
                     if sh is not None and hasattr(sh, "head"):
                         del sh.head
-                        sh.head = target_language_model.lm_head
+                        sh.head = self.model.lm_head
                         logger.info(
                             "Shared target model lm_head with MTP shared_head.head."
                         )

@@ -25,6 +25,11 @@ from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 
 logger = init_logger(__name__)
 
+# A propose() call always runs at least the first draft step (draft position 0)
+# and only counts >= 2 need a fused multi-step decode graph.
+MIN_DRAFT_STEPS = 1
+MIN_FUSED_DRAFT_STEPS = 2
+
 
 class AutoRegressiveSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -42,6 +47,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+        # One decode manager per draft-step count when the scheduler can ask
+        # for fewer than num_speculative_steps drafts (adaptive draft length).
+        self.decode_cudagraph_managers: dict[int, SpeculatorCudaGraphManager] = {}
+        # Draft steps for the current propose()/capture() call.
+        self._num_steps = self.num_speculative_steps
+        self._active_decode_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
 
     def load_model(self, target_model: nn.Module) -> None:
@@ -137,12 +148,24 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             cudagraph_mode = CUDAGraphMode.NONE
 
         # Initialize cudagraph manager for draft decodes (draft positions > 0).
-        self.decode_cudagraph_manager = SpeculatorCudaGraphManager(
-            self.vllm_config,
-            self.device,
-            cudagraph_mode,
-            decode_query_len=1,
-        )
+        for num_steps in self._draft_step_options():
+            self.decode_cudagraph_managers[num_steps] = SpeculatorCudaGraphManager(
+                self.vllm_config,
+                self.device,
+                cudagraph_mode,
+                decode_query_len=1,
+            )
+        self.decode_cudagraph_manager = self.decode_cudagraph_managers[
+            self.num_speculative_steps
+        ]
+
+    def _draft_step_options(self) -> list[int]:
+        """Draft-step counts the scheduler may request that need a fused graph."""
+        spec_cfg = self.speculative_config
+        if spec_cfg.adaptive_draft_length:
+            lo = max(MIN_FUSED_DRAFT_STEPS, spec_cfg.adaptive_draft_min_tokens)
+            return list(range(lo, self.num_speculative_steps + 1))
+        return [self.num_speculative_steps]
 
     def capture(self) -> None:
         logger.info("Capturing model for speculator...")
@@ -186,15 +209,26 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             if self.use_fused_multi_step_decode
             else self._generate_draft
         )
-        self.decode_cudagraph_manager.capture(
-            decode_fn,
-            self.model_state,
-            self.input_buffers,
-            self.block_tables,
-            self.attn_groups,
-            self.kv_cache_config,
-            progress_bar_desc="Capturing decode CUDA graphs",
+        # The fused loop bakes the step count into the graph, so capture one
+        # set of graphs per requestable step count; single-step graphs are
+        # count-independent, capture them once.
+        managers = (
+            self.decode_cudagraph_managers.items()
+            if self.use_fused_multi_step_decode
+            else [(self.num_speculative_steps, self.decode_cudagraph_manager)]
         )
+        for num_steps, manager in managers:
+            self._num_steps = num_steps
+            manager.capture(
+                decode_fn,
+                self.model_state,
+                self.input_buffers,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                progress_bar_desc=f"Capturing decode CUDA graphs ({num_steps} steps)",
+            )
+        self._num_steps = self.num_speculative_steps
         self.on_multi_step_decode_end(self.max_num_reqs)
 
     @torch.inference_mode()
@@ -224,7 +258,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        num_speculative_steps: int | None = None,
     ) -> torch.Tensor:
+        # Draft steps for this call; the scheduler may ask for fewer than the
+        # configured maximum (dynamic / adaptive speculative decoding). Even a
+        # request for 0 runs the first draft step: it keeps the draft KV/state
+        # in sync with the target; the runner drops columns beyond the
+        # requested count before they reach the scheduler.
+        self._num_steps = self.num_speculative_steps
+        if num_speculative_steps is not None:
+            self._num_steps = max(
+                MIN_DRAFT_STEPS, min(self.num_speculative_steps, num_speculative_steps)
+            )
         num_tokens = input_batch.num_tokens
         num_tokens_padded = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
@@ -311,10 +356,30 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
         self.on_prefill_end(num_reqs)
 
-        if self.num_speculative_steps == 1:
+        if self._num_steps == 1:
             # Early exit.
             return self.draft_tokens[:num_reqs, :1]
 
+        drafts = self._multi_step_propose(
+            input_batch=input_batch,
+            num_reqs=num_reqs,
+            num_rejected=num_rejected,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            is_profile=is_profile,
+        )
+        # Only the columns this call drafted are valid.
+        return drafts[:, : self._num_steps]
+
+    def _multi_step_propose(
+        self,
+        input_batch: InputBatch,
+        num_reqs: int,
+        num_rejected: torch.Tensor,
+        dummy_run: bool,
+        skip_attn_for_dummy_run: bool,
+        is_profile: bool,
+    ) -> torch.Tensor:
         # Prepare the inputs for the decode steps.
         prepare_decode_inputs(
             self.draft_tokens[:num_reqs, 0],
@@ -328,8 +393,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         # Each request produces exactly 1 token per draft generation step,
         # enabling FULL graph replay.
+        decode_manager = self.decode_cudagraph_manager
+        if self.use_fused_multi_step_decode:
+            # The fused loop is baked into the graph: pick the manager captured
+            # for this step count, or fall back to the full chain.
+            fused_manager = self.decode_cudagraph_managers.get(self._num_steps)
+            if fused_manager is None:
+                self._num_steps = self.num_speculative_steps
+            else:
+                decode_manager = fused_manager
+        self._active_decode_manager = decode_manager
         decode_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.decode_cudagraph_manager,
+            decode_manager,
             num_reqs,
             num_reqs,
             uniform_token_count=1,
@@ -469,7 +544,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         attn_metadata = None
         slot_mappings_by_layer = None
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, self._num_steps):
             # Rebuild every step when positions advance, or just once
             # on the first step when positions are constant (Gemma4 MTP).
             if not skip_attn and (self.advance_draft_positions or step == 1):
@@ -493,8 +568,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.current_draft_step.fill_(step)
 
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
-                assert self.decode_cudagraph_manager is not None
-                self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+                assert self._active_decode_manager is not None
+                self._active_decode_manager.run_fullgraph(batch_desc)
             else:
                 self._generate_draft(
                     num_reqs,
@@ -539,8 +614,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            assert self.decode_cudagraph_manager is not None
-            self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+            assert self._active_decode_manager is not None
+            self._active_decode_manager.run_fullgraph(batch_desc)
             return
 
         self._generate_fused_drafts(
@@ -570,7 +645,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             else []
         )
 
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, self._num_steps):
             self.current_draft_step.fill_(step)
             self._generate_draft(
                 num_reqs,
@@ -581,7 +656,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode,
             )
             if (
-                step < self.num_speculative_steps - 1
+                step < self._num_steps - 1
                 and attn_metadata is not None
                 and self.advance_draft_positions
             ):

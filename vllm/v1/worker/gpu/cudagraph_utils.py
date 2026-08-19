@@ -15,7 +15,7 @@ from vllm.compilation.breakable_cudagraph import (
     is_breakable_cudagraph_enabled,
 )
 from vllm.compilation.counter import compilation_counter
-from vllm.config import VllmConfig
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.distributed.parallel_state import (
@@ -38,6 +38,68 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+RangedQueryLens = list[tuple[int, int, set[int]]]
+
+
+def decode_query_lens_for_spec(
+    speculative_config: SpeculativeConfig,
+    decode_query_len: int,
+    max_num_reqs: int,
+) -> tuple[list[int], RangedQueryLens]:
+    """Uniform-decode query lengths to capture for a spec-decode target manager.
+
+    Returns the schedule-derived lengths (captured for every batch size, as
+    upstream) plus, when adaptive draft length is on, one
+    ``(range_start, range_end, query_lens)`` entry per schedule range so the
+    adaptive lengths ``min_tokens..K_range`` are captured only for the batch
+    sizes that can use them.
+    """
+    # decode_query_len = num_speculative_steps + num_new_sampled_tokens_per_step;
+    # a manager whose query does not cover the verify tokens (draft decode,
+    # decode_query_len == 1) has nothing to vary.
+    num_new_sampled_tokens_per_step = (
+        decode_query_len - speculative_config.num_speculative_tokens
+    )
+    if num_new_sampled_tokens_per_step < 1 or not (
+        speculative_config.uses_dynamic_speculative_decoding()
+        or speculative_config.adaptive_draft_length
+    ):
+        return [decode_query_len], []
+    schedule = speculative_config.num_speculative_tokens_per_batch_size or [
+        (1, max_num_reqs, speculative_config.num_speculative_tokens)
+    ]
+    decode_query_lens = [x[2] + num_new_sampled_tokens_per_step for x in schedule]
+    ranged_query_lens: RangedQueryLens = []
+    if speculative_config.adaptive_draft_length:
+        k_min = speculative_config.adaptive_draft_min_tokens
+        for start, end, k_range in schedule:
+            if k_range > 1:
+                qlens = {
+                    k + num_new_sampled_tokens_per_step
+                    for k in range(k_min, k_range + 1)
+                }
+                ranged_query_lens.append((start, end, qlens))
+                for q in qlens:
+                    if q not in decode_query_lens:
+                        decode_query_lens.append(q)
+    return decode_query_lens, ranged_query_lens
+
+
+def decode_query_len_allowed(
+    query_len: int,
+    num_reqs: int,
+    schedule_query_lens: set[int],
+    ranged_query_lens: RangedQueryLens,
+) -> bool:
+    """Whether a uniform-decode graph (query_len x num_reqs) is worth capturing."""
+    if query_len in schedule_query_lens:
+        return True
+    return any(
+        start <= num_reqs <= end and query_len in qs
+        for start, end, qs in ranged_query_lens
+    )
 
 
 class AttentionState(NamedTuple):
@@ -192,29 +254,33 @@ class CudaGraphManager:
 
         # When using Dynamic SD, num_speculative_tokens is the max number of
         # draft tokens. The scheduler might use a smaller number so we need
-        # to capture graphs for all possible values during decode.
+        # to capture graphs for all possible values during decode. Only
+        # managers whose decode query covers the verify tokens (target model,
+        # draft prefill) vary with the draft length; the draft-decode manager
+        # (decode_query_len == 1) does not.
         speculative_config = self.vllm_config.speculative_config
         if (
-            speculative_config
-            and speculative_config.uses_dynamic_speculative_decoding()
+            speculative_config is not None
+            and self.decode_query_len > self.vllm_config.num_speculative_tokens
         ):
-            num_spec_per_batch_size = (
-                speculative_config.num_speculative_tokens_per_batch_size
+            decode_query_lens, ranged_query_lens = decode_query_lens_for_spec(
+                speculative_config=speculative_config,
+                decode_query_len=self.decode_query_len,
+                max_num_reqs=self.max_num_reqs,
             )
-            # uses_dynamic_speculative_decoding() guarantees this is set.
-            assert num_spec_per_batch_size is not None
-            # decode_query_len = num_speculative_steps + num_new_sampled_tokens
-            # _per_step. Recover num_new_sampled_tokens_per_step
-            # from the values the manager already has.
-            num_new_sampled_tokens_per_step = (
-                self.decode_query_len - self.vllm_config.num_speculative_tokens
-            )
-            # Each entry is (range_start, range_end, num_speculative_tokens).
-            decode_query_lens = [
-                x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
-            ]
         else:
-            decode_query_lens = [self.decode_query_len]
+            decode_query_lens, ranged_query_lens = [self.decode_query_len], []
+        schedule_query_lens = set(decode_query_lens) - {
+            q for _, _, qs in ranged_query_lens for q in qs
+        }
+
+        def _query_len_allowed(query_len: int, num_reqs: int) -> bool:
+            return decode_query_len_allowed(
+                query_len=query_len,
+                num_reqs=num_reqs,
+                schedule_query_lens=schedule_query_lens,
+                ranged_query_lens=ranged_query_lens,
+            )
 
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode
@@ -245,6 +311,9 @@ class CudaGraphManager:
                         rounded_num_tokens > max_decode_tokens
                         or rounded_num_tokens > max_cg_capture_size
                         or rounded_num_reqs > self.max_num_reqs
+                        or not _query_len_allowed(
+                            query_len=decode_query_len, num_reqs=rounded_num_reqs
+                        )
                     ):
                         continue
 

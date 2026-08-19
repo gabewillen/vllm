@@ -1673,6 +1673,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
             routed_experts=routed_experts,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
 
         if not self.is_last_pp_rank:
@@ -1696,6 +1697,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
         routed_experts = self.execute_model_state.routed_experts
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1812,19 +1816,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
+                num_speculative_steps=num_spec_tokens_to_schedule,
             )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            # The scheduler may have asked for fewer than num_speculative_steps
+            # drafts (dynamic / adaptive SD); only those columns are handed on,
+            # so sync and async scheduling verify exactly the requested count.
+            num_drafted = draft_tokens.shape[1]
+            if num_spec_tokens_to_schedule < num_drafted:
+                num_drafted = num_spec_tokens_to_schedule
+                draft_tokens = draft_tokens[:, :num_drafted]
+            self.req_states.draft_tokens[input_batch.idx_mapping, :num_drafted] = (
+                draft_tokens
+            )
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+        else:
+            num_drafted = self.num_speculative_steps
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                self.req_states.draft_tokens[input_batch.idx_mapping, :num_drafted],
             )
 
         # Post-step KV connector related operations.
@@ -1955,6 +1971,8 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
     routed_experts: RoutedExpertsTensors | None
+    # Draft tokens the scheduler will verify next step (dynamic/adaptive SD).
+    num_spec_tokens_to_schedule: int = 0
 
 
 class BatchReqState(NamedTuple):

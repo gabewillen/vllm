@@ -910,7 +910,10 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if (
             speculative_config is None
-            or not speculative_config.uses_dynamic_speculative_decoding()
+            or not (
+                speculative_config.uses_dynamic_speculative_decoding()
+                or speculative_config.adaptive_draft_length
+            )
             or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
             or self.use_v2_model_runner
         ):
@@ -927,11 +930,18 @@ class VllmConfig:
 
     def _maybe_disable_dynamic_sd_for_data_parallel(self) -> None:
         speculative_config = self.speculative_config
-        if (
-            speculative_config is None
-            or not speculative_config.uses_dynamic_speculative_decoding()
-            or self.parallel_config.data_parallel_size <= 1
-        ):
+        if speculative_config is None or self.parallel_config.data_parallel_size <= 1:
+            return
+        if speculative_config.adaptive_draft_length:
+            # Same divergence hazard as the batch-size schedule: each DP rank's
+            # scheduler would pick its own draft length.
+            logger.warning_once(
+                "Adaptive draft length is not supported with data parallelism "
+                "(ranks would draft different lengths); disabling "
+                "adaptive_draft_length."
+            )
+            speculative_config.adaptive_draft_length = False
+        if not speculative_config.uses_dynamic_speculative_decoding():
             return
 
         logger.warning_once(

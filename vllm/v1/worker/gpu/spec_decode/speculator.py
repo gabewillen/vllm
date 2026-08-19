@@ -65,6 +65,10 @@ class BaseSpeculator(ABC):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        # Draft tokens the scheduler will verify next step (dynamic/adaptive
+        # SD); None means num_speculative_tokens. Speculators that always
+        # draft the full length accept and ignore it.
+        num_speculative_steps: int | None = None,
     ) -> torch.Tensor:
         pass
 

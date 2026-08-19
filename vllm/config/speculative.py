@@ -185,6 +185,27 @@ class SpeculativeConfig:
     inclusive batch-size range.
     """
 
+    draft_lm_head_dtype: Literal["auto", "fp8", "int4"] = "auto"
+    """Storage dtype of the drafter's copy of a *shared* target lm_head (MTP /
+    EAGLE without own head). ``fp8`` keeps a per-channel FP8 copy, ``int4`` a
+    group-128 Marlin W4A16 copy, for the draft argmax only; the target head is
+    untouched. Cuts draft-step memory traffic on large-vocab models."""
+    adaptive_draft_length: bool = False
+    """Adapt the number of draft tokens per step to recent acceptance. The
+    scheduler keeps a per-request EMA of accepted draft tokens and drafts
+    ``ceil(max_ema + adaptive_draft_margin)`` tokens for the batch (capped at
+    ``num_speculative_tokens`` / the batch-size schedule). Cheap drafters that
+    are memory-bound per step (e.g. MTP heads reading a large shared LM head)
+    stop paying for draft positions that are almost never accepted."""
+    adaptive_draft_ema_alpha: float = Field(default=0.7, ge=0.0, lt=1.0)
+    """Weight of the previous EMA value when updating the per-request accepted
+    draft-token average (higher = smoother, slower to react)."""
+    adaptive_draft_margin: float = Field(default=2.0, ge=0.0)
+    """Extra draft tokens beyond the EMA so the schedule can grow again when
+    acceptance improves."""
+    adaptive_draft_min_tokens: int = Field(default=1, ge=1)
+    """Lower bound on the adaptive draft length."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
@@ -1361,6 +1382,19 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
+
+        if self.adaptive_draft_length:
+            if self.num_speculative_tokens < 2:
+                raise ValueError(
+                    "adaptive_draft_length needs num_speculative_tokens >= 2 "
+                    f"(got {self.num_speculative_tokens})."
+                )
+            if self.adaptive_draft_min_tokens > self.num_speculative_tokens:
+                raise ValueError(
+                    "adaptive_draft_min_tokens "
+                    f"({self.adaptive_draft_min_tokens}) must not exceed "
+                    f"num_speculative_tokens ({self.num_speculative_tokens})."
+                )
 
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -64,6 +65,31 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def adaptive_num_spec_tokens(
+    emas: list[float | None],
+    max_tokens: int,
+    min_tokens: int,
+    margin: float,
+) -> int:
+    """Draft length for a batch from its requests' accepted-token EMAs.
+
+    A request without history (fresh decode) keeps the full length so its
+    first steps are not starved; otherwise the batch drafts
+    ``ceil(max_ema + margin)`` clamped to ``[min_tokens, max_tokens]``.
+    """
+    if not emas or any(ema is None for ema in emas):
+        return max_tokens
+    num = math.ceil(max(ema for ema in emas if ema is not None) + margin)
+    return max(min_tokens, min(max_tokens, num))
+
+
+def update_accepted_ema(prev: float | None, num_accepted: int, alpha: float) -> float:
+    """EMA of accepted draft tokens; the first observation seeds it."""
+    if prev is None:
+        return float(num_accepted)
+    return alpha * prev + (1.0 - alpha) * num_accepted
 
 
 class Scheduler(SchedulerInterface):
@@ -255,6 +281,13 @@ class Scheduler(SchedulerInterface):
         # reserve between a chunk boundary and the prefill end.
         self.num_prefill_lookahead = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        # Adaptive draft length: per-request EMA of accepted draft tokens.
+        self.adaptive_draft = (
+            speculative_config is not None
+            and speculative_config.adaptive_draft_length
+            and self.num_spec_tokens > 1
+        )
+        self._accepted_ema: dict[str, float] = {}
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -1257,6 +1290,11 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        if self.adaptive_draft and num_spec_tokens_to_schedule > 1:
+            num_spec_tokens_to_schedule = min(
+                num_spec_tokens_to_schedule,
+                self._adaptive_num_spec_tokens(scheduled_running_reqs),
+            )
 
         scheduled_encoder_input_stats = None
         if (
@@ -1837,6 +1875,8 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+                if self.adaptive_draft:
+                    self._update_accepted_ema(req_id=req_id, num_accepted=num_accepted)
                 # Rejections roll back num_computed_tokens (and, under async
                 # scheduling, num_output_placeholders, which covers the spec
                 # tokens). A stale rejection count predates the preemption
@@ -2385,10 +2425,30 @@ class Scheduler(SchedulerInterface):
 
         return valid_requests
 
+    def _adaptive_num_spec_tokens(self, running_reqs: list[Request]) -> int:
+        """Draft length for this step from the per-request acceptance EMAs."""
+        assert self.vllm_config.speculative_config is not None
+        cfg = self.vllm_config.speculative_config
+        return adaptive_num_spec_tokens(
+            emas=[self._accepted_ema.get(req.request_id) for req in running_reqs],
+            max_tokens=self.num_spec_tokens,
+            min_tokens=cfg.adaptive_draft_min_tokens,
+            margin=cfg.adaptive_draft_margin,
+        )
+
+    def _update_accepted_ema(self, req_id: str, num_accepted: int) -> None:
+        assert self.vllm_config.speculative_config is not None
+        self._accepted_ema[req_id] = update_accepted_ema(
+            prev=self._accepted_ema.get(req_id),
+            num_accepted=num_accepted,
+            alpha=self.vllm_config.speculative_config.adaptive_draft_ema_alpha,
+        )
+
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        self._accepted_ema.pop(request.request_id, None)
 
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
