@@ -180,7 +180,13 @@ groups long enough that the two windows are disjoint:
 | margin *drop* (last − first) | 0.538 |
 
 **Every AUC is at chance.** With length controlled, neither the absolute level
-nor the within-request rise separates. The apparently strong numbers you get
+nor the within-request rise separates. This table is no longer a one-off: the
+same statistic, the same label and the same length control now run inside
+`serve-configs/effort_calibrate.py build`, which writes the result into the
+sketch file. The default rule (`dynamic_effort.rule = "length"`,
+docs/dynamic-reasoning.claude.md §12.2) consults the entropy/margin features
+only when that number clears `uncertainty_min_auc` on the model in front of it,
+so this measurement is what decides whether they vote — on Qwen3.8 they do not. The apparently strong numbers you get
 without controlling for length (entropy-rise AUC 0.264, margin AUC 0.873) are a
 length artifact: short requests' "first-128" and "last-128" windows are the
 same steps.
@@ -208,7 +214,7 @@ p75 0.922, p90 0.964.
 |---|---|
 | **Rank-based, self-normalizing signals** | Right for the wrong-looking reason. It does not make entropy/margin more predictive — nothing can, they are at chance here — but it removes the fixed `(mean, sd)` table that has to be re-fitted per model/quantization and makes "top 15 % of uncertainty" mean the same thing on every deployment. It also makes the threshold auditable: `p_uncertain` is a percentile, so a wrong setting is visible as an escalation *rate*. |
 | **Within-request baseline** | Keep, but as a *brake*, not a discriminator. Requiring a rank rise over the request's own first-128 tokens can only reduce escalations; given §4 that is the safe direction. |
-| **p(`</think>`) + grace window** | The one genuinely new signal. Everything in §4 says the existing signals cannot tell when the model is about to finish — p(end) is measured directly from the same logits and is definitionally that quantity. It is also the mechanism that actually addresses the 35 force-closed requests, by turning a hard cut into a soft one exactly when the model is closing. **This is where P6 earns its keep.** No claim can be made about its magnitude from this run: p(end) is not in the v3 telemetry (the column ships with P6). |
+| **p(`</think>`) + grace window** (the grace window is now the §12.1 soft-limit ramp: unconditional, biased, and it reports `close_kind`) | The one genuinely new signal. Everything in §4 says the existing signals cannot tell when the model is about to finish — p(end) is measured directly from the same logits and is definitionally that quantity. It is also the mechanism that actually addresses the 35 force-closed requests, by turning a hard cut into a soft one exactly when the model is closing. **This is where P6 earns its keep.** No claim can be made about its magnitude from this run: p(end) is not in the v3 telemetry (the column ships with P6). |
 | **Language-agnostic novelty churn** | Directionally right (three of four failures show repeated identical probes) but unvalidated here: the telemetry has no token stream, so the novelty rate cannot be computed retrospectively. Marker weight 0 costs nothing since the markers were never load-bearing. |
 | **Worker-side decision (kills `late`)** | Correct but low-value on this run: `late: false` everywhere in the §2c window, and the 4 failures were wall-clock-bound. Its value is at load, where the scheduler→worker lag grows. |
 | **Graceful `force_end_str`** | Untested here. It only changes what the 2.9 % force-closed requests read like at the cut; the argument for it is in-distribution text, not this data. |

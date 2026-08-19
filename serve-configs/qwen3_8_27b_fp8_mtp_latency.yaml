@@ -104,26 +104,34 @@ compilation-config: '{"max_cudagraph_capture_size": 96}'
 speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
 kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
 reasoning-parser: qwen3
-# Dynamic reasoning effort (docs/dynamic-reasoning.claude.md, §11 = P6):
+# Dynamic reasoning effort (docs/dynamic-reasoning.claude.md, §11 = P6,
+# §12 = P7; §11.0 is the standing model-agnostic-signals constraint).
 # reasoning_effort "dynamic" starts every request at a 1k thinking cap rendered as
 # template medium + the Qwen "low" sentence on the last user turn (block 0 stays
-# effort-free), and the cap is raised 1k -> 4k -> 16k only when the request's
-# uncertainty *percentile rank* clears p_uncertain for its rung and has risen
-# over its own first-128-token baseline. The ranks come from running per-model
-# quantile sketches warmed from quantile_path, so there is no per-model
-# calibration table to fit; cold sketches never escalate. Near the cap a rising
-# p(</think>) buys one 256-token grace window instead of a hard cut, and the
-# forced close is Qwen's own transition phrase. On this V2 runner the rule is
-# evaluated in the sampler next to the cap actuator, so a raised cap is never
-# late. Defaults from DynamicEffortConfig; non-dynamic requests are untouched.
-# Warm/refresh the sketch file with serve-configs/effort_calibrate.py.
+# effort-free), and the cap is raised 1k -> 4k -> 16k by the default rule
+# ("length"): the request is still in the think block at the check point, is not
+# looping or churning, p(</think>) is not rising, and MTP acceptance does not
+# veto it. The entropy/margin percentile-rank features are *measured but not
+# consulted* unless the sketch file at quantile_path reports a discriminative
+# AUC >= uncertainty_min_auc (0.60) for this model - on Qwen3.8 the v3 sweep put
+# them at chance (0.41-0.54, length controlled), so by default they are inert.
+# The startup log states which features are active and why.
 #
-# DEPRECATED, kept for rule="score" / evaluation="scheduler" only: calibration
-# {entropy: [0.043, 0.046], margin: [5.9, 4.5]} (13.6k decode steps, 2026-08-18)
-# and theta [0, 0.5, 1.0]. docs/dynamic-reasoning-v3-analysis.md §4 shows why
-# the z-scores were replaced: entropy/margin are at chance (AUC 0.41-0.54) at
-# separating requests that needed more thinking, so the rank rule is
-# conservative and p(</think>) carries the load.
+# The cap is no longer a cliff: from the cap onward the </think> logit is biased
+# by up to +10 over 256 tokens (soft_limit, linear) and only then is the close
+# forced, as Qwen's own transition phrase. A model that was nearly done closes
+# itself inside the ramp - the response effort object reports close_kind
+# natural/soft/forced and vllm:effort_close_total{kind} counts them. This
+# replaces the old conditional p(</think>) grace window and also applies to
+# plain thinking_token_budget requests. On this V2 runner the rule is evaluated
+# in the sampler next to the cap actuator, so a raised cap is never late.
+# Defaults from DynamicEffortConfig; non-dynamic requests are untouched.
+# Warm/refresh the sketch file (and its AUC block) with
+# serve-configs/effort_calibrate.py build.
+#
+# DEPRECATED, kept for rule="rank"/"score" / evaluation="scheduler" only:
+# calibration {entropy: [0.043, 0.046], margin: [5.9, 4.5]} (13.6k decode steps,
+# 2026-08-18), theta [0, 0.5, 1.0] and grace_tokens 256.
 reasoning-config: '{"dynamic_effort": {"quantile_path": "/data/effort-sketches/qwen38-latency.json"}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder

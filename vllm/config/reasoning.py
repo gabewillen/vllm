@@ -154,9 +154,12 @@ class DynamicEffortConfig:
     """Distinct-new-n-grams / total below which the window counts as churn
     and vetoes escalation."""
     backtrack_marker_weight: float = Field(default=0.0, ge=0.0)
-    """Weight of the (English-only, model-specific) backtrack-marker density
-    in the churn evidence. 0 - the P6 default - disables it; the marker list
-    stays configurable."""
+    """**Legacy, off by default.** Weight of the backtrack-marker density in
+    the churn evidence. A lexical marker list is exactly what
+    docs/dynamic-reasoning.claude.md §11.0 rules out - it is English-only and
+    model-specific - so the churn detector runs on the language-agnostic n-gram
+    novelty rate instead. 0 disables the markers entirely; the setting survives
+    only so an existing deployment can reproduce a pre-P6 decision."""
     graceful_force_end: bool = True
     """Force `force_end_str` (an in-distribution transition phrase ending in
     the model's own end marker) instead of a bare end marker."""
@@ -204,12 +207,14 @@ class DynamicEffortConfig:
     backtrack_markers: list[str] = field(
         default_factory=lambda: ["Wait", "Hmm", "Actually", "Let me re-check"]
     )
-    """Self-correction phrases whose density is tracked as churn evidence."""
+    """Legacy (see `backtrack_marker_weight`): self-correction phrases whose
+    density is tracked as churn evidence when the weight is non-zero. Never
+    consulted at the default weight of 0."""
     marker_window: int = Field(default=256, ge=16)
     """Think tokens over which the backtrack-marker density is measured."""
     marker_max_rate: float = Field(default=0.05, gt=0.0)
-    """Markers per token above which non-converging thinking counts as churn.
-    Only consulted when `backtrack_marker_weight > 0`."""
+    """Legacy: markers per token above which non-converging thinking counts as
+    churn. Only consulted when `backtrack_marker_weight > 0`."""
     answer_reserve_tokens: int = Field(default=256, ge=0)
     """Tokens kept free below `max_tokens` for the answer after thinking;
     a rung whose cap cannot leave this reserve is never entered. The

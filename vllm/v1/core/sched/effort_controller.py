@@ -408,7 +408,13 @@ def _ingest_signals(
 
 
 def _churn(state: EffortState, cfg: DynamicEffortConfig) -> bool:
-    """Language-agnostic churn: a low-novelty window, or (opt-in) markers."""
+    """Churn evidence: a low-novelty window.
+
+    The novelty rate is a token-stream statistic, so it means the same thing on
+    any model, tokenizer and language (docs/dynamic-reasoning.claude.md §11.0).
+    The marker branch below is the legacy, weight-0-by-default lexical
+    detector; nothing reaches it unless a deployment opts back in.
+    """
     if state.novelty_rate is not None and state.novelty_rate < cfg.novelty_min_rate:
         return True
     if cfg.backtrack_marker_weight > 0.0 and state.h_fast is not None:

@@ -1,7 +1,9 @@
 # Dynamic reasoning effort — signals and implementation plan
 
 Status: P0-P2 shipped as patch 0009 and GPU-validated 2026-08-18 (§2c); P6 (§11)
-rewrites the controller and is CPU-tested, GPU validation pending; P3-P5 open. Target: the two Qwen3.8-27B-FP8 profiles on the
+rewrites the controller and P7 (§12) makes the close soft and the rule
+evidence-gated - both CPU-tested, GPU validation pending; P3-P5 open. §11.0 is
+a standing constraint on every signal added from here on. Target: the two Qwen3.8-27B-FP8 profiles on the
 4x L4 box (`serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml`, V2 runner + MTP;
 `serve-configs/qwen3_8_27b_fp8_max.yaml`, V1 runner + DBO). Ships as venv-local
 patches `0009+` (`serve-configs/patches/`), same contract as 0005-0008.
@@ -215,8 +217,8 @@ Costs are per decode step for the batch; "free" = already materialised.
 | S6 | MTP acceptance per request (accepted/drafted per pass, per-position counters) | scheduler `update_from_output` (`scheduler.py:1553-1571`), 0005 EMA | free | high acceptance = the 1-layer drafter predicts the target ⇒ text is low-surprise (boilerplate, restating) ⇒ do not escalate; low = hard tokens ⇒ escalate | latency profile only (spec off >32 seqs / off in max profile); adaptive draft length changes K per step, so use accepted/drafted, and normalise per request against its own first-256-token baseline; prose is inherently lower than code; measures draft/target mismatch, not difficulty — **corroborating evidence only, never a standalone escalation vote**; absent = unknown, not 0 |
 | S7 | repetition / stall | scheduler: reuse the `RepetitionDetectionParams` detector's evidence before its terminal stop, plus (a) 16-gram repeated ≥3× in the last 512 think tokens, (b) rolling hash of 32-token windows seen before, (c) density of backtrack markers (`Wait`, `Hmm`, `Actually`, `Let me re-check` — token ids resolved at startup) per 256 tokens | free (incremental) | (a)/(b) = degenerate loop → hard-stop (clamp cap to `think_count + 32`); (c) high = productive self-verification only if S2 is falling, otherwise churn | model-specific marker list; keep as tunable strings |
 | S8 | budget position vs `max_tokens` | scheduler | free | never escalate a rung the answer cannot fit after | |
-| S9 | tool outcomes | typed `success/error/timeout/empty` from the Responses built-in-tool loop (`vllm/entrypoints/openai/responses/serving.py`, `context.py`); for plain Chat clients only an *opt-in, untrusted* text heuristic over the last `role: tool` message (traceback / non-zero exit / same call+args repeated) | free | a failed tool step deserves a faster ladder (start rung stays 0, but the escalation threshold drops and the first check fires earlier) | stateless: derived per request from `messages`; clients may also pass `vllm_xargs.effort_bias` |
-| S10 | request-context priors (prompt time) | frontend | free | tools declared, code fences, prompt length, `tool_choice` → coding-agent shape → different ladder table | priors only; never a start rung above 0 |
+| S9 | tool outcomes | **typed only**: `success/error/timeout/empty` from the Responses built-in-tool loop (`vllm/entrypoints/openai/responses/serving.py`, `context.py`) | free | a failed tool step deserves a faster ladder (start rung stays 0, but the escalation threshold drops and the first check fires earlier) | the text heuristic over the last `role: tool` message that this row used to allow (traceback / non-zero exit / repeated call) is **dropped**: it is lexical, per-language and per-harness. Plain Chat clients can still pass `vllm_xargs.effort_bias` explicitly — that is the client's statement, not the server guessing |
+| ~~S10~~ | ~~request-context priors (prompt time)~~ | ~~frontend~~ | — | ~~tools declared, code fences, prompt length, `tool_choice` → coding-agent shape~~ | **Rejected** (§11.0). Every one of these is a prompt-structure heuristic that means something different per client, language and tokenizer. Nothing in the controller may key on them |
 | S11 | scheduler pressure (running seqs, KV usage) | scheduler | free | capacity-aware ladder: at high batch the top rung is withheld (mirrors `num_speculative_tokens_per_batch_size`) | policy, not a per-request signal |
 | S12 | wall-clock / TTFT budget from the client (`vllm_xargs.deadline_ms`) | frontend | free | hard cap the top rung so the keep-alive middleware and CF 100 s edge are respected | optional |
 
@@ -301,6 +303,13 @@ told. Every decision is logged with the signal vector so runs are replayable.
   holder already forces multi-token sequences; only the parser's
   `reasoning_end_str` used for *detection* must stay `</think>` — needs a
   small split (`force_end_str` vs `reasoning_end_str`) in `ReasoningConfig`.
+- **Soft limit** (default, §12) — from the cap onward the first token of the
+  *natural* end marker gets a bias rising to `max_bias` over `ramp_tokens`
+  (`bias(t) = max_bias · clamp((t − cap)/ramp, 0, 1)^curve`); the hard force
+  moves to `cap + ramp_tokens`. A model that was nearly done closes on its own
+  inside the ramp and nothing is forced. Implemented once as arithmetic on the
+  think position (`vllm/v1/sample/soft_limit.py`) and applied by both
+  actuators, for dynamic *and* static `thinking_token_budget` requests.
 - **Floor** (Phase 5) — mask `</think>` (`−inf`) while `think_count < floor`
   and, when the model tried to close, bias the first token of a continuation
   phrase (`"Wait, "`) — the s1 "budget forcing" trick. Same holder, one more
@@ -371,17 +380,22 @@ CPU-checkable rules to `serve-configs/tests/`.
   `dynamic_effort_theta`, `effort_bias: float`, `deadline_ms`,
   `dynamic_effort_floor: bool`.
 - Server: `--reasoning-config '{"dynamic_effort": {"ladder": [...],
-  "check_at": 0.75, "theta": [...], "weights": {...}, "loop_ngram": 16,
-  "loop_repeats": 3, "max_rung_by_batch_size": [[1,8,3],[9,32,2],[33,128,1]],
-  "force_end_str": "..."}}'`.
+  "check_at": 0.75, "rule": "length", "uncertainty_min_auc": 0.6,
+  "soft_limit": {"enabled": true, "ramp_tokens": 256, "max_bias": 10.0,
+  "curve": 1.0}, "loop_ngram": 16, "loop_repeats": 3,
+  "max_rung_by_batch_size": [[1,8,3],[9,32,2],[33,128,1]],
+  "force_end_str": "...", "quantile_path": "..."}}'`.
 - Telemetry cardinality: labels are fixed enums only (`from`,`to` rung;
   `reason` ∈ uncertainty/mtp/repetition/stall/tool_error/boundary/cap;
-  `outcome` ∈ applied/late/rejected/unsupported); numbers go to histograms
-  or OTEL span attributes; never request ids, prompt/output/tool text.
+  `outcome` ∈ applied/late/rejected/unsupported; `kind` ∈
+  natural/soft/forced); numbers go to histograms or OTEL span attributes;
+  never request ids, prompt/output/tool text.
 - Metrics (`vllm/v1/metrics/`): `vllm:effort_final_rung` histogram,
   `vllm:effort_escalations_total{from,to}`, `vllm:effort_stall_clamps_total`,
-  `vllm:reasoning_tokens` histogram; per-request fields on
-  `FinishedRequestStats` (`vllm/v1/metrics/stats.py:224`).
+  `vllm:effort_close_total{kind}` (natural / soft / forced — the direct read
+  on whether the soft limit is doing its job), `vllm:reasoning_tokens`
+  histogram; per-request fields on `FinishedRequestStats`
+  (`vllm/v1/metrics/stats.py:224`).
 
 ## 8. Phases
 
@@ -422,10 +436,10 @@ reasoning tokens on the mixed set, no regression on the code-edit slice.
   `max_rung_by_batch_size` on both profiles; report the Pareto vs fixed
   `low`/`medium`/`xhigh`; verify no single-stream regression when no request
   is dynamic. Choose defaults, write them into the two YAMLs.
-- **P4 — tool outcomes + priors (S9/S10).** Frontend classifier for the last
-  tool turn → `effort_bias`; coding-agent ladder table; verify on an agent
-  transcript replay (the compaction/agent traffic that motivated the
-  keep-alive work).
+- **P4 — typed tool outcomes (S9).** Map the Responses built-in-tool loop's
+  own typed outcome for the previous subturn onto `effort_bias`. No text
+  classifier and no prompt-shape ladder table (§11.0 rules both out); a plain
+  Chat client that wants the same effect passes `effort_bias` itself.
 - **P5 — floor + graceful close experiments.** `force_end_str` recipe,
   `</think>` suppression + `"Wait, "` continuation at rung 0; keep only if P3's
   metric improves.
@@ -465,6 +479,39 @@ mid-generation restart machinery (restart is out of scope, §6 option C).
 
 ## 11. P6 — self-normalizing, worker-side controller (2026-08-19)
 
+### 11.0 Standing constraint — model-agnostic signals only
+
+**This governs §11, §12 and everything after them.** Every signal and every
+rule in this controller must be a function of *the model's own output
+distribution and token stream*, defined identically for any model, tokenizer,
+language and quantization. Concretely:
+
+**Allowed.** Logit-derived quantities at the canonical stage (entropy, top1−top2
+margin, p(end)); token-stream statistics (n-gram novelty rate, stagnation =
+tokens since the last novel n-gram, compressibility / recurrence as loop
+evidence); speculative-decode acceptance; termination and length rules
+(think position vs cap, `max_tokens` headroom, batch-size rung caps); and
+per-model calibration that is **measured** — running quantile sketches, the
+AUC gate of §12.2 — rather than typed in by hand.
+
+**Not allowed.** Lexical marker lists (`Wait`, `Hmm`, …); prompt-structure
+heuristics (prompt length, code fences, number of declared tools, keyword or
+`tool_choice` sniffing); text classifiers over tool output; and per-model magic
+numbers that someone fitted by eye. A threshold is acceptable only when it is
+expressed in a model-agnostic unit (a percentile, a token count, a logit
+delta) *and* a wrong setting is visible as a rate in the metrics.
+
+What this already ruled out on this branch: S10 (request-context priors) is
+struck from §3; S9 keeps only the Responses API's own typed tool outcomes and
+loses its text heuristic; `backtrack_markers` survives **only** as an
+explicitly legacy, weight-0-by-default option, and the churn detector runs on
+n-gram novelty instead. The one model-specific string left in the design is
+the frontend's rung-0 effort sentence (§2b) and the `force_end_str` transition
+(§5) — those are *renderings the server emits*, chosen per deployment in the
+YAML, not signals the controller reads.
+
+### 11.1 What P6 answered
+
 P6 answers four complaints about the P2 controller: it was hard-coded (a fixed
 `(mean, sd)` calibration table and a `theta` per model and quantization), its
 churn evidence was an English word list, it cut hard at the cap even when the
@@ -478,7 +525,7 @@ which requests need more thinking. P6 is therefore deliberately conservative:
 it makes the rule auditable and self-calibrating, and puts the new signal -
 p(`</think>`) - where the old ones failed.
 
-### 11.1 What replaced what
+### 11.2 What replaced what
 
 | P2 | P6 | why |
 |---|---|---|
@@ -486,7 +533,7 @@ p(`</think>`) - where the old ones failed.
 | `theta` per rung + five weights (`w_h`, `w_m`, `w_t`, `w_a`) | one tunable per rung: `p_uncertain` | the rule is ordinal and small; a wrong setting shows up directly as an escalation *rate* |
 | absolute level only | rank **plus** a within-request baseline over the first `baseline_tokens` think tokens | escalation keys on relative change |
 | `backtrack_markers` density (`Wait`, `Hmm`, …) | **n-gram novelty rate** per window + the existing rolling-hash repeat count; markers keep weight 0 | language-agnostic and not model-specific |
-| hard cut at the cap | **p(`</think>`) grace window** | a model that is wrapping up gets `grace_tokens` more instead of being cut mid-sentence |
+| hard cut at the cap | **p(`</think>`) grace window** (superseded by the §12.1 soft limit, which grants the same room unconditionally and biases the close on top; the scheduler now ships `grace_tokens = 0` while the soft limit is on) | a model that is wrapping up gets `grace_tokens` more instead of being cut mid-sentence |
 | bare `</think>` forced | `force_end_str` (Qwen's own "Considering the limited time…" transition), detection stays on `reasoning_end_str` | in-distribution close (§5) |
 | scheduler decides, worker applies 1-2 steps later (`late`) | **worker evaluates the rule where the cap is applied** (V2); scheduler ships policy only | `late` is 0 by construction |
 | ladder `[1024, 4096, 16384, 65536]` | `[1024, 4096, 16384]` | 0 of 1 199 measured requests passed 16 384 think tokens |
@@ -496,7 +543,7 @@ Nothing was deleted: `rule: "score"` selects the P2 weighted z-score,
 `backtrack_marker_weight > 0` re-arms the marker list. The V1 runner always
 uses the scheduler-side path.
 
-### 11.2 The rule
+### 11.3 The rule
 
 Signals per request, from the committed rows of the previous step (frozen
 tuple, §6 item 1, now four wide): `entropy`, `margin`, `p_end`, `n_rows`.
@@ -519,11 +566,15 @@ scheduler-side and worker-side sites use the same grid and the same predicate
 it is made. **Cold sketches never escalate**: below `quantile_min_samples` the
 policy is `warm=False` and every request stays at rung 0.
 
+This is `rule = "rank"`. It is no longer the default: §12.2 keeps the whole
+rule but makes the two uncertainty terms conditional on measured evidence,
+because §4 of the analysis says they carry none on this model.
+
 Grace: at the `final_check_at` point, a request that did not escalate and whose
 fast p(end) EMA leads the slow one gets `cap += grace_tokens`, once. Flat or
 zero p(end) at the final check leaves the rung rule to escalate or close.
 
-### 11.3 Architecture
+### 11.4 Architecture
 
 The §6 recommendation (scheduler decides) is now split:
 
@@ -544,7 +595,7 @@ The §6 recommendation (scheduler decides) is now split:
 - Worker → scheduler: `ModelRunnerOutput.effort_reports[req_id] = (rung,
   escalations, grace_tokens, late)` with `late = 0`.
 
-### 11.4 Calibration workflow
+### 11.5 Calibration workflow
 
 `serve-configs/effort_calibrate.py`:
 
@@ -568,23 +619,212 @@ scheduler's per-request acceptance EMA, so a warmed file and a self-warmed
 server converge to the same distribution. The server rewrites the file every
 `quantile_flush_every` observations, so it also self-maintains.
 
-### 11.5 Defaults
+### 11.6 Defaults
 
 `ladder [1024, 4096, 16384]` · `p_uncertain [0.85, 0.92]` (padded `0.96`) ·
 `baseline_tokens 128` · `baseline_rise 0.10` · `grace_tokens 256` ·
 `acc_veto_rank 0.85` · `novelty_ngram 8` / `novelty_window 256` /
 `novelty_min_rate 0.2` · `backtrack_marker_weight 0.0` ·
-`quantile_min_samples 2048` · `rule "rank"` · `evaluation "worker"`.
+`quantile_min_samples 2048` · `evaluation "worker"`.
 The reasoning for each is in
 [`dynamic-reasoning-v3-analysis.md`](dynamic-reasoning-v3-analysis.md) §5.
+`rule` and `grace_tokens` were superseded by §12: the default rule is now
+`"length"` and the grace window is folded into the soft-limit ramp.
 
-### 11.6 Not yet measured
+### 11.7 Not yet measured
 
 p(`</think>`) itself (the column ships with P6, so it is absent from the v3
-telemetry), the novelty rate (needs a token stream the sink does not keep), and
-the on-GPU cost of the escalation tensors. GPU validation of P6 is the next
+telemetry), the novelty rate (needs a token stream the sink does not keep), the
+on-GPU cost of the escalation tensors, and — new with §12 — what fraction of
+force-closed requests the soft-limit ramp converts to a natural close
+(`vllm:effort_close_total{kind}` answers it directly) and the AUC the
+calibration pass reports on this model. GPU validation of P6/P7 is the next
 window. One harness change is worth doing first: VulcanBench discards the
 response `effort` object (`TokenUsage` keeps only prompt/completion tokens), so
 rung, escalations and `late` are not recoverable from a sweep - persisting
 `LLMResponse.raw` would make every question in the analysis directly
 measurable.
+
+## 12. P7 — soft-limit close and the evidence-gated rule (2026-08-19)
+
+P7 changes two things and deletes nothing. Both follow §11.0: the new actuator
+is arithmetic on the model's own think position and the first token of its own
+end marker, and the new rule replaces a hand-asserted premise with a measured
+one.
+
+### 12.1 The soft-limit close
+
+The cap was a cliff: at `think_count == cap` the end sequence was forced,
+whatever the model was in the middle of. From now on the cap starts a ramp
+instead (the idea is lfg.cpp's "reasoning soft-limit sampler"):
+
+```
+bias(t) = max_bias * clamp((t - cap) / ramp_tokens, 0, 1) ** curve
+```
+
+added to the logit of the **first token of the natural reasoning end
+sequence** — the marker the parser detects, not the (possibly graceful,
+multi-token) forced close, so a soft close reads like the model's own. The
+existing hard force moves to `cap + ramp_tokens`, unchanged in every other
+respect: still spec-decode aware, still token-by-token through a multi-token
+`force_end_str`, still rolled back when a draft is rejected before the forced
+position.
+
+- **Defaults:** `ramp_tokens 256`, `max_bias 10.0` logits, `curve 1.0`
+  (linear), `enabled true`. All three are model-agnostic units.
+- **Both actuators, one formula.** `vllm/v1/sample/soft_limit.py` holds the
+  three lines; the V1 `ThinkingBudgetStateHolder`, the V2 Triton kernel and
+  its torch reference each apply them. Under spec decode the bias lands on the
+  target rows at their own think positions, exactly like the force does: row
+  `p` of a K-token draft window sits at `think_count + p`, so a window can
+  straddle the ramp and the force (rows 0-3 biased, rows 4+ forced) — the
+  K=7 case is a test.
+- **Dynamic and static.** A plain `thinking_token_budget` request gets the
+  same ramp, because "close gracefully" is not a property of the ladder. A
+  server with no `dynamic_effort` block has no soft limit at all, so a
+  deployment that never asked for this keeps exact hard-cap semantics.
+- **`close_kind`.** Every request reports how its think block ended:
+  `natural` (before the cap, or exactly at it — the bias is 0 there), `soft`
+  (inside the ramp: the biased marker won and **nothing was forced**), or
+  `forced` (the hard force fired at `cap + ramp_tokens`). It rides on the
+  response `effort` object and on `vllm:effort_close_total{kind}`. The v3
+  telemetry says 2.9 % of requests were force-closed; this counter is the
+  direct measurement of what fraction of those the ramp converts.
+- **It composes with the other limits by aiming the force point, not the cap.**
+  Two places had a hard guarantee that a ramp would otherwise stretch, so both
+  now subtract it: the `max_tokens` headroom (S8) caps a rung at
+  `max_tokens - answer_reserve_tokens - ramp`, so the forced close still leaves
+  the answer its reserve; and the stall clamp targets
+  `think + hard_stop_margin - ramp`, so the loop guard's close lands where it
+  always did, with the bias already saturated on the way. A cap cannot go
+  negative, so a loop detected inside the first `ramp` think tokens closes at
+  `ramp` instead - and the request's own `repetition_detection` stop, which
+  none of this weakens, remains the terminal guarantee.
+- **The p(end) grace window is retired into this.** The grace granted
+  `grace_tokens` *conditionally*, when the fast p(end) EMA led the slow one.
+  The ramp grants the same room *unconditionally* and biases the close on top,
+  so a p(end)-gated window on top of it would only be the same tokens with an
+  extra predicate. Simplification: grace = ramp. The scheduler ships
+  `grace_tokens = 0` while `soft_limit` is active; setting
+  `soft_limit.enabled = false` brings the old window back.
+
+### 12.2 The default rule: termination/length, uncertainty gated by evidence
+
+`docs/dynamic-reasoning-v3-analysis.md` §4 is unambiguous: with length
+controlled, entropy and margin sit at AUC 0.41-0.54 at separating requests that
+needed more thinking, in both the absolute level and the within-request rise.
+P6 kept escalating on them anyway, just more conservatively. P7 stops asserting
+the premise and measures it instead.
+
+**`rule = "length"` (the new default).** At a check point:
+
+```
+escalate iff  still in the think block at check_at
+          and not looping / churning              (n-gram novelty + recurrence)
+          and p(end) not rising                   (not converging)
+          and rank(MTP acceptance) <= acc_veto_rank
+```
+
+**`use_uncertainty`.** On top of that, and only when the model's calibration
+file reports a discriminative AUC of at least `uncertainty_min_auc` (default
+**0.60**) for the entropy/margin features on *that* model:
+
+```
+          and u >= p_uncertain[rung]  and  u - u_baseline >= baseline_rise
+          and H_fast >= H_slow
+```
+
+No AUC in the file means no evidence, which means the features stay off — they
+are still computed, logged and sketched, they just do not vote. `rule="rank"`
+turns them on unconditionally (the P6 behaviour) and `rule="score"` still
+selects the pre-P6 weighted z-score; both remain selectable.
+
+Two consequences worth stating plainly. First, with the features off there is
+no distribution to warm, so the policy ships `warm=True` immediately and a
+fresh deployment escalates from its first request instead of behaving like a
+fixed rung-0 cap until the sketches fill. Second, "not converging" reduces to
+"p(end) not rising": the entropy trend is itself an uncertainty feature and
+leaves with them.
+
+**Measuring the AUC.** `serve-configs/effort_calibrate.py build` now computes
+it from the same telemetry sink it folds into the sketches, with the analysis
+doc's method and label:
+
+- *positive* = the request needed the higher rung: it passed the rung-0 cap and
+  then closed naturally, rather than landing within `cap_slack` of a higher cap;
+- *negative* = it closed at or before the rung-0 cap;
+- length control: both groups must be at least `2 * window` (default 256) think
+  tokens, so a request's first-`window` and last-`window` means are disjoint;
+- six features — entropy first / last / rise, margin first / last / drop — each
+  scored as a rank statistic (Mann-Whitney, ties at 0.5) **in the direction the
+  rule assumes**, so a value under 0.5 means the rule's premise is backwards on
+  this model. `uncertainty_auc` is the best of the six.
+
+The block is written into the sketch file next to the digests, is additive (a
+file from before this change loads and reports "no evidence"), and survives the
+server's periodic reflush. At startup the scheduler logs which features are
+active and why, e.g.
+`entropy/margin rank features OFF - calibration AUC 0.538 < 0.60`.
+
+### 12.3 What we tried and what carries information
+
+| signal | how it was tested | verdict |
+|---|---|---|
+| entropy (normalised) | AUC on 1 199 requests, length controlled (v3 §4) | **at chance** (0.41-0.49). Kept as telemetry; gated off by default |
+| top1−top2 margin | same | **at chance** (0.50-0.54). Same treatment |
+| entropy rise over the request's own baseline | same | **at chance** (0.42). The un-controlled 0.26 was a length artifact |
+| margin drop over the baseline | same | **at chance** (0.54) |
+| a fixed `(mean, sd)` z-table per model | fitted 2026-08-18, then re-read against the distribution | **wrong shape**: entropy is right-skewed with a point mass at 0, so a z-score is not an ordinal statement. Replaced by quantile sketches |
+| backtrack-marker density (`Wait`, `Hmm`, …) | never load-bearing; English-only | **rejected** by §11.0. Weight 0, legacy option only |
+| prompt-shape priors (length, code fences, #tools) | — | **rejected** by §11.0 before implementation |
+| n-gram novelty rate | three of the four v3 failures show repeated identical probes; not retro-computable (the sink keeps no token stream) | **directionally right, unvalidated.** Language-agnostic, so it stays |
+| MTP acceptance | global 0.733, per-request p85 ≈ 0.95 | **corroboration only**, as a veto. Never a standalone vote |
+| think position vs cap (termination/length) | 35 of 1 199 requests force-closed; escalation fires on ~7 % | **the load-bearing signal.** It is the one thing that is definitionally about "the model is not done" |
+| p(`</think>`) | ships with P6/P7; absent from the v3 telemetry | **the new one.** Definitionally "about to finish", measured from the same logits. Now both the convergence test and, through the ramp, the actuator |
+
+### 12.4 Next
+
+In order. Everything here obeys §11.0.
+
+1. **Offline policy simulator over recorded unbounded-thinking traces.** Record
+   greedy traces with no cap and the full per-step signal tuple, then replay any
+   stop/escalate policy against them exactly: a policy that only ever *cuts*
+   earlier than the recording is answerable from the trace alone, and only a
+   policy that changes the token stream needs regeneration — and then only from
+   the cut point, reusing the prefix. This turns every remaining question in
+   §12.3 from an argument into a measurement, and it is the prerequisite for
+   the four items after it.
+2. **P(end) hazard.** The ramp uses p(end) as a level; the honest quantity is a
+   hazard — P(the block closes within the next *n* tokens | it has not yet).
+   Fit it once per model from the same traces, and the check point stops being
+   a fraction of the cap and becomes "the hazard says this will not close on
+   its own".
+3. **Novelty collapse.** The novelty rate as a *trend* rather than a threshold:
+   the derivative of distinct-new-n-grams per window is a loop starting, and it
+   fires before the current absolute cut-off does.
+4. **Stagnation cap.** Tokens since the last novel n-gram, capped directly. The
+   simplest possible termination rule that is not a token count, and it is
+   defined identically for any tokenizer.
+5. **Compressibility loop detection.** Recurrence / compression ratio of the
+   think tail as loop evidence, replacing the n-gram + rolling-hash pair with
+   one statistic that does not need a window length chosen by hand.
+6. **Decision-point margin.** Not the per-token margin (at chance) but the
+   margin at the *branch* tokens — the positions where the distribution is
+   genuinely multimodal. Selecting those positions is itself a distributional
+   test, so it stays inside §11.0.
+7. **MTP rank.** Where the target's choice sits in the drafter's ranking, not
+   just accept/reject. Free on the latency profile, strictly more information
+   than the acceptance ratio.
+8. **Typed tool-outcome priors — Responses API only.** The previous subturn's
+   typed `error`/`timeout` outcome raises the sensitivity for the next one.
+   Only the built-in-tool loop's own typed outcomes; no classifier over tool
+   text, and no plain-Chat inference (a Chat client that wants this passes
+   `effort_bias`).
+9. **Encoder / hidden-state probe (P7-probe).** Last. It needs training data,
+   it is per-model by construction, and it should only be reached once 1-7 are
+   exhausted — by then the simulator can score it honestly against them.
+
+Explicitly *not* on this list: counterfactual replay by re-running saved
+requests with forced closes at each rung. Item 1 subsumes it and is strictly
+cheaper — a forced close at rung *r* is a prefix of the unbounded trace, so the
+label comes out of the recording instead of a fresh generation.
