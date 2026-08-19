@@ -1,3 +1,23 @@
+## About this fork
+
+This is [gabewillen/vllm](https://github.com/gabewillen/vllm), a fork of [vllm-project/vllm](https://github.com/vllm-project/vllm).
+
+- `main` tracks upstream `main` unchanged (no fork commits).
+- Model-specific engine tuning lives in per-model branches. Each branch carries the
+  patches, serve configs, service units, and measurement evidence for one deployment.
+
+| Branch | Contents |
+| --- | --- |
+| `qwen3.8-27B` | Qwen3.8-27B-FP8 on 4× NVIDIA L4. Venv patches `serve-configs/patches/0001-0009` (adaptive MTP draft length, quantized draft/target lm_head, dense-TP dual-batch overlap, GDN skinny GEMM, L4 block-fp8 GEMM configs, dynamic reasoning effort), serve configs `serve-configs/qwen3_8_27b_*.yaml`, systemd units under `serve-configs/systemd/`, `docs/dynamic-reasoning.claude.md`, goal-run evidence under `goal/`. |
+| `venv-0.27.2rc1-patched` | Git-tracked copy of the installed `0.27.2rc1.dev110` wheel with the patches applied (the deployment baseline). |
+| `lane-*` | Implementation lanes for dynamic reasoning effort (`lane-a-telemetry`, `lane-b-v2-budget`, `lane-c-controller`), branched from that baseline and merged back into it; exported as patch 0009. |
+
+Start with [`serve-configs/patches/README.md`](serve-configs/patches/README.md) (what each patch does and how it is applied to the venv) and [`docs/dynamic-reasoning.claude.md`](docs/dynamic-reasoning.claude.md).
+
+The patches are applied to the installed package, not to this source tree, and have not been reported upstream; they are candidates for upstream PRs.
+
+---
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
