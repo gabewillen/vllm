@@ -8,14 +8,25 @@ from pydantic import Field
 
 from vllm.config.model import ModelConfig
 from vllm.config.utils import config
+from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.v1.sample.effort_policy import DEFAULT_P_UNCERTAIN
+
+logger = init_logger(__name__)
 
 
 QWEN_LOW_EFFORT_SENTENCE = (
     "Reasoning effort is set to low. Keep your thinking brief and focused, "
     "moving directly to the conclusion without unnecessary elaboration."
 )
+
+QWEN_GRACEFUL_FORCE_END_STR = (
+    "\n\nConsidering the limited time by the user, I have to give the solution "
+    "based on the thinking directly now.\n</think>\n\n"
+)
+"""Qwen's own budget-forcing transition (docs/dynamic-reasoning.claude.md §5).
+Forcing this instead of a bare `</think>` keeps the close in-distribution."""
 
 
 @config
@@ -29,25 +40,80 @@ class DynamicEffortConfig:
 
     ladder: list[int] = field(default_factory=lambda: [1024, 4096, 16384, 65536])
     """Thinking-token caps per rung, strictly increasing."""
+    rule: str = "rank"
+    """`rank` (default, P6): ordinal percentile-rank rule fed by the
+    scheduler's running quantile sketches. `score`: the pre-P6 weighted
+    z-score against the fixed `calibration` table (deprecated)."""
+    evaluation: str = "worker"
+    """Where the escalation rule runs. `worker` (default) evaluates it in the
+    V2 sampler next to the cap actuator, so a decision can never arrive late;
+    `scheduler` keeps the pre-P6 scheduler-side path. The V1 runner always
+    falls back to `scheduler`."""
     check_at: float = Field(default=0.75, gt=0.0, lt=1.0)
     """Fraction of the current cap at which the escalation check fires."""
     final_check_at: float = Field(default=0.9, gt=0.0, lt=1.0)
     """Fraction of the current cap for the second (last) escalation check."""
+    p_uncertain: list[float] | None = None
+    """Uncertainty **percentile rank** required to climb each rung, the only
+    tunable of the rank rule. Defaults to `[0.75, 0.85, 0.92, ...]`."""
+    quantile_path: str | None = None
+    """JSON file the per-model quantile sketches are persisted to and warmed
+    from at startup. `None` keeps them in memory (cold after every restart)."""
+    quantile_min_samples: int = Field(default=2048, ge=1)
+    """Observations a signal sketch needs before any request may escalate."""
+    quantile_compression: float = Field(default=100.0, ge=10.0)
+    """t-digest compression of the sketches."""
+    quantile_flush_every: int = Field(default=5000, ge=0)
+    """Observations between two writes of `quantile_path`; 0 disables."""
+    quantile_edges: int = Field(default=33, ge=2)
+    """Points of the monotone quantile grid shipped to the worker; the worker
+    turns a signal into a rank by searching this grid."""
+    baseline_tokens: int = Field(default=128, ge=1)
+    """Think tokens that form the within-request signal baseline; escalation
+    keys on the rise over it, not on the absolute level."""
+    baseline_rise: float = Field(default=0.10, ge=0.0, le=1.0)
+    """Uncertainty-rank rise over the request's own baseline required to
+    escalate."""
+    grace_tokens: int = Field(default=256, ge=0)
+    """Think tokens granted once, near the cap, when p(reasoning end) is
+    rising - the model is wrapping up, so it is not cut off mid-sentence."""
+    p_end_rise_eps: float = Field(default=0.0, ge=0.0)
+    """How much the fast p(end) EMA must exceed the slow one to count as
+    rising."""
+    acc_veto_rank: float = Field(default=0.85, gt=0.0, le=1.0)
+    """MTP acceptance rank above which escalation is vetoed (the drafter
+    predicts the target, so the text is predictable). Corroboration only."""
+    novelty_ngram: int = Field(default=8, ge=2)
+    """N-gram length of the language-agnostic novelty (churn) detector."""
+    novelty_window: int = Field(default=256, ge=16)
+    """Think tokens the novelty rate is measured over."""
+    novelty_min_rate: float = Field(default=0.2, ge=0.0, le=1.0)
+    """Distinct-new-n-grams / total below which the window counts as churn
+    and vetoes escalation."""
+    backtrack_marker_weight: float = Field(default=0.0, ge=0.0)
+    """Weight of the (English-only, model-specific) backtrack-marker density
+    in the churn evidence. 0 - the P6 default - disables it; the marker list
+    stays configurable."""
+    graceful_force_end: bool = True
+    """Force `force_end_str` (an in-distribution transition phrase ending in
+    the model's own end marker) instead of a bare end marker."""
+    force_end_str: str = QWEN_GRACEFUL_FORCE_END_STR
+    """The forced close. Detection keeps `ReasoningConfig.reasoning_end_str`."""
     theta: list[float] | None = None
-    """Escalation score threshold per transition (`len(ladder) - 1` entries).
-    Defaults to `[0.0, 0.5, 1.0, ...]` (harder to climb the higher rungs)."""
+    """Deprecated (pre-P6 `rule="score"`): escalation score threshold per
+    transition. Defaults to `[0.0, 0.5, 1.0, ...]`."""
     w_h: float = 1.0
-    """Weight of z(H_fast) in the escalation score."""
+    """Deprecated (`rule="score"`): weight of z(H_fast)."""
     w_m: float = 1.0
-    """Weight of -z(margin_ema) in the escalation score."""
+    """Deprecated (`rule="score"`): weight of -z(margin_ema)."""
     w_t: float = 0.5
-    """Weight of the entropy-trend indicator `[H_fast >= H_slow]`."""
+    """Deprecated (`rule="score"`): weight of the entropy trend."""
     w_a: float = 0.5
-    """Weight of the MTP acceptance drop `(acc_base - acc_ema)`."""
+    """Deprecated (`rule="score"`): weight of the MTP acceptance drop."""
     ema_fast_alpha: float = Field(default=0.3, gt=0.0, le=1.0)
     """EMA weight of a new sample for `H_fast`, `margin_ema` and `acc_ema`."""
     ema_slow_alpha: float = Field(default=0.05, gt=0.0, le=1.0)
-    """EMA weight of a new sample for `H_slow`."""
+    """EMA weight of a new sample for `H_slow` and the slow p(end) EMA."""
     min_samples: int = Field(default=64, ge=1)
     """Signal samples (committed think tokens with signals) required before
     an escalation may fire."""
@@ -75,8 +141,8 @@ class DynamicEffortConfig:
     marker_window: int = Field(default=256, ge=16)
     """Think tokens over which the backtrack-marker density is measured."""
     marker_max_rate: float = Field(default=0.05, gt=0.0)
-    """Markers per token above which non-converging thinking counts as churn
-    (vetoes escalation; never a hard stop)."""
+    """Markers per token above which non-converging thinking counts as churn.
+    Only consulted when `backtrack_marker_weight > 0`."""
     answer_reserve_tokens: int = Field(default=256, ge=0)
     """Tokens kept free below `max_tokens` for the answer after thinking;
     a rung whose cap cannot leave this reserve is never entered."""
@@ -89,7 +155,8 @@ class DynamicEffortConfig:
     calibration: dict[str, tuple[float, float]] = field(
         default_factory=lambda: {"entropy": (0.0, 1.0), "margin": (0.0, 1.0)}
     )
-    """Per-signal `(mean, std)` used by the z-scores; keys `entropy`, `margin`."""
+    """Deprecated (`rule="score"`): per-signal `(mean, std)` for the z-scores;
+    keys `entropy`, `margin`. The rank rule replaces it with running sketches."""
     render_effort: str = "medium"
     """`reasoning_effort` value handed to the chat template for dynamic
     requests (block-0-stable rendering)."""
@@ -108,6 +175,29 @@ class DynamicEffortConfig:
             )
         if self.final_check_at <= self.check_at:
             raise ValueError("dynamic_effort.final_check_at must exceed check_at")
+        if self.rule not in ("rank", "score"):
+            raise ValueError("dynamic_effort.rule must be 'rank' or 'score'")
+        if self.evaluation not in ("worker", "scheduler"):
+            raise ValueError(
+                "dynamic_effort.evaluation must be 'worker' or 'scheduler'"
+            )
+        num_transitions = len(self.ladder) - 1
+        if self.p_uncertain is None:
+            defaults = list(DEFAULT_P_UNCERTAIN)
+            self.p_uncertain = [
+                defaults[min(i, len(defaults) - 1)] for i in range(num_transitions)
+            ]
+        if len(self.p_uncertain) != num_transitions:
+            raise ValueError(
+                "dynamic_effort.p_uncertain needs one entry per ladder transition "
+                f"({num_transitions}), got {len(self.p_uncertain)}"
+            )
+        if any(not 0.0 < p <= 1.0 for p in self.p_uncertain):
+            raise ValueError("dynamic_effort.p_uncertain entries must be in (0, 1]")
+        if self.graceful_force_end and not self.force_end_str:
+            raise ValueError(
+                "dynamic_effort.graceful_force_end needs a non-empty force_end_str"
+            )
         if self.theta is None:
             self.theta = [0.5 * i for i in range(len(self.ladder) - 1)]
         if len(self.theta) != len(self.ladder) - 1:
@@ -119,6 +209,8 @@ class DynamicEffortConfig:
             raise ValueError("dynamic_effort.theta must be finite")
         if self.hash_window <= self.loop_ngram:
             raise ValueError("dynamic_effort.hash_window must exceed loop_ngram")
+        if self.novelty_window <= self.novelty_ngram:
+            raise ValueError("dynamic_effort.novelty_window must exceed novelty_ngram")
         if self.floor_enabled:
             raise ValueError("dynamic_effort.floor_enabled is not implemented")
         for key in ("entropy", "margin"):
@@ -173,7 +265,14 @@ class ReasoningConfig:
     reasoning_start_str: str = ""
     """String that indicates the start of reasoning."""
     reasoning_end_str: str = ""
-    """String forced when the thinking budget is exhausted."""
+    """String that ends reasoning; used for *detection* and, unless
+    `force_end_str` is set, also as the forced close."""
+    force_end_str: str = ""
+    """String forced when the thinking budget is exhausted. Empty falls back
+    to `dynamic_effort.force_end_str` (when `graceful_force_end` is on) and
+    then to `reasoning_end_str`. Splitting the two lets the forced close be an
+    in-distribution transition phrase while detection stays on the bare end
+    marker (docs/dynamic-reasoning.claude.md §5)."""
     dynamic_effort: DynamicEffortConfig | None = None
     """Server defaults for `reasoning_effort: "dynamic"`; `None` rejects it."""
 
@@ -248,7 +347,23 @@ class ReasoningConfig:
         if not natural_reasoning_end_str:
             natural_reasoning_end_str = reasoning_end_str
 
-        if not reasoning_start_str or not reasoning_end_str:
+        force_end_str = self.force_end_str
+        if not force_end_str and self.dynamic_effort is not None:
+            if self.dynamic_effort.graceful_force_end:
+                force_end_str = self.dynamic_effort.force_end_str
+        if not force_end_str:
+            force_end_str = reasoning_end_str
+        if natural_reasoning_end_str and not force_end_str.endswith(
+            natural_reasoning_end_str.rstrip()
+        ):
+            logger.warning(
+                "ReasoningConfig: the forced close %r does not end with the "
+                "detected reasoning end marker %r; reasoning may never close.",
+                force_end_str,
+                natural_reasoning_end_str,
+            )
+
+        if not reasoning_start_str or not force_end_str:
             # If we don't have valid strings to tokenize,
             # we can't initialize the token IDs.
             return
@@ -256,7 +371,7 @@ class ReasoningConfig:
             reasoning_start_str, add_special_tokens=False
         )
         self._reasoning_end_token_ids = tokenizer.encode(
-            reasoning_end_str, add_special_tokens=False
+            force_end_str, add_special_tokens=False
         )
         self._natural_reasoning_end_token_ids = tokenizer.encode(
             natural_reasoning_end_str, add_special_tokens=False
@@ -270,7 +385,8 @@ class ReasoningConfig:
             raise ValueError(
                 f"ReasoningConfig: failed to tokenize reasoning strings: "
                 f"reasoning_start_str='{self.reasoning_start_str}', "
-                f"reasoning_end_str='{self.reasoning_end_str}'. "
+                f"reasoning_end_str='{self.reasoning_end_str}', "
+                f"force_end_str='{self.force_end_str}'. "
                 "Ensure the strings are valid tokens in the model's vocabulary."
             )
         self._enabled = True
