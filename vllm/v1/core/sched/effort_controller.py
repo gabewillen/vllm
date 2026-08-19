@@ -395,10 +395,7 @@ def _ingest_signals(
 
 def _churn(state: EffortState, cfg: DynamicEffortConfig) -> bool:
     """Language-agnostic churn: a low-novelty window, or (opt-in) markers."""
-    if (
-        state.novelty_rate is not None
-        and state.novelty_rate < cfg.novelty_min_rate
-    ):
+    if state.novelty_rate is not None and state.novelty_rate < cfg.novelty_min_rate:
         return True
     if cfg.backtrack_marker_weight > 0.0 and state.h_fast is not None:
         rate = (

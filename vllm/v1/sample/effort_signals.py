@@ -139,9 +139,7 @@ def reduce_committed(
     if row_mask is not None:
         committed = committed & row_mask
     weight = committed.to(torch.float32)
-    sums = torch.zeros(
-        (num_reqs, NUM_ROW_SIGNALS), dtype=torch.float32, device=device
-    )
+    sums = torch.zeros((num_reqs, NUM_ROW_SIGNALS), dtype=torch.float32, device=device)
     sums.index_add_(0, req_of_row, row_signals.float() * weight[:, None])
     n_rows = torch.zeros(num_reqs, dtype=torch.float32, device=device)
     n_rows.index_add_(0, req_of_row, weight)

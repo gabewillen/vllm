@@ -217,7 +217,9 @@ class TDigest:
         digest.count = float(data.get("count", sum(weights)))
         lo, hi = data.get("min"), data.get("max")
         digest.min = float(lo) if lo is not None else (means[0] if means else math.inf)
-        digest.max = float(hi) if hi is not None else (means[-1] if means else -math.inf)
+        digest.max = (
+            float(hi) if hi is not None else (means[-1] if means else -math.inf)
+        )
         return digest
 
 

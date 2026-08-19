@@ -286,9 +286,7 @@ class SchedulerOutput:
     # req_id -> (revision, absolute thinking token budget). Applied by the
     # model runner before this step's sampling for strictly increasing
     # revisions only; acked via ModelRunnerOutput.thinking_budget_acks.
-    thinking_budget_updates: dict[str, tuple[int, int]] = field(
-        default_factory=dict
-    )
+    thinking_budget_updates: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

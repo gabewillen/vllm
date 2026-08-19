@@ -2587,7 +2587,9 @@ class Scheduler(SchedulerInterface):
         try:
             warmed = self._effort_sketches.load()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("dynamic_effort: could not load %s (%s)", cfg.quantile_path, exc)
+            logger.warning(
+                "dynamic_effort: could not load %s (%s)", cfg.quantile_path, exc
+            )
             warmed = False
         logger.info(
             "dynamic_effort: rule=%s evaluation=%s sketches=%s (%s)",

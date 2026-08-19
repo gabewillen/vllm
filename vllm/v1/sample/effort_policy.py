@@ -12,12 +12,14 @@ made or on which TP rank makes it.
 
 Rule (docs/dynamic-reasoning.claude.md §P6):
 
-    u        = max(rank(H_fast), 1 - rank(margin))
-    escalate = u >= p_uncertain[rung]                      # globally uncertain
-               and u - u_baseline >= baseline_rise         # and rising for *this* request
-               and (H_fast >= H_slow or p_end not rising)   # not converging
-               and no loop / churn
-               and rank(MTP acceptance) <= acc_veto_rank    # corroboration only
+    u = max(rank(H_fast), 1 - rank(margin))
+    escalate = (
+        u >= p_uncertain[rung]                    # globally uncertain
+        and u - u_baseline >= baseline_rise       # and rising for *this* request
+        and (H_fast >= H_slow or p_end not rising)  # not converging
+        and no loop / churn
+        and rank(MTP acceptance) <= acc_veto_rank   # corroboration only
+    )
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from __future__ import annotations
 import bisect
 from dataclasses import dataclass, field
 
-DEFAULT_P_UNCERTAIN = (0.75, 0.85, 0.92)
+DEFAULT_P_UNCERTAIN = (0.85, 0.92, 0.96)
 
 
 @dataclass
@@ -103,7 +105,8 @@ def uncertainty_rank(
     entropy_rank: float | None, margin_rank: float | None
 ) -> float | None:
     """Combine the two ranks into one ordinal uncertainty feature."""
-    parts = [r for r in (entropy_rank, None if margin_rank is None else 1.0 - margin_rank) if r is not None]
+    margin_uncertainty = None if margin_rank is None else 1.0 - margin_rank
+    parts = [r for r in (entropy_rank, margin_uncertainty) if r is not None]
     return max(parts) if parts else None
 
 
@@ -138,6 +141,4 @@ def escalation_verdict(
         return False
     if u_now - u_base < policy.baseline_rise:
         return False
-    if acceptance_rank is not None and acceptance_rank > policy.acc_veto_rank:
-        return False
-    return True
+    return not (acceptance_rank is not None and acceptance_rank > policy.acc_veto_rank)

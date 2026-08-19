@@ -94,9 +94,7 @@ class EffortEscalationState:
         # Live per-request state.
         self.rung = _i32()
         self.cap = _i32()
-        self.clamp = torch.full(
-            (max_num_reqs,), -1, dtype=torch.int32, device=device
-        )
+        self.clamp = torch.full((max_num_reqs,), -1, dtype=torch.int32, device=device)
         self.frozen = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
         self.veto = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
         self.checked_primary = torch.zeros(
@@ -126,9 +124,7 @@ class EffortEscalationState:
             (max_num_reqs, 4), dtype=torch.float32, device=device
         )
         self.last_acc = _f32()
-        self.last_acc_valid = torch.zeros(
-            max_num_reqs, dtype=torch.bool, device=device
-        )
+        self.last_acc_valid = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
 
         self.policy: EffortPolicy | None = None
         self._entropy_edges: torch.Tensor | None = None
@@ -176,9 +172,7 @@ class EffortEscalationState:
         if not self._reset_reqs and not self._staged_dirty:
             return
         if self._reset_reqs:
-            idx = torch.tensor(
-                self._reset_reqs, dtype=torch.int64, device=self.device
-            )
+            idx = torch.tensor(self._reset_reqs, dtype=torch.int64, device=self.device)
             for tensor in (
                 self.rung,
                 self.rung_entry_think,
@@ -326,7 +320,9 @@ class EffortEscalationState:
         """Budget the cap actuator must use this step."""
         if not self.any_enabled:
             return staged_budget
-        cap = torch.where(self.clamp >= 0, torch.minimum(self.cap, self.clamp), self.cap)
+        cap = torch.where(
+            self.clamp >= 0, torch.minimum(self.cap, self.clamp), self.cap
+        )
         return torch.where(self.enabled, cap, staged_budget)
 
     def record_signals(
@@ -369,8 +365,13 @@ class EffortEscalationState:
         )
 
 
-def _ema(prev: torch.Tensor, sample: torch.Tensor, alpha: float, n: torch.Tensor,
-         have: torch.Tensor) -> torch.Tensor:
+def _ema(
+    prev: torch.Tensor,
+    sample: torch.Tensor,
+    alpha: float,
+    n: torch.Tensor,
+    have: torch.Tensor,
+) -> torch.Tensor:
     """Batched twin of the controller's `_ema` (n-sample catch-up weight)."""
     w = 1.0 - torch.pow(
         torch.tensor(1.0 - alpha, dtype=prev.dtype, device=prev.device),

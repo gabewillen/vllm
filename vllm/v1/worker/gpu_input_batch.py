@@ -121,7 +121,8 @@ class InputBatch:
         # Requests that opted into effort telemetry (entropy / margin).
         self.effort_telemetry_reqs: set[str] = set()
         natural_end = (
-            None if reasoning_config is None
+            None
+            if reasoning_config is None
             else reasoning_config.natural_reasoning_end_token_ids
         )
         self.effort_end_token_id: int | None = natural_end[0] if natural_end else None

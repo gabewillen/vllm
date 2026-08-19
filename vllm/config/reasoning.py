@@ -38,8 +38,11 @@ class DynamicEffortConfig:
     `vllm/v1/core/sched/effort_controller.py` for the policy.
     """
 
-    ladder: list[int] = field(default_factory=lambda: [1024, 4096, 16384, 65536])
-    """Thinking-token caps per rung, strictly increasing."""
+    ladder: list[int] = field(default_factory=lambda: [1024, 4096, 16384])
+    """Thinking-token caps per rung, strictly increasing. The pre-P6 default
+    had a fourth 65536 rung; across 1199 measured requests nothing ever passed
+    16384 think tokens and only 5 passed 4096 (docs/dynamic-reasoning-v3-
+    analysis.md §3), so the top rung was dead weight. It stays configurable."""
     rule: str = "rank"
     """`rank` (default, P6): ordinal percentile-rank rule fed by the
     scheduler's running quantile sketches. `score`: the pre-P6 weighted
@@ -55,7 +58,10 @@ class DynamicEffortConfig:
     """Fraction of the current cap for the second (last) escalation check."""
     p_uncertain: list[float] | None = None
     """Uncertainty **percentile rank** required to climb each rung, the only
-    tunable of the rank rule. Defaults to `[0.75, 0.85, 0.92, ...]`."""
+    tunable of the rank rule. Defaults to `[0.85, 0.92, 0.96, ...]`: the v3
+    measurement found entropy/margin near chance at separating requests that
+    needed more thinking (AUC 0.41-0.54 with length controlled), so the rule is
+    deliberately conservative and the p(end) grace window carries the load."""
     quantile_path: str | None = None
     """JSON file the per-model quantile sketches are persisted to and warmed
     from at startup. `None` keeps them in memory (cold after every restart)."""
@@ -348,9 +354,12 @@ class ReasoningConfig:
             natural_reasoning_end_str = reasoning_end_str
 
         force_end_str = self.force_end_str
-        if not force_end_str and self.dynamic_effort is not None:
-            if self.dynamic_effort.graceful_force_end:
-                force_end_str = self.dynamic_effort.force_end_str
+        if (
+            not force_end_str
+            and self.dynamic_effort is not None
+            and self.dynamic_effort.graceful_force_end
+        ):
+            force_end_str = self.dynamic_effort.force_end_str
         if not force_end_str:
             force_end_str = reasoning_end_str
         if natural_reasoning_end_str and not force_end_str.endswith(
