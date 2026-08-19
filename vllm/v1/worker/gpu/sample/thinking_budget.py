@@ -159,6 +159,27 @@ class ThinkingBudgetState:
     def requires_logits_processing(self, idx_mapping_np: np.ndarray) -> bool:
         return self.enabled and bool(np.any(self.use_thinking_budget[idx_mapping_np]))
 
+    def refresh_marker_cache(self, idx_mapping: torch.Tensor) -> None:
+        """Bring the cached reasoning start/end positions up to date.
+
+        The worker-side escalation rule derives each request's think-token
+        count from this cache, so it must run before the rule and before the
+        force kernel (which refreshes it again, idempotently).
+        """
+        if not self.enabled:
+            return
+        update_marker_cache(
+            idx_mapping,
+            self.thinking_token_budget.gpu,
+            self.req_states.all_token_ids.gpu,
+            self.req_states.total_len.gpu,
+            self.cached_last_start,
+            self.cached_last_end,
+            self.cached_scan_pos,
+            self.reasoning_start_token_ids,
+            self.natural_reasoning_end_token_ids,
+        )
+
     def apply(
         self,
         logits: torch.Tensor,
@@ -167,6 +188,7 @@ class ThinkingBudgetState:
         idx_mapping_np: np.ndarray,
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        budget_override: torch.Tensor | None = None,
     ) -> None:
         if not self.requires_logits_processing(idx_mapping_np):
             return
@@ -175,7 +197,9 @@ class ThinkingBudgetState:
             logits,
             idx_mapping,
             expanded_idx_mapping,
-            self.thinking_token_budget.gpu,
+            self.thinking_token_budget.gpu
+            if budget_override is None
+            else budget_override,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
             input_ids,
@@ -592,6 +616,51 @@ def apply_thinking_budget_torch(
             torch.tensor(rows, dtype=torch.int64, device=logits.device),
             torch.tensor(force_tokens, dtype=torch.int64, device=logits.device),
         ] = 1.0e9
+
+
+def update_marker_cache(
+    req_ids: torch.Tensor,
+    thinking_token_budget: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    total_len: torch.Tensor,
+    cached_last_start: torch.Tensor,
+    cached_last_end: torch.Tensor,
+    cached_scan_pos: torch.Tensor,
+    reasoning_start_token_ids: torch.Tensor,
+    natural_reasoning_end_token_ids: torch.Tensor,
+) -> None:
+    """Refresh the committed reasoning marker cache (Triton on CUDA)."""
+    if all_token_ids.device.type != "cuda":
+        update_marker_cache_torch(
+            req_ids,
+            thinking_token_budget,
+            all_token_ids,
+            total_len,
+            cached_last_start,
+            cached_last_end,
+            cached_scan_pos,
+            reasoning_start_token_ids,
+            natural_reasoning_end_token_ids,
+        )
+        return
+    start_len = reasoning_start_token_ids.shape[0]
+    natural_end_len = natural_reasoning_end_token_ids.shape[0]
+    _update_committed_marker_cache_kernel[(req_ids.shape[0],)](
+        req_ids,
+        thinking_token_budget,
+        all_token_ids,
+        all_token_ids.stride(0),
+        total_len,
+        cached_last_start,
+        cached_last_end,
+        cached_scan_pos,
+        reasoning_start_token_ids,
+        natural_reasoning_end_token_ids,
+        START_LEN=start_len,
+        NATURAL_END_LEN=natural_end_len,
+        MAX_LEN=max(start_len, natural_end_len),
+        BLOCK=_COLD_SCAN_BLOCK,
+    )
 
 
 def apply_thinking_budget(

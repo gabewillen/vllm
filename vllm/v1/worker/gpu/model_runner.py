@@ -1003,6 +1003,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state.apply_staged_writes()
         if self.sampler is not None:
             self.update_thinking_budgets(scheduler_output)
+            self.update_effort_policy(scheduler_output)
             self.sampler.apply_staged_writes()
 
     def update_thinking_budgets(self, scheduler_output: SchedulerOutput) -> None:
@@ -1014,6 +1015,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             updates, self.req_states.req_id_to_index
         )
         self.pending_thinking_budget_acks.update(acks)
+        self.sampler.effort_escalation.absorb_budget_updates(
+            updates, self.req_states.req_id_to_index
+        )
+
+    def update_effort_policy(self, scheduler_output: SchedulerOutput) -> None:
+        """Install this step's dynamic-effort policy and loop/churn vetoes."""
+        assert self.sampler is not None
+        escalation = self.sampler.effort_escalation
+        if not escalation.any_enabled and scheduler_output.effort_policy is None:
+            return
+        cfg = self.vllm_config.reasoning_config
+        dynamic = None if cfg is None else cfg.dynamic_effort
+        escalation.set_policy(
+            scheduler_output.effort_policy,
+            0.3 if dynamic is None else dynamic.ema_fast_alpha,
+            0.05 if dynamic is None else dynamic.ema_slow_alpha,
+        )
+        escalation.set_vetoes(
+            scheduler_output.effort_vetoes, self.req_states.req_id_to_index
+        )
 
     def take_thinking_budget_acks(self) -> dict[str, int] | None:
         if not self.pending_thinking_budget_acks:
