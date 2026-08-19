@@ -1,6 +1,7 @@
 # Dynamic reasoning effort — signals and implementation plan
 
-Status: P0-P2 shipped as patch 0009 and GPU-validated 2026-08-18 (§2c); P3+ open. Target: the two Qwen3.8-27B-FP8 profiles on the
+Status: P0-P2 shipped as patch 0009 and GPU-validated 2026-08-18 (§2c); P6 (§11)
+rewrites the controller and is CPU-tested, GPU validation pending; P3-P5 open. Target: the two Qwen3.8-27B-FP8 profiles on the
 4x L4 box (`serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml`, V2 runner + MTP;
 `serve-configs/qwen3_8_27b_fp8_max.yaml`, V1 runner + DBO). Ships as venv-local
 patches `0009+` (`serve-configs/patches/`), same contract as 0005-0008.
@@ -461,3 +462,129 @@ mid-generation restart machinery (restart is out of scope, §6 option C).
 - Upstreamability: P1 (V2 thinking budget) and the entropy/margin telemetry
   are model-agnostic and worth PRs; the controller is opinionated and can stay
   venv-local until it has numbers.
+
+## 11. P6 — self-normalizing, worker-side controller (2026-08-19)
+
+P6 answers four complaints about the P2 controller: it was hard-coded (a fixed
+`(mean, sd)` calibration table and a `theta` per model and quantization), its
+churn evidence was an English word list, it cut hard at the cap even when the
+model was 20 tokens from finishing, and its decisions arrived at the worker one
+or two steps late. The measurements behind the defaults are in
+[`dynamic-reasoning-v3-analysis.md`](dynamic-reasoning-v3-analysis.md); the
+short version is that `dynamic` already beat every fixed effort on VulcanBench
+v3 (19/23 vs 14/22, 14/21, 8/16, and **zero** tasks lost to a fixed effort), and
+that entropy/margin are at chance (AUC 0.41-0.54, length controlled) at telling
+which requests need more thinking. P6 is therefore deliberately conservative:
+it makes the rule auditable and self-calibrating, and puts the new signal -
+p(`</think>`) - where the old ones failed.
+
+### 11.1 What replaced what
+
+| P2 | P6 | why |
+|---|---|---|
+| `calibration: {entropy: (mean, sd), margin: (mean, sd)}` z-scores | running per-model **quantile sketches** (t-digest, `vllm/v1/core/sched/effort_quantiles.py`), features are **percentile ranks** | a z-score on a right-skewed distribution with a point mass at 0 is not an ordinal statement; a rank is, and it means the same thing on any model/quantization |
+| `theta` per rung + five weights (`w_h`, `w_m`, `w_t`, `w_a`) | one tunable per rung: `p_uncertain` | the rule is ordinal and small; a wrong setting shows up directly as an escalation *rate* |
+| absolute level only | rank **plus** a within-request baseline over the first `baseline_tokens` think tokens | escalation keys on relative change |
+| `backtrack_markers` density (`Wait`, `Hmm`, …) | **n-gram novelty rate** per window + the existing rolling-hash repeat count; markers keep weight 0 | language-agnostic and not model-specific |
+| hard cut at the cap | **p(`</think>`) grace window** | a model that is wrapping up gets `grace_tokens` more instead of being cut mid-sentence |
+| bare `</think>` forced | `force_end_str` (Qwen's own "Considering the limited time…" transition), detection stays on `reasoning_end_str` | in-distribution close (§5) |
+| scheduler decides, worker applies 1-2 steps later (`late`) | **worker evaluates the rule where the cap is applied** (V2); scheduler ships policy only | `late` is 0 by construction |
+| ladder `[1024, 4096, 16384, 65536]` | `[1024, 4096, 16384]` | 0 of 1 199 measured requests passed 16 384 think tokens |
+
+Nothing was deleted: `rule: "score"` selects the P2 weighted z-score,
+`evaluation: "scheduler"` selects the P2 decision site, and
+`backtrack_marker_weight > 0` re-arms the marker list. The V1 runner always
+uses the scheduler-side path.
+
+### 11.2 The rule
+
+Signals per request, from the committed rows of the previous step (frozen
+tuple, §6 item 1, now four wide): `entropy`, `margin`, `p_end`, `n_rows`.
+`p_end` is the softmax probability of the *first token of the reasoning end
+sequence*, taken from the same canonical-stage logits as the other two.
+
+```
+u        = max(rank(H_fast), 1 - rank(margin_ema))
+escalate = u >= p_uncertain[rung]                  # globally uncertain
+           and u - u_baseline >= baseline_rise     # and rising for this request
+           and not (H_fast < H_slow and p_end rising)   # not converging
+           and no loop / novelty churn
+           and rank(MTP acceptance) <= acc_veto_rank    # corroboration only
+```
+
+`rank()` is a lookup in a monotone quantile grid the scheduler resolves from
+its sketches once per step and ships in `SchedulerOutput.effort_policy`; the
+scheduler-side and worker-side sites use the same grid and the same predicate
+(`vllm/v1/sample/effort_policy.py`), so the decision does not depend on where
+it is made. **Cold sketches never escalate**: below `quantile_min_samples` the
+policy is `warm=False` and every request stays at rung 0.
+
+Grace: at the `final_check_at` point, a request that did not escalate and whose
+fast p(end) EMA leads the slow one gets `cap += grace_tokens`, once. Flat or
+zero p(end) at the final check leaves the rung rule to escalate or close.
+
+### 11.3 Architecture
+
+The §6 recommendation (scheduler decides) is now split:
+
+- **Worker** (`vllm/v1/worker/gpu/sample/effort_escalation.py`, V2 runner):
+  per-slot tensors for `rung`, `cap`, `H_ema`, `H_slow`, `margin_ema`,
+  `p_end_ema`, baseline, check-point flags, grace, escalations. The rule is
+  elementwise torch, evaluated in `Sampler.apply_sampling_params` immediately
+  before `ThinkingBudgetState` forces the end sequence, and it writes the cap
+  the actuator then uses. Deterministic in its inputs, so all TP ranks agree -
+  the same argument that already licenses the budget forcing. Plain torch, so
+  it runs on CPU as its own reference and is unit-tested there.
+- **Scheduler**: owns the sketches (fed by every dynamic request's step means,
+  persisted to `quantile_path`), resolves them into the step policy, keeps the
+  token-level loop/novelty detector and ships its vetoes and stall clamps, and
+  mirrors the worker's `rung`/`escalations` into the response `effort` object.
+  Requests with a client `deadline_ms` need a clock and stay
+  scheduler-evaluated.
+- Worker → scheduler: `ModelRunnerOutput.effort_reports[req_id] = (rung,
+  escalations, grace_tokens, late)` with `late = 0`.
+
+### 11.4 Calibration workflow
+
+`serve-configs/effort_calibrate.py`:
+
+```bash
+# warm from live traffic: drive the prompt set against a server whose unit has
+# VLLM_EFFORT_TELEMETRY=/data/effort-telemetry/latency.jsonl
+python serve-configs/effort_calibrate.py run \
+    --base-url http://localhost:8012/v1 --model Qwen3.8-27B
+
+# fold the sink into the file named by dynamic_effort.quantile_path
+python serve-configs/effort_calibrate.py build \
+    --telemetry /data/effort-telemetry/latency.jsonl \
+    --out /data/effort-sketches/qwen38.json --model Qwen3.8-27B
+
+# inspect
+python serve-configs/effort_calibrate.py show --sketch /data/effort-sketches/qwen38.json
+```
+
+`build` folds only in-think rows, weighted by `n_rows`, and mirrors the
+scheduler's per-request acceptance EMA, so a warmed file and a self-warmed
+server converge to the same distribution. The server rewrites the file every
+`quantile_flush_every` observations, so it also self-maintains.
+
+### 11.5 Defaults
+
+`ladder [1024, 4096, 16384]` · `p_uncertain [0.85, 0.92]` (padded `0.96`) ·
+`baseline_tokens 128` · `baseline_rise 0.10` · `grace_tokens 256` ·
+`acc_veto_rank 0.85` · `novelty_ngram 8` / `novelty_window 256` /
+`novelty_min_rate 0.2` · `backtrack_marker_weight 0.0` ·
+`quantile_min_samples 2048` · `rule "rank"` · `evaluation "worker"`.
+The reasoning for each is in
+[`dynamic-reasoning-v3-analysis.md`](dynamic-reasoning-v3-analysis.md) §5.
+
+### 11.6 Not yet measured
+
+p(`</think>`) itself (the column ships with P6, so it is absent from the v3
+telemetry), the novelty rate (needs a token stream the sink does not keep), and
+the on-GPU cost of the escalation tensors. GPU validation of P6 is the next
+window. One harness change is worth doing first: VulcanBench discards the
+response `effort` object (`TokenUsage` keeps only prompt/completion tokens), so
+rung, escalations and `late` are not recoverable from a sweep - persisting
+`LLMResponse.raw` would make every question in the analysis directly
+measurable.

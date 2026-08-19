@@ -61,11 +61,16 @@ attention-backend: TRITON_ATTN
 enable-dbo: true
 dbo-decode-token-threshold: 1000000
 reasoning-parser: qwen3
-# Dynamic reasoning effort (venv patch 0009, docs/dynamic-reasoning.claude.md);
-# same calibration as the latency profile. Takes effect on the next restart of
-# vllm-qwen38-throughput. The V1 runner applies budget updates through
-# ThinkingBudgetStateHolder; MTP is off here so the acceptance term is 0.
-reasoning-config: '{"dynamic_effort": {"calibration": {"entropy": [0.043, 0.046], "margin": [5.9, 4.5]}}}'
+# Dynamic reasoning effort (docs/dynamic-reasoning.claude.md, §11 = P6); same
+# quantile sketches as the latency profile, but this is the V1 runner, so the
+# rank rule is evaluated in the scheduler and budget updates go through
+# ThinkingBudgetStateHolder (a 1-2 step ack lag is possible here, unlike on V2).
+# MTP is off, so the acceptance corroboration rank is simply absent. Takes
+# effect on the next restart of vllm-qwen38-throughput.
+#
+# DEPRECATED, kept for rule="score" only: calibration {entropy: [0.043, 0.046],
+# margin: [5.9, 4.5]} and theta [0, 0.5, 1.0].
+reasoning-config: '{"dynamic_effort": {"quantile_path": "/data/effort-sketches/qwen38-throughput.json"}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
