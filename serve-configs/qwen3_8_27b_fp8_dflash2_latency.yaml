@@ -1,0 +1,126 @@
+# Qwen3.8-27B-FP8 on 4x L4 — DFlash2 speculative-decoding profile (TRIAL, not
+# production). Same target, TP, context, KV dtype, runner and effort config as
+# the MTP latency profile (qwen3_8_27b_fp8_mtp_latency.yaml); the only intended
+# difference is the drafter. Bench plan: docs/dflash2-bench-plan.md.
+#
+# NOTHING HERE HAS RUN ON A GPU YET. Everything below is derived from the
+# checkpoint, the vLLM source on this branch, and the upstream PR; the numbers
+# are estimates and the whole file is a hypothesis to be measured.
+#
+# Drafter: z-lab/Qwen3.8-27B-DFlash2 (mirror of incoai/Qwen3.8-27B-DFlash2),
+# bf16, 1.92 B params / 3.85 GB, already in /data/huggingface (the unit runs
+# HF_HUB_OFFLINE=1, so it must stay there). Block-diffusion drafter: one draft
+# forward proposes a whole block of 8 (anchor + 7 masked slots), keeps the
+# target head's top-16 per slot, and a Triton path-walk selector picks one
+# coherent path. Config: block_size 8, conv_kernel_size 2, conv_group_size 16,
+# selector_rank 256, selector_top_k 16, target_layer_ids [5,19,33,47,61] of 64,
+# hidden 5120, vocab 248320 — hidden size, vocab and layer count all match this
+# target. 5 draft layers, all sliding_attention (window 2048), 32 q / 8 kv
+# heads, head_dim 128, is_causal false.
+#
+# Engine support: vllm-project/vllm PR #52816 ("[Spec Decode] DFlash2: local
+# convolution + candidate selector"), OPEN as of 2026-08-19, cherry-picked onto
+# this branch. Python + Triton only, so the pinned precompiled wheel still
+# applies. DFlash1 support was already in the base.
+#
+# num_speculative_tokens 7 is not free choice: DFlash uses a fixed 1 + K query
+# layout, and the checkpoint's block_size is 8, so K = 7.
+#
+# Deliberate differences from the MTP latency yaml, each one required:
+#
+#  1. NO `additional-config lm_head_dtype` (patch 0008). The DFlash2 checkpoint
+#     ships no lm_head and no embed_tokens, so vLLM shares the TARGET's
+#     lm_head with the drafter (dflash/utils.py). Patch 0008 replaces
+#     language_model.lm_head with QuantizedDraftLMHead, and DFlash2's
+#     compute_candidates raises "DFlash2 requires an unquantized target LM head
+#     for candidate TopK" when lm_head.quant_method is not
+#     UnquantizedEmbeddingMethod. The FP8 checkpoint keeps lm_head and
+#     embed_tokens in bf16 (lm_head is in modules_to_not_convert), so with
+#     patch 0008 off the shared head is unquantized and the selector works.
+#     Cost vs the MTP profile: ~1 ms per verify step that patch 0008 saved.
+#
+#  2. NO `draft_lm_head_dtype` (patch 0005). dflash/utils.py never calls
+#     maybe_quantize_shared_lm_head, so it would be silently ignored, and
+#     quantizing the shared head would break (1) anyway.
+#
+#  3. NO `adaptive_draft_length` (patch 0005). DFlash drafts the whole block in
+#     one pass and ignores the per-step count (the V2 runner then truncates the
+#     verify to the requested columns). So adaptive length can only shorten the
+#     TARGET's verify, never the draft, and its EMA/margin were tuned against
+#     MTP's sequential per-step cost. Flat K=7 is the arm the upstream numbers
+#     describe. Optional arm in the bench plan.
+#
+#  4. NO `num_speculative_tokens_per_batch_size`. Same reason: the drafter runs
+#     a full block regardless, so ramping K down at high batch saves only
+#     verify tokens while still paying the whole draft forward. Whether that
+#     still pays at 32+ concurrent is exactly what the bench measures.
+#
+#  5. NO `kv-transfer-config` (tiered KV offload). Patch 0003 detects the draft
+#     tower by an "mtp." layer prefix; the DFlash draft tower has no such
+#     prefix and vLLM only sets KVCacheGroupSpec.is_eagle_group for DeepSeek-V4
+#     (kv_cache_utils._annotate_eagle_groups_deepseek_v4), so the connector
+#     falls back to marking EVERY KV group EAGLE-volatile — the exact state
+#     patch 0003 exists to avoid (tiered restore never converges; 32k resume
+#     20 s instead of 2-3 s, and is_eagle_group also changes decode-time
+#     scheduling, which would confound the bench). Run the MTP and no-spec
+#     baseline arms with offload disabled too (docs/dflash2-bench-plan.md).
+#     A production DFlash2 profile needs patch 0003 extended to the DFlash
+#     draft group first.
+#
+# Memory (estimated, per rank at TP4, MUST be checked against the startup log):
+#   drafter weights ~1.45 GiB — attention + MLP (1.60 B params) shard across
+#     TP4 (~0.80 GiB), but fc [5120 x 25600], the per-layer conv
+#     kernel_projections and the selector's two [248320 x 256] codebooks are
+#     ReplicatedLinear / plain Parameters (~0.33 B params, ~0.65 GiB on EVERY
+#     rank).
+#   DFlash2Speculator.draft_logits is allocated unconditionally as
+#     fp32 [max_num_seqs, K, vocab] = 96 x 7 x 248320 x 4 B = ~0.67 GiB/rank.
+#     Halving max-num-seqs halves it.
+#   plus the drafter's own 5-layer sliding-window KV group.
+# So ~2.1 GiB/rank more non-KV memory than the MTP profile, which is why
+# gpu-memory-utilization drops 0.92 -> 0.88 (DSpark, ~1.1 GiB/rank of drafter
+# weights, needed 0.88 and OOMed at 0.92 under a 128-request burst). Read the
+# "GPU KV cache size" line at startup and compare with the MTP profile's 1.39M
+# tokens before trusting any throughput number: DSpark's real cost was the KV
+# pool (1.39M -> 652k tokens), not the tok/s.
+#
+# TRITON_ATTN everywhere, target and drafter. Two independent reasons: the
+# NCCL_P2P_LEVEL=SYS + FlashInfer illegal-memory-access race on the spec-decode
+# verify path (never mix P2P with FLASHINFER on this box), and the drafter's
+# is_causal=false, which needs a backend with supports_non_causal (TRITON_ATTN
+# has it, and supports_sliding_window for the window-2048 draft layers).
+#
+# The V2 model runner is mandatory here, not a choice: VllmConfig
+# ._is_dflash2_draft() forces use_v2_model_runner, because the V1 DFlashProposer
+# has no candidate selector and would silently draft as DFlash1. Keep
+# VLLM_USE_V2_MODEL_RUNNER=1 in the launch environment anyway.
+#
+# Trial serve (experiment venv and worktree, NOT the prod unit):
+#   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 PYTHONHASHSEED=8012 \
+#     PYTHONPATH=/shared/vllm/serve-configs/middleware \
+#     VLLM_USE_V2_MODEL_RUNNER=1 NCCL_P2P_LEVEL=SYS \
+#     /shared/vllm/.venv-dflash2/bin/vllm serve \
+#     --config /shared/vllm-dflash2/serve-configs/qwen3_8_27b_fp8_dflash2_latency.yaml
+model: Qwen/Qwen3.8-27B-FP8
+tensor-parallel-size: 4
+max-model-len: 262144
+kv-cache-dtype: fp8
+gpu-memory-utilization: 0.88
+max-num-seqs: 96
+max-num-batched-tokens: 8192
+compilation-config: '{"max_cudagraph_capture_size": 96}'
+speculative-config: '{"method": "dflash", "model": "z-lab/Qwen3.8-27B-DFlash2", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN"}'
+reasoning-parser: qwen3
+# Dynamic reasoning effort (patches 0009-0011) carried over unchanged so the
+# two profiles differ only in the drafter. It is opt-in per request, so the
+# throughput arms never touch it. Note for anyone who does use it here: the
+# controller's acceptance term is method-agnostic
+# (num_accepted_tokens / num_draft_tokens), but acceptance_edges were
+# calibrated against MTP acceptance, and DFlash2 accepts more per pass.
+reasoning-config: '{"dynamic_effort": {"calibration": {"entropy": [0.043, 0.046], "margin": [5.9, 4.5]}}}'
+enable-auto-tool-choice: true
+tool-call-parser: qwen3_coder
+served-model-name: Qwen3.8-27B
+attention-backend: TRITON_ATTN
+port: 8013
+middleware: ["vllm_keepalive.KeepAliveMiddleware"]
