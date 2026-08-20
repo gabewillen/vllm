@@ -93,7 +93,12 @@
 # counters vLLM already exports.
 # Measurements and rejected alternatives: goal run
 # goal/sessions/23cb78c0-b3a1-4ea3-89e2-332443ff1f8f/runs/20260818T055754Z-8dd3de85.
-model: Qwen/Qwen3.8-27B-FP8
+# 2026-08-20: INT4 swap (RedHatAI GPTQ/AWQ W4A16 g128, Marlin on SM89). Arm-benched
+# like-for-like vs the FP8 hardware-limit numbers: single-stream reason/prose/
+# write/edit 66/65/105/160 -> ~100/88/147/207 tok/s; KV pool 1.39M -> 1.72M (0.92
+# util); MTP drafter + int4 draft head + fp8 target lm_head unchanged (tok/pass
+# 7.8 on edit); VulcanBench v3 greedy dynamic 20/23 vs FP8 19/23 @ ~equal tokens.
+model: RedHatAI/Qwen3.8-27B-INT4
 tensor-parallel-size: 4
 max-model-len: 262144
 kv-cache-dtype: fp8

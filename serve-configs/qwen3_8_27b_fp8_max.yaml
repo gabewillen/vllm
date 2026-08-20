@@ -40,7 +40,10 @@
 #   -> seqs96 474.6 (kept) -> batch16k 474.1 (reverted; plateau, loop stopped).
 # Nightly pinned because the MTP+GDN spec-decode fix (#51812) and GDN
 # grid-overflow guard (#52030) are not in 0.27.1 (both verified in wheel).
-model: Qwen/Qwen3.8-27B-FP8
+# 2026-08-20: INT4 swap (RedHatAI W4A16 g128, Marlin). c32/c64/c128 output tok/s
+# 615/912/1170 -> 676/1100/1298 on the same harness; KV pool 1.46M -> 1.78M.
+# seqs 192 re-tested and still loses (GDN state keeps the knee at 128).
+model: RedHatAI/Qwen3.8-27B-INT4
 # TP4 (not TP2x2 replicas): per-rank weights 7.4 GiB and halved GDN state
 # unlock 96-way decode batching, which dominates PCIe all-reduce cost on
 # this dense hybrid (48 GDN linear + 16 full-attn layers).
