@@ -595,6 +595,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
     _dynamic_effort: dict[str, Any] | None = PrivateAttr(default=None)
     """Validated dynamic-effort overrides; set only by `apply_dynamic_effort`."""
+    _effort_request: dict[str, Any] | None = PrivateAttr(default=None)
+    """`{"requested": <as sent, None if omitted>, "effective": <served>}` for
+    the effort telemetry finish record."""
 
     def build_chat_params(
         self,
@@ -741,6 +744,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self._dynamic_effort is not None:
             extra_args["dynamic_effort"] = self._dynamic_effort
             extra_args.setdefault("effort_telemetry", True)
+        if self._effort_request is not None:
+            extra_args["effort_request"] = self._effort_request
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

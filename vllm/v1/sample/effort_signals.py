@@ -346,6 +346,14 @@ class EffortTelemetrySink:
         elif len(self._buffer) >= self.FLUSH_EVERY:
             self.flush()
 
+    def record_finish(self, req_id: str, payload: dict[str, Any]) -> None:
+        """One `event: finish` line per request: what the client asked for,
+        what was served, and the controller's closing report."""
+        self._buffer.append(
+            json.dumps({"req_id": req_id, "event": "finish", **payload})
+        )
+        self.flush()
+
     def forget(self, req_id: str) -> None:
         self._steps.pop(req_id, None)
         self._trackers.pop(req_id, None)

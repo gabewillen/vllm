@@ -1,0 +1,105 @@
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 4837783b34..7b69e771e5 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -595,6 +595,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
+     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
+     _dynamic_effort: dict[str, Any] | None = PrivateAttr(default=None)
+     """Validated dynamic-effort overrides; set only by `apply_dynamic_effort`."""
++    _effort_request: dict[str, Any] | None = PrivateAttr(default=None)
++    """`{"requested": <as sent, None if omitted>, "effective": <served>}` for
++    the effort telemetry finish record."""
+ 
+     def build_chat_params(
+         self,
+@@ -741,6 +744,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         if self._dynamic_effort is not None:
+             extra_args["dynamic_effort"] = self._dynamic_effort
+             extra_args.setdefault("effort_telemetry", True)
++        if self._effort_request is not None:
++            extra_args["effort_request"] = self._effort_request
+         return SamplingParams.from_optional(
+             n=self.n,
+             presence_penalty=self.presence_penalty,
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 896b250643..bf043ae83d 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -249,11 +249,16 @@ class OpenAIServingChat(GenerateBaseServing):
+         # Streaming response
+         tokenizer = self.renderer.tokenizer
+         assert tokenizer is not None
++        requested_effort = request.reasoning_effort
+         if request.reasoning_effort is None:
+             effort_cfg = self._dynamic_effort_config()
+             default_effort = getattr(effort_cfg, "default_effort", None)
+             if default_effort:
+                 request.reasoning_effort = default_effort
++        request._effort_request = {
++            "requested": requested_effort,
++            "effective": request.reasoning_effort,
++        }
+         if request.reasoning_effort == "dynamic":
+             try:
+                 apply_dynamic_effort(request, self._dynamic_effort_config())
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 72edac34b0..407d0ee164 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2089,6 +2089,10 @@ class Scheduler(SchedulerInterface):
+                 if finished:
+                     if effort_state is not None:
+                         effort_report = finish_effort(effort_state)
++                    if self.effort_sink is not None:
++                        self._record_effort_finish(
++                            request, finish_reason, effort_report
++                        )
+                     kv_transfer_params, ec_transfer_params = self._free_request(request)
+ 
+                 if status_before_stop == RequestStatus.RUNNING:
+@@ -2599,6 +2603,26 @@ class Scheduler(SchedulerInterface):
+             if pending is not None and pending[0] <= revision:
+                 del self._effort_pending[req_id]
+ 
++    def _record_effort_finish(
++        self,
++        request: Request,
++        finish_reason: Any,
++        effort_report: dict[str, int] | None,
++    ) -> None:
++        assert self.effort_sink is not None
++        params = request.sampling_params
++        asked = (params.extra_args or {}).get("effort_request") if params else None
++        payload: dict[str, Any] = {
++            "requested_effort": (asked or {}).get("requested"),
++            "effective_effort": (asked or {}).get("effective"),
++            "num_output_tokens": len(request.output_token_ids),
++            "num_prompt_tokens": request.num_prompt_tokens,
++            "finish_reason": str(finish_reason) if finish_reason is not None else None,
++        }
++        if effort_report is not None:
++            payload["dynamic"] = effort_report
++        self.effort_sink.record_finish(request.request_id, payload)
++
+     def _step_effort(
+         self,
+         request: Request,
+diff --git a/vllm/v1/sample/effort_signals.py b/vllm/v1/sample/effort_signals.py
+index ac8e8d19c8..9220bbf54b 100644
+--- a/vllm/v1/sample/effort_signals.py
++++ b/vllm/v1/sample/effort_signals.py
+@@ -346,6 +346,14 @@ class EffortTelemetrySink:
+         elif len(self._buffer) >= self.FLUSH_EVERY:
+             self.flush()
+ 
++    def record_finish(self, req_id: str, payload: dict[str, Any]) -> None:
++        """One `event: finish` line per request: what the client asked for,
++        what was served, and the controller's closing report."""
++        self._buffer.append(
++            json.dumps({"req_id": req_id, "event": "finish", **payload})
++        )
++        self.flush()
++
+     def forget(self, req_id: str) -> None:
+         self._steps.pop(req_id, None)
+         self._trackers.pop(req_id, None)

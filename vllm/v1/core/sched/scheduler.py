@@ -2089,6 +2089,10 @@ class Scheduler(SchedulerInterface):
                 if finished:
                     if effort_state is not None:
                         effort_report = finish_effort(effort_state)
+                    if self.effort_sink is not None:
+                        self._record_effort_finish(
+                            request, finish_reason, effort_report
+                        )
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
@@ -2598,6 +2602,26 @@ class Scheduler(SchedulerInterface):
             pending = self._effort_pending.get(req_id)
             if pending is not None and pending[0] <= revision:
                 del self._effort_pending[req_id]
+
+    def _record_effort_finish(
+        self,
+        request: Request,
+        finish_reason: Any,
+        effort_report: dict[str, int] | None,
+    ) -> None:
+        assert self.effort_sink is not None
+        params = request.sampling_params
+        asked = (params.extra_args or {}).get("effort_request") if params else None
+        payload: dict[str, Any] = {
+            "requested_effort": (asked or {}).get("requested"),
+            "effective_effort": (asked or {}).get("effective"),
+            "num_output_tokens": len(request.output_token_ids),
+            "num_prompt_tokens": request.num_prompt_tokens,
+            "finish_reason": str(finish_reason) if finish_reason is not None else None,
+        }
+        if effort_report is not None:
+            payload["dynamic"] = effort_report
+        self.effort_sink.record_finish(request.request_id, payload)
 
     def _step_effort(
         self,
