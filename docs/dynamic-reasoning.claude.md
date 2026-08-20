@@ -829,6 +829,307 @@ requests with forced closes at each rung. Item 1 subsumes it and is strictly
 cheaper — a forced close at rung *r* is a prefix of the unbounded trace, so the
 label comes out of the recording instead of a fresh generation.
 
+## 13. P8 — hidden-state effort v3 (the plan; §13.10 records what shipped)
+
+Decision (user, 2026-08-19): the **label-free hidden-state signal is the design
+for dynamic-effort v3**. Measurements, code and raw results:
+[`effort-hidden-probe.md`](effort-hidden-probe.md) and
+`/shared/vllm/work/router-proto/hidden/`. This section is the implementation
+plan; nothing here is built yet.
+
+### 13.0 Why this is inside §11.0, not an exception to it
+
+§12.4 item 9 parked "encoder / hidden-state probe" last, because "it needs
+training data, it is per-model by construction". The first half turned out to be
+wrong. The shipping signal is **retrieval, not a fitted head**: a memory of
+pooled prefill states the server itself observed, keyed by cosine, valued by the
+reasoning length that request actually spent. Nothing is fitted; the only
+constants are percentile ranks of running digests — the same self-calibration
+§11.0 already blesses for entropy and margin. The second half is true and
+unchanged: it is per-model, exactly as the quantile sketches are.
+
+Checked against §11.0's list: no lexical markers, no prompt-structure heuristics
+(and the measurement shows the signal is *not* a prompt-length proxy — rank
+partial Spearman 0.572 with length removed), no text classifier over tool
+output, no hand-fitted numbers. The one new thing §11.0 did not anticipate is
+that the model's own **hidden state** counts as "the model's own output" — it is
+the vector `lm_head` consumes, defined identically for any transformer,
+tokenizer, language and quantization, and it is free because the prefill happens
+anyway.
+
+### 13.1 What the measurement says (headline)
+
+On the 689 natural closes of the shared dataset, leave-one-task-out, out of fold:
+
+| | AUC long-think | within-run | Spearman vs think tokens |
+|---|---:|---:|---:|
+| kNN-16 over `last_final`, label-free | **0.850** [0.818, 0.877] | **0.762** | **0.685** |
+| trained probe (upper bound, not shipped) | 0.866 | 0.778 | 0.657 |
+| prompt length (the free control) | 0.729 | 0.581 | 0.494 |
+| entropy / margin (what §12.3 measured) | ≈ chance | ≈ chance | ≈ chance |
+
+**Pooling to ship: the last prompt token's final hidden state.** Mean pooling is
+far worse (0.622 vs 0.839 at matched k = 8, and 0.665 vs 0.789 on
+TwinRouterBench); the layer-32 variant could not be measured on this build
+(§1 of the probe doc) and is not required by the plan.
+
+External check, same capture path, no training: on **TwinRouterBench**'s 336
+execution-verified agentic-coding steps (Apache-2.0, four tiers) the same
+label-free retrieval separates the `high` tier at **AUC 0.789** [0.742, 0.836]
+against 0.584 for prompt length and 0.492 for step index; a memory built from
+*our* loop and transferred to theirs still scores 0.620 [0.559, 0.678], which is
+the argument for filling the memory **online from served traffic** rather than
+shipping a fixed one.
+
+**Signals to ship: novelty + kNN over the online memory. Not within-session
+surprisal** — as cortext defines it, it is a mild *negative* signal here
+(AUC 0.284, i.e. 0.716 inverted) and inverting it just recovers a position
+proxy. It stays out of the controller; the memory carries the load.
+
+### 13.2 Files
+
+New:
+
+| file | contents |
+|---|---|
+| `vllm/v1/worker/gpu/effort_hidden.py` | pooling of the prompt rows (the prototype is `work/router-proto/hidden/hidden_capture.py`; drop the JSONL sink, keep `observe`) |
+| `vllm/v1/core/sched/effort_memory.py` | the online memory: ring buffer, cosine kNN, novelty, neighbour spread, persistence |
+| `serve-configs/tests/test_effort_memory.py`, `test_effort_two_phase.py` | see §13.7 |
+
+Changed:
+
+| file | change |
+|---|---|
+| `vllm/config/reasoning.py` | `HiddenEffortConfig` nested in `DynamicEffortConfig` (`enabled`, `memory_size`, `min_entries`, `k`, `temperature`, `q_mid`, `q_high`, `novelty_gate_q`, `spread_gate_q`, `memory_path`, `flush_every`) |
+| `vllm/entrypoints/openai/chat_completion/dynamic_effort.py` | stop committing to one sentence: render **one tail token-id list per rung** (server constants) and hand them to the request instead of mutating `messages` |
+| `vllm/v1/request.py` | `RequestStatus.WAITING_FOR_EFFORT_DECISION` (the `WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR` / `WAITING_FOR_REMOTE_KVS` pattern already exists); `Request.effort_tail_variants`, `Request.effort_body_len` |
+| `vllm/v1/outputs.py` | `ModelRunnerOutput.effort_prefill_states: dict[str, torch.Tensor] \| None`, next to the existing `effort_signals` (:360) |
+| `vllm/v1/worker/gpu/model_runner.py` | pool at the existing call site in `sample_tokens` (after `pcp.maybe_restore_pcp_for_sampling`, before `self.sample`) and put the fp16 vector in the output for requests that are awaiting a decision |
+| `vllm/v1/core/sched/scheduler.py` | schedule the body; on the output carrying the vector, decide, append the chosen tail, requeue; insert into the memory at finish |
+| `vllm/v1/core/sched/effort_controller.py` | `EffortState.start_rung`; `decide_start_rung(estimate, novelty, spread, sketches, cfg)` |
+| `vllm/v1/worker/gpu_model_runner.py` (V1) | not touched — V1 keeps today's behaviour; the hidden path is V2-only, like the rest of the latency profile |
+
+### 13.3 The two-phase prefill decision point
+
+Today `apply_dynamic_effort` appends `cfg.low_effort_sentence` to the last user
+turn in the frontend, before tokenization, and the rung is fixed from then on.
+The prompt already has the right seam:
+
+```
+[ body ................................. ][ tail ]
+system + every turn + last user content    effort sentence + <|im_start|>assistant\n<think>\n
+identical for every rung                   ~20-40 tokens, one variant per rung
+```
+
+1. **Frontend.** `apply_dynamic_effort` sets `request.reasoning_effort =
+   cfg.render_effort`, renders the tail once per rung, submits with
+   `prompt_token_ids = body` and stashes the variants on the request. Everything
+   else it does today (ladder/theta validation, `thinking_token_budget =
+   ladder[0]`, `extra_args["dynamic_effort"]`) is unchanged.
+2. **Scheduler.** The request enters `WAITING_FOR_EFFORT_DECISION`. It is
+   scheduled exactly like a normal prefill; when its body finishes it produces no
+   sampled token (`num_tokens == body_len`), so nothing is emitted to the client.
+3. **Runner.** At the existing `sample_tokens` call site the pooled
+   `last_final` row is already in hand; for requests in that state it is copied
+   to host (`[5120]` fp16, 10 KB) and returned in
+   `ModelRunnerOutput.effort_prefill_states`. Take the row from the request's
+   **logit index** (`input_batch.logits_indices[cu_num_logits_np[i]]`), not from
+   the prefill accounting: a 100 %-prefix-cached body schedules no prompt tokens
+   and the prototype silently produced no record for 11 such requests.
+4. **Scheduler, next step.** `effort_memory.query(vec)` returns
+   `(estimate, novelty, spread, n_entries)`; `decide_start_rung` maps it through
+   the digests (§13.5); the chosen tail token ids are appended to the request,
+   `num_tokens` is bumped, `start_rung` is recorded on `EffortState`, the
+   thinking budget is set to `ladder[start_rung]` through the **existing**
+   versioned `thinking_budget_updates` path, and the request moves to `WAITING`.
+5. The tail prefills in the next step and generation starts.
+
+**Cost.** One extra engine step per dynamic request — order 10–15 ms at TP4 on
+the L4 box, a few tenths of a percent of TTFT on a median 13 k-token agent
+prompt, a few percent on a short one. The probe itself is a `[M,5120]@[5120]`
+matvec: 21 MFLOP at `M = 4096`, i.e. free. Prefix-cache behaviour improves
+slightly: the body is byte-identical across rungs, so one body per conversation
+is cached instead of one per (conversation, rung).
+
+**Failure modes and fallbacks.** Cold memory (`n_entries < min_entries`) → skip
+the split entirely, render rung 0 in the frontend as today. Missing vector
+(preemption, PP, V1 runner, a non-last PP rank) → same fallback. The decision
+never blocks a step: if it is not ready, the request waits one more step, which
+is the same cost as the split itself.
+
+### 13.4 The online memory
+
+`vllm/v1/core/sched/effort_memory.py`, scheduler-side, one per engine core.
+
+Per entry (**inserted at request finish, from the engine's own observation** —
+no labels, no offline corpus):
+
+| field | bytes | note |
+|---|---:|---|
+| pooled `last_final`, fp16, L2-normalised | 10 240 | the key |
+| `reasoning_tokens` | 4 | the value; `log1p` at query time |
+| `close_kind` (natural / soft / forced) | 1 | **only `natural` entries contribute a value** — soft and forced closes are right-censored, so they are inserted as keys with `value = None` and are counted for novelty but skipped by the kNN average |
+| `effort_used` (start rung, final rung, escalation count) | 3 | lets the memory answer "where did the ladder end up", and lets a rung change invalidate stale values |
+| session id, monotonic insert index | 16 | same-session exclusion and eviction |
+| **total** | **≈10.3 KB** | |
+
+- **Size:** `memory_size = 4096` → **≈42 MB** of host RAM. Measured: 512 entries
+  already reach AUC 0.842 vs 0.843 at 2048 and 0.808 at 128, so 4096 is
+  comfortable headroom, not a requirement.
+- **Eviction:** FIFO ring, with at most `ceil(memory_size / 64)` entries per
+  session id, so one long conversation cannot evict the memory. (Pure FIFO is
+  adequate at 4096; the per-session cap is cheap insurance.)
+- **Query:** cosine against the ring (one fp16 GEMV), top-`k = 16`,
+  `softmax(cos / 0.05)` weights over `log1p(reasoning_tokens)` of the entries
+  that have a value; `novelty = (1 - max cos)/2`; `spread` = the weighted stdev
+  of those neighbour values.
+- **Persistence:** written next to `quantile_path` with the same atomic-replace
+  flush every `flush_every` inserts, so a restart warms instead of running
+  blind. Version the file; drop it on a model, `hidden_size` or ladder change.
+- **Cardinality:** the memory itself emits no per-entry telemetry. Metrics are
+  aggregate only — `effort_memory_entries`, `effort_memory_hit_rate`,
+  `effort_start_rung_total{rung}`, `effort_decision_skipped_total{reason}` —
+  four bounded label sets, no request or session ids.
+
+### 13.5 The mapping is asymmetric
+
+TwinRouterBench's finding, adopted: **one under-routed step can kill a
+trajectory; over-routing only costs tokens.** So the map raises freely and lowers
+only on confidence. All cuts are percentile ranks of running digests, so nothing
+is a per-model constant:
+
+```
+q = rank(estimate, digest)
+q >= q_high (0.60)                                        -> rung 2
+q >= q_mid  (0.35)                                        -> rung 1
+q <  q_mid AND novelty <= rank 0.6 AND spread <= rank 0.6 -> rung 0
+otherwise                                                 -> rung 1     # unsure -> safe
+```
+
+Two gates guard the *downward* band only: `novelty` (the memory has nothing
+similar, so it cannot be trusted to say "easy") and `spread` (the neighbours
+disagree). Measured on the 689 natural closes
+(`work/router-proto/hidden/results_dynamicv2/policy.json`):
+
+| starting policy | rung mix (low/med/high) | starts under-provisioned | of those, at rung 0 | p90 think tokens in the low band | mean granted budget |
+|---|---|---:|---:|---:|---:|
+| today: always rung 0 | 689 / 0 / 0 | **12.3 %** (85) | 85 | **1 471** | 1 024 |
+| symmetric tertiles | 230 / 229 / 230 | 0.44 % (3) | 0 | 61 | 7 173 |
+| **asymmetric, gated** (0.35 / 0.60) | 194 / 219 / 276 | **0.44 %** (3) | **0** | **59** | 8 153 |
+| asymmetric, ungated (0.40 / 0.65) | 276 / 172 / 241 | 0.44 % (3) | **1** | 66 | 7 164 |
+
+Read this carefully. "Starts under-provisioned" means the request would have had
+to escalate to finish — today that is 12.3 % of natural closes, and the 90th
+percentile of the requests today's policy sends to the 1 024 cap actually wants
+1 471 tokens. The router cuts that to 0.44 %, and the requests it does send to
+rung 0 want a p90 of **59** tokens. The gate's own contribution is small but
+real and in the predicted direction: at the most aggressive downward cut it is
+the difference between 0 and 1 under-routed rung-0 starts. On 689 requests with
+3 total under-routes that is not a significant difference — the gate is
+insurance, priced at ~3–6 % of mean granted budget, and should ship on that
+argument, not on this table.
+
+**What this table cannot say:** the token *cost* of the higher starting rungs. A
+bigger cap is a ceiling, not an instruction; the thing that actually makes the
+model think less is the rung-0 sentence. Only a rerun measures that — §13.8.
+
+### 13.6 What is removed and what is kept
+
+**Removed** (all pre-P6/P7 machinery that the v3 measurement already found
+inert, plus what the prefill decision makes redundant):
+
+- `rule = "score"` and its whole surface: `theta`, `w_h`, `w_m`, `w_t`, `w_a`,
+  the fixed `calibration` z-table. Already deprecated in §11; P8 deletes them
+  (pre-1.0, venv-local, no deployed consumer — the hard-cutover rule applies).
+- `backtrack_marker_weight` and `QWEN`-specific marker plumbing. §11.0 already
+  reduced it to a weight-0 legacy option; delete it.
+- `p_uncertain`, `baseline_rise`, `baseline_tokens` and the entropy/margin rank
+  features, **and** the `uncertainty_min_auc` gate that exists only to hold them
+  off. §12.3 measured them at chance on this model and the gate has kept them
+  inert ever since; the hidden-state signal is what they were a proxy for.
+- `grace_tokens` (already subsumed by the soft-limit ramp).
+
+**Kept:**
+
+- The **ladder** and the mid-generation escalation. The prefill decision sets the
+  *starting* rung; the live rule still climbs. This is what makes a wrong
+  prefill decision recoverable, and it is why the asymmetric map can afford a
+  rung-0 band at all.
+- The **soft-limit close** (§12.1) and `graceful_force_end` / `force_end_str`.
+- The **loop-stall guard** — `loop_ngram`, `loop_repeats`, `loop_window`,
+  `hash_window`, and the n-gram novelty churn detector. Explicitly retained:
+  it is the only thing that stops a degenerate loop, it is language-agnostic, and
+  it is orthogonal to how much thinking was budgeted.
+- `check_at` / `final_check_at`, `dwell_tokens`, `cooldown_tokens`,
+  `min_samples`, the p(end) convergence test and the MTP acceptance veto.
+- **`close_kind` telemetry — kept and promoted.** It stops being only a metric:
+  it is the field that decides whether a finished request contributes a *value*
+  to the memory (§13.4). Same for `reasoning_tokens` and the rung/escalation
+  counters. The per-token entropy/margin JSONL sink stays available behind
+  `VLLM_EFFORT_TELEMETRY` for calibration work but is no longer on any decision
+  path.
+- The **`X-Request-Id` join**: every effort telemetry record must carry the
+  client-visible request id. The v3 sink did not, which is why the offline
+  analysis could join only 244 of 791 requests; the capture prototype fixed it
+  for free.
+
+### 13.7 Tests
+
+| test | what it pins |
+|---|---|
+| `test_effort_memory.py::test_ring_evicts_fifo_and_caps_one_session` | eviction, per-session cap, `memory_size` respected |
+| `…::test_censored_closes_are_keys_not_values` | forced/soft closes count for novelty, never for the kNN average |
+| `…::test_query_matches_numpy_reference` | the GEMV kNN against a plain numpy implementation, fp16 tolerance |
+| `…::test_cold_memory_returns_none` | `< min_entries` → `None`, and the caller falls back to today's path |
+| `…::test_persistence_roundtrip_and_version_mismatch` | atomic flush, warm start, drop on model/dim/ladder change |
+| `test_effort_two_phase.py::test_body_prefill_emits_no_token` | a request in `WAITING_FOR_EFFORT_DECISION` produces no client-visible token |
+| `…::test_tail_appended_and_budget_set` | chosen tail ids land on the request; `thinking_budget_updates` carries `ladder[start_rung]` with the right version |
+| `…::test_decision_unavailable_falls_back_to_rung0` | cold memory / missing vector / V1 runner → today's behaviour, byte-identical prompt |
+| `…::test_fully_cached_body_still_yields_a_vector` | the 100 %-prefix-cache-hit case the prototype missed |
+| `…::test_asymmetric_map_never_lowers_without_both_gates` | the downward band is unreachable when novelty or spread is above its rank |
+| `…::test_prefix_cache_body_shared_across_rungs` | two requests with the same body and different rungs share body blocks |
+| `serve-configs/tests/test_effort_hidden_pooling.py` | pooling arithmetic over chunked prefill: sum over chunks == sum over the whole prompt; last row is the last prompt token |
+| GPU: `serve-configs/bench_single_stream.py` before/after | the split costs ≤ 1 engine step of TTFT and no decode regression |
+| GPU: spec-decode parity | MTP draft/verify path unchanged — the capture must not alter `aux_hidden_states` reaching the speculator |
+
+Regression guard from this measurement: `test_effort_hidden_pooling.py` must
+also assert that the runner tolerates a model that ignores an auxiliary-output
+request (the layer-32 finding in the probe doc) rather than asserting on the
+output shape.
+
+### 13.8 Rollout
+
+1. **Shadow first.** `hidden_effort.enabled = true`, `shadow = true`: the
+   decision is computed, logged (`effort_start_rung_shadow_total{rung}`) and
+   thrown away; the request runs at rung 0 as today. Confirms the memory warms,
+   the split never fires, and the cost is zero. One day of real traffic.
+2. **Offline simulator.** §12.4 item 1 (recorded unbounded-thinking traces) now
+   has a second consumer: replay the asymmetric map against the traces and get
+   the token cost of the higher starting rungs that §13.5 could not measure.
+3. **New VulcanBench v3 run set beside `dynamic` and `dynamic-v2`.** Add
+   `dynamic-v3` to `VULCANBENCH_ADAPTIVE_EFFORTS`
+   (`/shared/VulcanBench/harness/effort.py` already maps unknown adaptive levels
+   to a verbatim `reasoning_effort`, so only the map entry
+   `"dynamic-v3": "dynamic"` and the column name are needed). Run the full v3
+   suite, 23 tasks, same harness settings as the `dynamic-v2` column, so the
+   comparison is column-to-column on the existing leaderboard. The bar to clear:
+   `dynamic-v2` scored **0.857 mean functional at 1 071 completion tokens per
+   request**; `dynamic` scored **0.826 at 581**. v3 has to sit on or above that
+   frontier, and the interesting cell is "dynamic-v2 quality at dynamic cost".
+4. **Then and only then** enable it on the latency profile YAML, as a new
+   numbered patch under `serve-configs/patches/`, with the capture path
+   (`VLLM_EFFORT_HIDDEN_CAPTURE`) kept env-gated and off in production.
+
+### 13.9 What this does not settle
+
+- Multimodality is an argument, not a measurement: the v3 traces are text-only.
+  The hidden state contains the image tokens by construction, which is the whole
+  reason this beats a text encoder on screenshots — but it is untested here.
+- The memory's values all come from one engine configuration (`dynamic-v2`).
+  A ladder change makes old values stale; `effort_used` is stored so that a
+  future version can weight or drop them.
+- 23 tasks, 689 labelled requests, one model, one box.
+
 ### 13.10 Addendum — what shipping P8 changed (2026-08-19)
 
 P8 is implemented (venv patch `serve-configs/patches/0012`, branch
