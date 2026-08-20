@@ -886,7 +886,7 @@ index 4dff18e6bd..0000000000
 -if __name__ == "__main__":
 -    raise SystemExit(main())
 diff --git a/serve-configs/patches/README.md b/serve-configs/patches/README.md
-index 9f04f5dcc2..60163e677a 100644
+index 9f04f5dcc2..67d5573c00 100644
 --- a/serve-configs/patches/README.md
 +++ b/serve-configs/patches/README.md
 @@ -1,7 +1,7 @@
@@ -902,7 +902,7 @@ index 9f04f5dcc2..60163e677a 100644
  | `5e67ad3e4` | l4-configs: L4-tuned block-fp8 GEMM configs for the Qwen3.8-27B TP4 shapes |
  | branch `qwen3.8-27B-effort-v2` | 0010 dynamic reasoning effort P6 - rank rule over running quantile sketches, p(`</think>`) grace, worker-side decision |
  | branch `qwen3.8-27B-effort-v2` | 0011 dynamic reasoning effort P7 - soft-limit close at the cap, termination/length rule with the uncertainty features gated by a measured AUC |
-+| branch `qwen3.8-27B-effort-v3` | 0012 dynamic reasoning effort P8 - the effort *level* is chosen from the prefill hidden state and rendered at the prompt tail; the ladder, the caps and every mid-generation actuator are removed |
++| branch `qwen3.8-27B-effort-v3` | 0012 dynamic reasoning effort P8 - the effort *level* is chosen from the prefill hidden state and rendered at the prompt tail; the ladder, the caps and every mid-generation actuator are removed; an omitted `reasoning_effort` can default to `dynamic` |
  
  The rest of this file documents what each change does and why.
  
@@ -910,15 +910,15 @@ index 9f04f5dcc2..60163e677a 100644
  | 0009 config/reasoning.py, entrypoints/openai/chat_completion/{dynamic_effort.py (new), protocol.py, serving.py}, outputs.py, v1/core/sched/{effort_controller.py (new), scheduler.py, output.py}, v1/engine/{__init__.py, output_processor.py}, v1/metrics/{loggers.py, stats.py}, v1/outputs.py, v1/sample/{effort_signals.py (new), sampler.py, metadata.py, rejection_sampler.py, thinking_budget_state.py}, v1/worker/{gpu_input_batch.py, gpu_model_runner.py}, v1/worker/gpu/{async_utils.py, model_runner.py, sample/{effort.py (new), output.py, sampler.py, thinking_budget.py}, spec_decode/rejection_sampler.py} | Dynamic reasoning effort (`docs/dynamic-reasoning.claude.md`): (a) P0 telemetry — per-request entropy (÷log V) and top1-top2 margin at the canonical stage (after penalties, before budget force/temperature/top-k/p), committed rows only, both runners, opt-in per request via `vllm_xargs.effort_telemetry`, JSONL sink `VLLM_EFFORT_TELEMETRY=/path`; zero work when no request is flagged. (b) Versioned thinking-budget updates `SchedulerOutput.thinking_budget_updates` (req -> (revision, budget)) applied by both runners with acks in `ModelRunnerOutput.thinking_budget_acks`; V2 fix: greedy budgeted requests were never forced (`_requires_logits_processing` ignored the budget); CPU torch reference of the V2 Triton budget kernels. (c) `reasoning_effort: "dynamic"` — rendered as template `medium` + the Qwen `low` sentence appended to the last user turn (block 0 stays effort-free, §2b), `thinking_token_budget = ladder[0]`, scheduler-side controller (`--reasoning-config '{"dynamic_effort": {...}}'`: ladder 1k/4k/16k/64k, checks at 75/90 % of the cap, entropy/margin/trend/MTP score vs θ per rung, stall clamp, batch-size rung cap, max_tokens headroom, deadline), `effort` object on the chat response, Prometheus `vllm:effort_*` | Without it: no per-request uncertainty telemetry, no mid-request budget raise, `dynamic` is rejected by the template. GPU-validated 2026-08-18 on the latency profile (static caps force at exactly N tokens under MTP K=7; `dynamic` escalates 0->1 on an open-ended prompt and stays capped on a confident grind; acks land, no `late`; Triton-vs-torch budget kernels 300/300 identical; docs §2c); CPU tests: `serve-configs/tests/test_effort_telemetry.py`, `test_v2_thinking_budget.py`, `test_effort_controller.py` (124 total pass) |
  | 0010 v1/core/sched/{effort_quantiles.py (new), effort_controller.py, scheduler.py, output.py}, v1/sample/{effort_policy.py (new), effort_signals.py, metadata.py, sampler.py, rejection_sampler.py}, v1/outputs.py, config/reasoning.py, v1/worker/{gpu_input_batch.py, gpu_model_runner.py}, v1/worker/gpu/{async_utils.py, model_runner.py, sample/{effort_escalation.py (new), effort.py, output.py, sampler.py, thinking_budget.py}, spec_decode/rejection_sampler.py} | Dynamic reasoning effort P6 (`docs/dynamic-reasoning.claude.md` §11, defaults from `docs/dynamic-reasoning-v3-analysis.md`): (a) running per-model quantile sketches (t-digest, persisted to `dynamic_effort.quantile_path`, warmed by `serve-configs/effort_calibrate.py`) replace the fixed `(mean, sd)` calibration table; features become percentile ranks plus a within-request baseline and the rule reduces to one tunable per rung (`p_uncertain`). (b) p(`</think>`) joins the frozen signal tuple (entropy, margin, p_end, n_rows) on both runners; a rising p(end) near the cap buys one `grace_tokens` window instead of a hard cut, and the forced close uses `ReasoningConfig.force_end_str` (Qwen's own transition phrase) while detection stays on `reasoning_end_str`. (c) language-agnostic n-gram novelty churn replaces the English backtrack-marker list (weight 0, still configurable). (d) the rule is evaluated on the V2 worker next to the cap actuator, so `late` is 0 by construction; the scheduler ships only policy, vetoes and stall clamps. `rule="score"` / `evaluation="scheduler"` keep the P2 behaviour; V1 always uses the scheduler path | Without it: the controller needs a hand-fitted calibration per model/quantization, escalates on absolute z-scores, cuts hard at the cap, and can apply a raised cap 1-2 steps late. CPU tests: `serve-configs/tests/test_effort_p6.py` plus the updated `test_effort_controller.py` / `test_effort_telemetry.py` (163 pass; 3 pinned-memory tests need a free GPU). GPU validation pending |
  | 0011 v1/sample/{soft_limit.py (new), thinking_budget_state.py, effort_policy.py}, v1/worker/gpu/sample/{thinking_budget.py, effort_escalation.py}, v1/core/sched/{effort_controller.py, effort_quantiles.py, scheduler.py}, config/reasoning.py, v1/metrics/{stats.py, loggers.py}, v1/engine/__init__.py, outputs.py, entrypoints/openai/chat_completion/protocol.py | Dynamic reasoning effort P7 (`docs/dynamic-reasoning.claude.md` §12; §11.0 is the standing model-agnostic-signal constraint): (a) **soft-limit close** - from the cap onward the first token of the *natural* reasoning end marker gets a bias `max_bias * clamp((t - cap)/ramp_tokens, 0, 1) ** curve` and the hard force moves to `cap + ramp_tokens`, so a model that is nearly done closes itself and nothing is forced. One formula (`vllm/v1/sample/soft_limit.py`), both actuators (V1 holder, V2 Triton kernel + torch reference), spec-decode aware on the target rows, and it applies to plain `thinking_token_budget` requests too. Every request reports `close_kind` natural/soft/forced on the response `effort` object and as `vllm:effort_close_total{kind}`. The `max_tokens` headroom and the stall clamp both subtract the ramp so their hard guarantees still land where they did; the P6 p(end) grace window is retired into the ramp. (b) **`rule="length"` is the default** - escalate when the request is still thinking at the check point, is not looping/churning, is not converging (p(end) rising) and passes the MTP veto; the entropy/margin rank terms are consulted only when the calibration file reports a discriminative AUC >= `uncertainty_min_auc` (0.60) for that model. `serve-configs/effort_calibrate.py build` measures and stores that AUC with the method of `docs/dynamic-reasoning-v3-analysis.md` §4; the scheduler logs at startup which features are active and why. `rule="rank"` / `"score"` keep the P6 / P2 behaviour | Without it: the cap cuts the model off mid-sentence (2.9 % of requests in the v3 sweep) and escalation keys on entropy/margin features measured at chance (AUC 0.41-0.54) on this model. CPU tests: `serve-configs/tests/test_effort_soft_limit.py` (new) plus the extended `test_effort_p6.py` / `test_effort_controller.py` / `test_v2_thinking_budget.py` (224 pass; 3 pinned-memory tests in `test_effort_telemetry.py` need a free GPU). GPU validation pending |
-+| 0012 config/reasoning.py, entrypoints/openai/chat_completion/{dynamic_effort.py, protocol.py, serving.py}, v1/request.py, v1/outputs.py, v1/core/sched/{effort_memory.py (new), effort_controller.py, output.py, scheduler.py}, v1/metrics/loggers.py, v1/worker/gpu/{effort_hidden.py (new), async_utils.py, model_runner.py}; **deletes** v1/sample/effort_policy.py, v1/worker/gpu/sample/effort_escalation.py and serve-configs/effort_calibrate.py | Dynamic reasoning effort P8 (`docs/dynamic-reasoning.claude.md` §13, measurement in `docs/effort-hidden-probe.md`, results in `docs/dynamic-reasoning-v3-results.md`; still inside the §11.0 model-agnostic constraint - the signal is retrieval over the model's own vectors and nothing is fitted). `reasoning_effort: "dynamic"` becomes: **one effort level per request, decided before the model thinks, rendered as that level's sentence at the true tail of the prompt** (a trailing user message after the last turn - measured: on the last *user* message of an agent turn the xhigh wording moves reasoning length 1.14x, at the tail 1.23x up and 0.78x down, because a tool result otherwise sits between it and the generation point). (a) **Two-phase prefill.** The frontend renders one prompt per level and ships their longest common token prefix minus one as the body plus one tail per level; the scheduler caps the first chunk at the body so it is a non-final prefill chunk - no token sampled, no draft proposed - and asks the worker for the body's last row. The boundary is quantised to a KV block (1648 tokens on this hybrid profile); cached blocks past the body are never adopted, so a fully prefix-cached prompt still produces a row. (b) **Online memory** (`vllm/v1/core/sched/effort_memory.py`): a FIFO ring (per-session cap `memory_size/64`) of L2-normalised pooled states inserted at request finish, valued by the reasoning tokens the request spent - **only at a natural close**, since a client-limited one is right-censored and enters as a key with no value. Query = cosine kNN-16, `novelty = (1 - max cos)/2`, `spread` = the weighted stdev of the neighbours' values; persisted as fp16 `.npz`. (c) **Asymmetric map** (§13.5) over running digests: `q >= q_high` -> top level, `q >= q_mid` -> middle, and the *downward* band alone is gated on novelty and spread. (d) **Everything that touched the think block is removed from this path**: the rung ladder and per-rung caps, mid-generation escalation, the quantile sketches and rank rule, the soft-limit ramp, the forced close and the loop-stall clamp. A dynamic request sets **no thinking budget at all**; the model ends its own reasoning, bounded only by the client's `max_tokens` and timeouts, and `close_kind` is `natural` or `client-limit`. The response `effort` object carries `level`, `decided`, `reasoning_tokens`, `close_kind`, `memory_entries`, `neighbours`; metrics are `vllm:effort_level`, `vllm:effort_decided`, `vllm:effort_close{kind}`, `vllm:reasoning_tokens` | Without it every dynamic request gets the same "keep it brief" sentence and a 1k cap it has to escalate out of: 12.3 % of measured natural closes were under-provisioned at the start and the p90 of what those requests wanted was 1 471 think tokens (§13.5), while the label-free kNN separates them at AUC 0.850 out of fold against 0.729 for prompt length and ~chance for entropy/margin. Cost: one extra engine step per dynamic request; the body is byte-identical across levels, so the prefix cache holds one body per conversation instead of one per (conversation, level). CPU tests: `serve-configs/tests/test_effort_levels.py`, `test_effort_memory.py`, `test_effort_two_phase.py` (a real `Scheduler` on the served model's config, sync and async), `test_effort_hidden_pooling.py` (117 pass; 3 pinned-memory tests in `test_effort_telemetry.py` need a free GPU). Still in the tree but permanently unarmed: the worker-side escalation tensors (`vllm/v1/worker/gpu/sample/effort_escalation.py`) - nothing sets `worker_eval` |
++| 0012 config/reasoning.py, entrypoints/openai/chat_completion/{dynamic_effort.py, protocol.py, serving.py}, v1/request.py, v1/outputs.py, v1/core/sched/{effort_memory.py (new), effort_controller.py, output.py, scheduler.py}, v1/metrics/loggers.py, v1/worker/gpu/{effort_hidden.py (new), async_utils.py, model_runner.py}; **deletes** v1/sample/effort_policy.py, v1/worker/gpu/sample/effort_escalation.py and serve-configs/effort_calibrate.py | Dynamic reasoning effort P8 (`docs/dynamic-reasoning.claude.md` §13, measurement in `docs/effort-hidden-probe.md`, results in `docs/dynamic-reasoning-v3-results.md`; still inside the §11.0 model-agnostic constraint - the signal is retrieval over the model's own vectors and nothing is fitted). `reasoning_effort: "dynamic"` becomes: **one effort level per request, decided before the model thinks, rendered as that level's sentence at the true tail of the prompt** (a trailing user message after the last turn - measured: on the last *user* message of an agent turn the xhigh wording moves reasoning length 1.14x, at the tail 1.23x up and 0.78x down, because a tool result otherwise sits between it and the generation point). (a) **Two-phase prefill.** The frontend renders one prompt per level and ships their longest common token prefix minus one as the body plus one tail per level; the scheduler caps the first chunk at the body so it is a non-final prefill chunk - no token sampled, no draft proposed - and asks the worker for the body's last row. The boundary is quantised to a KV block (1648 tokens on this hybrid profile); cached blocks past the body are never adopted, so a fully prefix-cached prompt still produces a row. (b) **Online memory** (`vllm/v1/core/sched/effort_memory.py`): a FIFO ring (per-session cap `memory_size/64`) of L2-normalised pooled states inserted at request finish, valued by the reasoning tokens the request spent - **only at a natural close**, since a client-limited one is right-censored and enters as a key with no value. Query = cosine kNN-16, `novelty = (1 - max cos)/2`, `spread` = the weighted stdev of the neighbours' values; persisted as fp16 `.npz`. (c) **Asymmetric map** (§13.5) over running digests: `q >= q_high` -> top level, `q >= q_mid` -> middle, and the *downward* band alone is gated on novelty and spread. (d) **Everything that touched the think block is removed from this path**: the rung ladder and per-rung caps, mid-generation escalation, the quantile sketches and rank rule, the soft-limit ramp, the forced close and the loop-stall clamp. A dynamic request sets **no thinking budget at all**; the model ends its own reasoning, bounded only by the client's `max_tokens` and timeouts, and `close_kind` is `natural` or `client-limit`. (e) **`default_effort`**: a chat completion that *omits* `reasoning_effort` takes this level instead of falling through to the chat template's own default, which for Qwen3.8 is `xhigh`. An explicit level - including `"none"` - is never overridden, and a deployment opts out by leaving it null (the throughput profile does). The response `effort` object carries `level`, `decided`, `reasoning_tokens`, `close_kind`, `memory_entries`, `neighbours`; metrics are `vllm:effort_level`, `vllm:effort_decided`, `vllm:effort_close{kind}`, `vllm:reasoning_tokens` | Without it every dynamic request gets the same "keep it brief" sentence and a 1k cap it has to escalate out of: 12.3 % of measured natural closes were under-provisioned at the start and the p90 of what those requests wanted was 1 471 think tokens (§13.5), while the label-free kNN separates them at AUC 0.850 out of fold against 0.729 for prompt length and ~chance for entropy/margin. Cost: one extra engine step per dynamic request; the body is byte-identical across levels, so the prefix cache holds one body per conversation instead of one per (conversation, level). CPU tests: `serve-configs/tests/test_effort_levels.py`, `test_effort_memory.py`, `test_effort_two_phase.py` (a real `Scheduler` on the served model's config, sync and async), `test_effort_hidden_pooling.py` (117 pass; 3 pinned-memory tests in `test_effort_telemetry.py` need a free GPU). Still in the tree but permanently unarmed: the worker-side escalation tensors (`vllm/v1/worker/gpu/sample/effort_escalation.py`) - nothing sets `worker_eval` |
  | l4-configs/*.json (data, copied by apply-to-venv.sh) | L4-tuned Triton block-fp8 GEMM configs for the five per-rank TP4 shapes of Qwen3.8-27B (N,K = 4096/8704/3584x5120, 5120x4352, 5120x1536), keyed by M; from an HBM-realistic sweep (weights rotated past the 48 MB L2) | vLLM has no NVIDIA_L4 entries and falls back to BLOCK_M=64/N=128 for every M; the tuned tiles are +5-18% per GEMM (M<=32 and 96-128), measured in-model: single-stream 68/59/106/143 -> 72/63/112/150 tok/s |
  | 0004 model_loader/weight_utils.py | `get_quant_config` tolerates a callable `hf_overrides` (draft models compose one) instead of raising | `speculative-config` with `"quantization"` on a dspark/eagle draft crashes at load with "hf_overrides must be a dict" (note: online-fp8 for the DSpark drafter still fails later in the DFlash precompute path on SM89 — Marlin-repacked weight; keep the drafter bf16) |
  
 diff --git a/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml b/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml
-index e1025fed2e..b9a731f743 100644
+index e1025fed2e..7ea8b780cb 100644
 --- a/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml
 +++ b/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml
-@@ -104,35 +104,33 @@ compilation-config: '{"max_cudagraph_capture_size": 96}'
+@@ -104,35 +104,37 @@ compilation-config: '{"max_cudagraph_capture_size": 96}'
  speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
  kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
  reasoning-parser: qwen3
@@ -975,7 +975,11 @@ index e1025fed2e..b9a731f743 100644
 +# close_kind=stall. Nothing is trained and there is no offline corpus: a cold
 +# memory, a missing vector or a prompt with no usable seam all render the
 +# default level with a byte-identical prompt.
-+reasoning-config: '{"dynamic_effort": {"hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
++# default_effort: a request that OMITS reasoning_effort is routed instead of
++# falling through to the chat template's own default, which for Qwen3.8 is
++# xhigh - the most expensive level there is. An explicit level (including
++# "none") is never overridden. The throughput profile leaves this unset.
++reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
  enable-auto-tool-choice: true
  tool-call-parser: qwen3_coder
  served-model-name: Qwen3.8-27B
@@ -1833,10 +1837,10 @@ index 0000000000..2509c60146
 +    assert list(params) == ["hidden_states", "input_batch", "capture_req_ids"]
 diff --git a/serve-configs/tests/test_effort_levels.py b/serve-configs/tests/test_effort_levels.py
 new file mode 100644
-index 0000000000..590bca3ef6
+index 0000000000..2dc1ac9bf5
 --- /dev/null
 +++ b/serve-configs/tests/test_effort_levels.py
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,294 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""The v3 dynamic-effort contract: one level, chosen before thinking, no cap.
 +
@@ -1860,6 +1864,7 @@ index 0000000000..590bca3ef6
 +)
 +from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
 +    DynamicEffortError,
++    apply_default_effort,
 +    apply_dynamic_effort,
 +    render_effort_variants,
 +    split_body_and_tails,
@@ -2072,6 +2077,64 @@ index 0000000000..590bca3ef6
 +        "c",
 +        "d",
 +    ]
++
++
++# ------------------------------------------------------- the omitted default
++
++
++def _bare(**kw) -> ChatCompletionRequest:
++    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
++    body.update(kw)
++    return ChatCompletionRequest(**body)
++
++
++def test_an_omitted_effort_takes_the_server_default():
++    cfg = _cfg(default_effort="dynamic")
++    request = _bare()
++    assert request.reasoning_effort is None
++    apply_default_effort(request, cfg)
++    assert request.reasoning_effort == "dynamic"
++    # ...and then routes like any other dynamic request.
++    apply_dynamic_effort(request, cfg)
++    assert request._dynamic_effort_variant_messages is not None
++    assert request.reasoning_effort == cfg.render_effort
++
++
++def test_an_omitted_effort_is_untouched_without_the_knob():
++    """The throughput profile opts out by leaving `default_effort` unset."""
++    for cfg in (_cfg(), None):
++        request = _bare()
++        apply_default_effort(request, cfg)
++        assert request.reasoning_effort is None
++        assert request._dynamic_effort_variant_messages is None
++
++
++@pytest.mark.parametrize("effort", ["none", "low", "medium", "high", "xhigh"])
++def test_an_explicit_effort_is_never_overridden(effort):
++    cfg = _cfg(default_effort="dynamic")
++    request = _bare(reasoning_effort=effort)
++    apply_default_effort(request, cfg)
++    assert request.reasoning_effort == effort
++    # Only "dynamic" goes through the router, so nothing else is rewritten.
++    apply_dynamic_effort(request, cfg)
++    assert request.reasoning_effort == effort
++    assert request._dynamic_effort_variant_messages is None
++
++
++def test_an_explicit_dynamic_routes_even_with_the_knob_off():
++    cfg = _cfg()
++    request = _bare(reasoning_effort="dynamic")
++    apply_default_effort(request, cfg)
++    apply_dynamic_effort(request, cfg)
++    assert request._dynamic_effort_variant_messages is not None
++
++
++def test_the_default_effort_knob_is_validated():
++    for bad in ("Dynamic", "verylow", ""):
++        with pytest.raises(ValueError):
++            DynamicEffortConfig(default_effort=bad)
++    assert DynamicEffortConfig(default_effort="low").default_effort == "low"
++    assert DynamicEffortConfig().default_effort is None
 diff --git a/serve-configs/tests/test_effort_memory.py b/serve-configs/tests/test_effort_memory.py
 new file mode 100644
 index 0000000000..05b771b3e5
@@ -4643,7 +4706,7 @@ index bc6935f118..d17cc65fc3 100644
  from vllm.v1.worker.ubatch_utils import UBatchSlice, _make_metadata_with_slice
  
 diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
-index 48d3c281a4..73de1dde1f 100644
+index 48d3c281a4..044cb15a07 100644
 --- a/vllm/config/reasoning.py
 +++ b/vllm/config/reasoning.py
 @@ -11,7 +11,6 @@ from vllm.config.utils import config
@@ -4654,7 +4717,20 @@ index 48d3c281a4..73de1dde1f 100644
  from vllm.v1.sample.soft_limit import (
      DEFAULT_CURVE,
      DEFAULT_MAX_BIAS,
-@@ -64,287 +63,126 @@ class SoftLimitConfig:
+@@ -21,6 +20,12 @@ from vllm.v1.sample.soft_limit import (
+ logger = init_logger(__name__)
+ 
+ 
++VALID_REASONING_EFFORTS = frozenset(
++    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "dynamic"}
++)
++"""The `reasoning_effort` values the chat completion API accepts; kept in step
++with `ChatCompletionRequest.reasoning_effort`."""
++
+ QWEN_LOW_EFFORT_SENTENCE = (
+     "Reasoning effort is set to low. Keep your thinking brief and focused, "
+     "moving directly to the conclusion without unnecessary elaboration."
+@@ -64,287 +69,144 @@ class SoftLimitConfig:
              raise ValueError("soft_limit.max_bias and curve must be finite")
  
  
@@ -4927,6 +5003,15 @@ index 48d3c281a4..73de1dde1f 100644
 -    keys `entropy`, `margin`. The rank rule replaces it with running sketches."""
 +    hidden_effort: HiddenEffortConfig = field(default_factory=HiddenEffortConfig)
 +    """Which level a request gets, and the memory that decides it."""
++    default_effort: str | None = None
++    """`reasoning_effort` to assume when a chat completion **omits** it.
++
++    `None` (the default) keeps today's behaviour: an omitted value reaches the
++    chat template as `None` and the template picks its own default, which for
++    Qwen3.8 is `xhigh` - the most expensive level there is. Setting this to
++    `"dynamic"` makes the omitted case route itself instead. An explicit
++    `reasoning_effort` on the request is never overridden, including `"none"`.
++    A deployment that wants the template default back sets it to `None`."""
      render_effort: str = "medium"
      """`reasoning_effort` value handed to the chat template for dynamic
 -    requests (block-0-stable rendering)."""
@@ -4936,13 +5021,15 @@ index 48d3c281a4..73de1dde1f 100644
 +    requests, so block 0 of the prompt is identical for every level and the
 +    level lives only in the tail sentence."""
  
--    def __post_init__(self) -> None:
+     def __post_init__(self) -> None:
 -        if len(self.ladder) < 2:
 -            raise ValueError("dynamic_effort.ladder needs at least two rungs")
 -        if any(cap <= 0 for cap in self.ladder) or any(
 -            b <= a for a, b in zip(self.ladder, self.ladder[1:])
--        ):
--            raise ValueError(
++        if self.default_effort is not None and self.default_effort not in (
++            VALID_REASONING_EFFORTS
+         ):
+             raise ValueError(
 -                "dynamic_effort.ladder must be positive and strictly increasing"
 -            )
 -        if self.final_check_at <= self.check_at:
@@ -4969,7 +5056,9 @@ index 48d3c281a4..73de1dde1f 100644
 -        if self.graceful_force_end and not self.force_end_str:
 -            raise ValueError(
 -                "dynamic_effort.graceful_force_end needs a non-empty force_end_str"
--            )
++                f"dynamic_effort.default_effort must be null or one of "
++                f"{sorted(VALID_REASONING_EFFORTS)}, got {self.default_effort!r}"
+             )
 -        if self.theta is None:
 -            self.theta = [0.5 * i for i in range(len(self.ladder) - 1)]
 -        if len(self.theta) != len(self.ladder) - 1:
@@ -5008,9 +5097,6 @@ index 48d3c281a4..73de1dde1f 100644
 -                        f"outside [0, {top}]"
 -                    )
 -                prev_end = end
-+    @property
-+    def level_sentences(self) -> list[str]:
-+        return self.hidden_effort.sentences()
  
      @property
 -    def top_rung(self) -> int:
@@ -5046,12 +5132,16 @@ index 48d3c281a4..73de1dde1f 100644
 -        if auc >= self.uncertainty_min_auc:
 -            return True, f"calibration AUC {auc:.3f} >= {self.uncertainty_min_auc:.2f}"
 -        return False, f"calibration AUC {auc:.3f} < {self.uncertainty_min_auc:.2f}"
++    def level_sentences(self) -> list[str]:
++        return self.hidden_effort.sentences()
++
++    @property
 +    def num_levels(self) -> int:
 +        return len(self.level_sentences)
  
  
  @config
-@@ -365,11 +203,11 @@ class ReasoningConfig:
+@@ -365,11 +227,11 @@ class ReasoningConfig:
      """String that ends reasoning; used for *detection* and, unless
      `force_end_str` is set, also as the forced close."""
      force_end_str: str = ""
@@ -5068,7 +5158,7 @@ index 48d3c281a4..73de1dde1f 100644
      dynamic_effort: DynamicEffortConfig | None = None
      """Server defaults for `reasoning_effort: "dynamic"`; `None` rejects it."""
  
-@@ -445,12 +283,6 @@ class ReasoningConfig:
+@@ -445,12 +307,6 @@ class ReasoningConfig:
              natural_reasoning_end_str = reasoning_end_str
  
          force_end_str = self.force_end_str
@@ -5082,7 +5172,7 @@ index 48d3c281a4..73de1dde1f 100644
              force_end_str = reasoning_end_str
          if natural_reasoning_end_str and not force_end_str.endswith(
 diff --git a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
-index b9010fb188..74a4fc4437 100644
+index b9010fb188..e3dd25f16a 100644
 --- a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
 +++ b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
 @@ -1,16 +1,24 @@
@@ -5117,7 +5207,7 @@ index b9010fb188..74a4fc4437 100644
  from typing import TYPE_CHECKING, Any
  
  from vllm.config.reasoning import DynamicEffortConfig
-@@ -20,118 +28,37 @@ if TYPE_CHECKING:
+@@ -20,118 +28,53 @@ if TYPE_CHECKING:
          ChatCompletionRequest,
      )
  
@@ -5200,9 +5290,16 @@ index b9010fb188..74a4fc4437 100644
 -            or not math.isfinite(float(raw))
 -            or raw <= 0
 -        ):
--            raise DynamicEffortError(
++    overrides: dict[str, Any] = {}
++    if _LEVEL_KEY in xargs and xargs[_LEVEL_KEY] is not None:
++        raw = xargs[_LEVEL_KEY]
++        if isinstance(raw, bool) or not isinstance(raw, int):
++            raise DynamicEffortError(f"vllm_xargs.{_LEVEL_KEY} must be an integer")
++        if not 0 <= raw < cfg.num_levels:
+             raise DynamicEffortError(
 -                f"vllm_xargs.{_DEADLINE_KEY} must be a positive number"
--            )
++                f"vllm_xargs.{_LEVEL_KEY} must be in [0, {cfg.num_levels - 1}]"
+             )
 -        deadline_ms = float(raw)
 -    if xargs.get(_FLOOR_KEY):
 -        raise DynamicEffortError(f"vllm_xargs.{_FLOOR_KEY} is not implemented")
@@ -5219,28 +5316,6 @@ index b9010fb188..74a4fc4437 100644
 -
 -    String content is extended; list-of-parts content gets a text part.
 -    Returns False when there is no user message.
--    """
--    for msg in reversed(messages):
--        if not isinstance(msg, dict) or msg.get("role") != "user":
--            continue
--        content = msg.get("content")
--        if content is None or isinstance(content, str):
--            msg["content"] = f"{content}\n\n{sentence}" if content else sentence
--        elif isinstance(content, list):
--            content.append({"type": "text", "text": sentence})
--        else:
-+    overrides: dict[str, Any] = {}
-+    if _LEVEL_KEY in xargs and xargs[_LEVEL_KEY] is not None:
-+        raw = xargs[_LEVEL_KEY]
-+        if isinstance(raw, bool) or not isinstance(raw, int):
-+            raise DynamicEffortError(f"vllm_xargs.{_LEVEL_KEY} must be an integer")
-+        if not 0 <= raw < cfg.num_levels:
-             raise DynamicEffortError(
--                "dynamic reasoning_effort needs string or list user content"
-+                f"vllm_xargs.{_LEVEL_KEY} must be in [0, {cfg.num_levels - 1}]"
-             )
--        return True
--    return False
 +        overrides["forced_level"] = raw
 +    return overrides
 +
@@ -5251,10 +5326,40 @@ index b9010fb188..74a4fc4437 100644
 +        return False
 +    messages.append({"role": "user", "content": sentence})
 +    return True
++
++
++def apply_default_effort(
++    request: "ChatCompletionRequest", cfg: DynamicEffortConfig | None
++) -> None:
++    """Fill in `reasoning_effort` when the client omitted it entirely.
++
++    Only an *absent* value is filled: an explicit level, including `"none"`,
++    is left exactly as the client sent it. With `default_effort` unset the
++    request is untouched and the chat template picks its own default.
+     """
+-    for msg in reversed(messages):
+-        if not isinstance(msg, dict) or msg.get("role") != "user":
+-            continue
+-        content = msg.get("content")
+-        if content is None or isinstance(content, str):
+-            msg["content"] = f"{content}\n\n{sentence}" if content else sentence
+-        elif isinstance(content, list):
+-            content.append({"type": "text", "text": sentence})
+-        else:
+-            raise DynamicEffortError(
+-                "dynamic reasoning_effort needs string or list user content"
+-            )
+-        return True
+-    return False
++    if request.reasoning_effort is not None:
++        return
++    if cfg is None or not cfg.default_effort:
++        return
++    request.reasoning_effort = cfg.default_effort  # type: ignore[assignment]
  
  
  def apply_dynamic_effort(
-@@ -152,7 +79,8 @@ def apply_dynamic_effort(
+@@ -152,7 +95,8 @@ def apply_dynamic_effort(
          )
      if request.thinking_token_budget is not None:
          raise DynamicEffortError(
@@ -5264,7 +5369,7 @@ index b9010fb188..74a4fc4437 100644
          )
      kwargs = request.chat_template_kwargs or {}
      if "enable_thinking" in kwargs and not kwargs["enable_thinking"]:
-@@ -161,12 +89,56 @@ def apply_dynamic_effort(
+@@ -161,12 +105,56 @@ def apply_dynamic_effort(
              "chat_template_kwargs.enable_thinking=false"
          )
      overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
@@ -5405,7 +5510,7 @@ index eeb89bf23b..a9fdd72890 100644
      def build_chat_params(
          self,
 diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
-index da62bd84be..c190d330ef 100644
+index da62bd84be..95dbf68d72 100644
 --- a/vllm/entrypoints/openai/chat_completion/serving.py
 +++ b/vllm/entrypoints/openai/chat_completion/serving.py
 @@ -5,6 +5,7 @@ import asyncio
@@ -5416,15 +5521,17 @@ index da62bd84be..c190d330ef 100644
  from http import HTTPStatus
  from typing import Any, Final, cast
  
-@@ -27,6 +28,7 @@ from vllm.entrypoints.generate.base.serving import (
+@@ -26,7 +27,9 @@ from vllm.entrypoints.generate.base.serving import (
+ )
  from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
      DynamicEffortError,
++    apply_default_effort,
      apply_dynamic_effort,
 +    split_body_and_tails,
  )
  from vllm.entrypoints.openai.chat_completion.protocol import (
      ChatCompletionLogProb,
-@@ -225,6 +227,48 @@ class OpenAIServingChat(GenerateBaseServing):
+@@ -225,6 +228,48 @@ class OpenAIServingChat(GenerateBaseServing):
  
          return await self.online_renderer.render_chat(request)
  
@@ -5473,7 +5580,22 @@ index da62bd84be..c190d330ef 100644
      async def create_chat_completion(
          self,
          request: ChatCompletionRequest,
-@@ -268,6 +312,10 @@ class OpenAIServingChat(GenerateBaseServing):
+@@ -249,9 +294,13 @@ class OpenAIServingChat(GenerateBaseServing):
+         # Streaming response
+         tokenizer = self.renderer.tokenizer
+         assert tokenizer is not None
++        effort_config = self._dynamic_effort_config()
++        # An omitted reasoning_effort takes the server's default before
++        # anything else looks at it, so `dynamic` can be that default.
++        apply_default_effort(request, effort_config)
+         if request.reasoning_effort == "dynamic":
+             try:
+-                apply_dynamic_effort(request, self._dynamic_effort_config())
++                apply_dynamic_effort(request, effort_config)
+             except DynamicEffortError as e:
+                 return self.create_error_response(str(e))
+         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+@@ -268,6 +317,10 @@ class OpenAIServingChat(GenerateBaseServing):
              return result
  
          conversation, engine_inputs = result

@@ -27,6 +27,7 @@ from vllm.entrypoints.generate.base.serving import (
 )
 from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     DynamicEffortError,
+    apply_default_effort,
     apply_dynamic_effort,
     split_body_and_tails,
 )
@@ -293,9 +294,13 @@ class OpenAIServingChat(GenerateBaseServing):
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
+        effort_config = self._dynamic_effort_config()
+        # An omitted reasoning_effort takes the server's default before
+        # anything else looks at it, so `dynamic` can be that default.
+        apply_default_effort(request, effort_config)
         if request.reasoning_effort == "dynamic":
             try:
-                apply_dynamic_effort(request, self._dynamic_effort_config())
+                apply_dynamic_effort(request, effort_config)
             except DynamicEffortError as e:
                 return self.create_error_response(str(e))
         chat_template_kwargs = self._effective_chat_template_kwargs(request)

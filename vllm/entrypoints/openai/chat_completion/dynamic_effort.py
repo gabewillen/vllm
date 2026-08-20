@@ -61,6 +61,22 @@ def append_to_last_message(messages: list[Any], sentence: str) -> bool:
     return True
 
 
+def apply_default_effort(
+    request: "ChatCompletionRequest", cfg: DynamicEffortConfig | None
+) -> None:
+    """Fill in `reasoning_effort` when the client omitted it entirely.
+
+    Only an *absent* value is filled: an explicit level, including `"none"`,
+    is left exactly as the client sent it. With `default_effort` unset the
+    request is untouched and the chat template picks its own default.
+    """
+    if request.reasoning_effort is not None:
+        return
+    if cfg is None or not cfg.default_effort:
+        return
+    request.reasoning_effort = cfg.default_effort  # type: ignore[assignment]
+
+
 def apply_dynamic_effort(
     request: "ChatCompletionRequest", cfg: DynamicEffortConfig | None
 ) -> None:

@@ -130,7 +130,11 @@ reasoning-parser: qwen3
 # close_kind=stall. Nothing is trained and there is no offline corpus: a cold
 # memory, a missing vector or a prompt with no usable seam all render the
 # default level with a byte-identical prompt.
-reasoning-config: '{"dynamic_effort": {"hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
+# default_effort: a request that OMITS reasoning_effort is routed instead of
+# falling through to the chat template's own default, which for Qwen3.8 is
+# xhigh - the most expensive level there is. An explicit level (including
+# "none") is never overridden. The throughput profile leaves this unset.
+reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B

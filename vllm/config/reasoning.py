@@ -20,6 +20,12 @@ from vllm.v1.sample.soft_limit import (
 logger = init_logger(__name__)
 
 
+VALID_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "dynamic"}
+)
+"""The `reasoning_effort` values the chat completion API accepts; kept in step
+with `ChatCompletionRequest.reasoning_effort`."""
+
 QWEN_LOW_EFFORT_SENTENCE = (
     "Reasoning effort is set to low. Keep your thinking brief and focused, "
     "moving directly to the conclusion without unnecessary elaboration."
@@ -171,10 +177,28 @@ class DynamicEffortConfig:
 
     hidden_effort: HiddenEffortConfig = field(default_factory=HiddenEffortConfig)
     """Which level a request gets, and the memory that decides it."""
+    default_effort: str | None = None
+    """`reasoning_effort` to assume when a chat completion **omits** it.
+
+    `None` (the default) keeps today's behaviour: an omitted value reaches the
+    chat template as `None` and the template picks its own default, which for
+    Qwen3.8 is `xhigh` - the most expensive level there is. Setting this to
+    `"dynamic"` makes the omitted case route itself instead. An explicit
+    `reasoning_effort` on the request is never overridden, including `"none"`.
+    A deployment that wants the template default back sets it to `None`."""
     render_effort: str = "medium"
     """`reasoning_effort` value handed to the chat template for dynamic
     requests, so block 0 of the prompt is identical for every level and the
     level lives only in the tail sentence."""
+
+    def __post_init__(self) -> None:
+        if self.default_effort is not None and self.default_effort not in (
+            VALID_REASONING_EFFORTS
+        ):
+            raise ValueError(
+                f"dynamic_effort.default_effort must be null or one of "
+                f"{sorted(VALID_REASONING_EFFORTS)}, got {self.default_effort!r}"
+            )
 
     @property
     def level_sentences(self) -> list[str]:

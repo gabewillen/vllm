@@ -21,6 +21,7 @@ from vllm.config.reasoning import (
 )
 from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     DynamicEffortError,
+    apply_default_effort,
     apply_dynamic_effort,
     render_effort_variants,
     split_body_and_tails,
@@ -233,3 +234,61 @@ def test_hidden_effort_validates_its_levels():
         "c",
         "d",
     ]
+
+
+# ------------------------------------------------------- the omitted default
+
+
+def _bare(**kw) -> ChatCompletionRequest:
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    body.update(kw)
+    return ChatCompletionRequest(**body)
+
+
+def test_an_omitted_effort_takes_the_server_default():
+    cfg = _cfg(default_effort="dynamic")
+    request = _bare()
+    assert request.reasoning_effort is None
+    apply_default_effort(request, cfg)
+    assert request.reasoning_effort == "dynamic"
+    # ...and then routes like any other dynamic request.
+    apply_dynamic_effort(request, cfg)
+    assert request._dynamic_effort_variant_messages is not None
+    assert request.reasoning_effort == cfg.render_effort
+
+
+def test_an_omitted_effort_is_untouched_without_the_knob():
+    """The throughput profile opts out by leaving `default_effort` unset."""
+    for cfg in (_cfg(), None):
+        request = _bare()
+        apply_default_effort(request, cfg)
+        assert request.reasoning_effort is None
+        assert request._dynamic_effort_variant_messages is None
+
+
+@pytest.mark.parametrize("effort", ["none", "low", "medium", "high", "xhigh"])
+def test_an_explicit_effort_is_never_overridden(effort):
+    cfg = _cfg(default_effort="dynamic")
+    request = _bare(reasoning_effort=effort)
+    apply_default_effort(request, cfg)
+    assert request.reasoning_effort == effort
+    # Only "dynamic" goes through the router, so nothing else is rewritten.
+    apply_dynamic_effort(request, cfg)
+    assert request.reasoning_effort == effort
+    assert request._dynamic_effort_variant_messages is None
+
+
+def test_an_explicit_dynamic_routes_even_with_the_knob_off():
+    cfg = _cfg()
+    request = _bare(reasoning_effort="dynamic")
+    apply_default_effort(request, cfg)
+    apply_dynamic_effort(request, cfg)
+    assert request._dynamic_effort_variant_messages is not None
+
+
+def test_the_default_effort_knob_is_validated():
+    for bad in ("Dynamic", "verylow", ""):
+        with pytest.raises(ValueError):
+            DynamicEffortConfig(default_effort=bad)
+    assert DynamicEffortConfig(default_effort="low").default_effort == "low"
+    assert DynamicEffortConfig().default_effort is None
