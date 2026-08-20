@@ -119,7 +119,7 @@ reasoning-parser: qwen3
 # 13.6k decode steps (8 prompts x xhigh/low, 2026-08-18, VLLM_EFFORT_TELEMETRY
 # sink): entropy mean 0.043 sd 0.046, margin mean 5.9 sd 4.5. Escalation score
 # z(H) - z(margin) + trend + MTP term >= theta [0, 0.5, 1.0] per rung.
-reasoning-config: '{"dynamic_effort": {"calibration": {"entropy": [0.043, 0.046], "margin": [5.9, 4.5]}}}'
+reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "calibration": {"entropy": [0.043, 0.046], "margin": [5.9, 4.5]}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B

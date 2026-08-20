@@ -96,6 +96,10 @@ class DynamicEffortConfig:
     low_effort_sentence: str = QWEN_LOW_EFFORT_SENTENCE
     """Sentence appended to the last user turn of a dynamic request (the
     rung-0 prior). Empty disables the append."""
+    default_effort: str | None = None
+    """Effort applied when a request omits `reasoning_effort` (e.g.
+    "dynamic"). `None` keeps the stock behaviour (template default thinking).
+    Explicit values, including "none", are never overridden."""
 
     def __post_init__(self) -> None:
         if len(self.ladder) < 2:

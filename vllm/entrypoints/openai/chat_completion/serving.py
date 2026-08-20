@@ -249,6 +249,11 @@ class OpenAIServingChat(GenerateBaseServing):
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
+        if request.reasoning_effort is None:
+            effort_cfg = self._dynamic_effort_config()
+            default_effort = getattr(effort_cfg, "default_effort", None)
+            if default_effort:
+                request.reasoning_effort = default_effort
         if request.reasoning_effort == "dynamic":
             try:
                 apply_dynamic_effort(request, self._dynamic_effort_config())
