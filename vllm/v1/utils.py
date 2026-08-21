@@ -597,10 +597,12 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
         procs: List of processes to shutdown
         timeout: Maximum time in seconds to wait for graceful shutdown
     """
-    if timeout is None:
-        # Keep a small grace period for best-effort cleanup paths that do not
-        # have a user-configured shutdown timeout.
-        timeout = 5.0
+    # `timeout` is the request-drain budget; a SIGTERMed process still needs a
+    # few seconds of its own to run `EngineCore.shutdown` (executor teardown,
+    # scheduler state such as the effort memory). Floor it like
+    # `_shutdown_subprocesses` does, so timeout=0 means "abort requests now",
+    # not "SIGKILL before the handler runs".
+    timeout = max(timeout or 0.0, 5.0)
 
     logger.debug(
         "[shutdown] Process manager: start process_count=%d timeout=%ss names=%s",
