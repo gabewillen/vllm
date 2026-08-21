@@ -164,13 +164,20 @@ reasoning-parser: qwen3
 # it (close_kind=client-limit, not valued in the memory). Nothing is trained and
 # there is no offline corpus: a cold memory, a missing vector or a prompt with
 # no usable seam all render the default level with a byte-identical prompt.
-# default_level 1 (medium) is the prior for every undecided request - cold
-# memory, no seam, novel prompt. With the prior at 0 (low), VulcanBench
-# flask (2026-08-21, two seeds) ran the whole task at low and missed the
-# aggregation test both times (693 / 143k reasoning tokens, max level 0)
-# where the v1 ladder had passed by escalating on 6 requests. The asymmetric
-# map lowers from the middle only when the neighbours agree; it should not
-# start at the bottom.
+# The map is LOW-RESTING (2026-08-21 evening): low unless the neighbours
+# earn more. The memory's value is difficulty - a request's reasoning spend
+# ranked within the lane (effort level) it was rendered at - not raw spend,
+# because raw spend echoes the level the server chose (the same prompt thinks
+# ~10x longer under xhigh) and ratcheted every neighbourhood upward: by the
+# afternoon 68% of agent traffic was xhigh. Leave-one-out replay of the same
+# 512-entry memory under the new value: low/medium/xhigh 31/45/24% vs
+# 11/22/68% live. q_mid/q_high now cut the difficulty directly (0.35/0.60);
+# every 8th decision above low renders one level lower (probe_every) so lanes
+# keep receiving cheaper samples and can be pulled down.
+# default_level 1 (medium) is the prior for the undecided only - cold memory,
+# no seam, novel prompt (nothing comparable in memory). With it at 0,
+# VulcanBench flask (two seeds) ran whole tasks at low and missed the
+# aggregation test both times.
 # default_effort: a request that OMITS reasoning_effort is routed instead of
 # falling through to the chat template's own default, which for Qwen3.8 is
 # xhigh - the most expensive level there is. An explicit level (including

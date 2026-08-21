@@ -2,11 +2,12 @@
 """CPU contract tests for the v3 online effort memory (§13.4, §13.5).
 
 The memory is the whole v3 signal: a ring of pooled prefill states the server
-filled itself, queried by cosine and valued by the reasoning tokens each entry
-actually spent. Nothing here is trained, so what has to be pinned is the
-bookkeeping - who evicts whom, which entries may contribute a value, and that
-the asymmetric map can only lower a request's level when both confidence gates
-agree.
+filled itself, queried by cosine and valued by each entry's difficulty - its
+reasoning spend ranked within the effort level it was rendered at. Nothing
+here is trained, so what has to be pinned is the bookkeeping - who evicts
+whom, which entries may contribute a value, that the level label cancels out
+of the value, and that the low-resting map only leaves low on evidence and
+keeps probing downward.
 """
 
 import math
@@ -83,8 +84,7 @@ def test_censored_closes_are_keys_not_values():
     assert result.max_cos > 0.9
     # ...and contribute nothing to the value.
     assert result.n_valued == 2
-    values = {math.log1p(10_000), math.log1p(1_000)}
-    assert min(values) <= result.estimate <= max(values)
+    assert 0.0 <= result.estimate <= 1.0
 
 
 # --------------------------------------------------------------------- query
@@ -108,7 +108,11 @@ def test_query_matches_numpy_reference():
     best = sims[top[0]]
     weights = np.exp((sims[top] - best) / 0.05)
     weights /= weights.sum()
-    values = np.log1p(tokens[top].astype(np.float64))
+    # Every entry went in at level 0: each value is its spend rank in that lane.
+    lane = memory._level_digests[0]
+    values = np.array(
+        [lane.rank(float(np.float32(math.log1p(int(t))))) for t in tokens[top]]
+    )
     expected = float((weights * values).sum())
     expected_spread = float(math.sqrt((weights * (values - expected) ** 2).sum()))
 
@@ -189,47 +193,111 @@ def _query(novelty=0.1, spread=0.1, estimate=1.0) -> MemoryQuery:
     )
 
 
-def test_asymmetric_map_never_lowers_without_both_gates():
-    cfg = _cfg(q_mid=0.35, q_high=0.60, novelty_gate_q=0.6, spread_gate_q=0.6)
+def test_low_resting_map_leaves_low_only_on_difficulty():
+    cfg = _cfg(q_mid=0.35, q_high=0.60, novelty_gate_q=0.6, default_level=1)
     top = 2
     q = _query()
 
-    # Upward band: no gate, ever.
-    assert decide_effort_level(q, (0.99, 0.99, 0.99), cfg, top).level == 2
-    assert decide_effort_level(q, (0.60, 0.99, 0.99), cfg, top).level == 2
-    assert decide_effort_level(q, (0.35, 0.99, 0.99), cfg, top).level == 1
+    # The estimate is the neighbours' difficulty; the cuts apply to it.
+    assert decide_effort_level(q, (0.99, 0.10, 0.99), cfg, top).level == 2
+    assert decide_effort_level(q, (0.60, 0.10, 0.99), cfg, top).level == 2
+    assert decide_effort_level(q, (0.35, 0.10, 0.99), cfg, top).level == 1
+    assert decide_effort_level(q, (0.34, 0.10, 0.99), cfg, top).level == 0
+    assert decide_effort_level(q, (0.00, 0.10, 0.00), cfg, top).level == 0
+    # Spread is reported, never cut on.
+    assert decide_effort_level(q, (0.10, 0.10, None), cfg, top).level == 0
 
-    # Downward band needs BOTH gates. Either one above its rank keeps the
-    # request at the safe level.
-    assert decide_effort_level(q, (0.10, 0.10, 0.10), cfg, top).level == 0
-    assert decide_effort_level(q, (0.10, 0.90, 0.10), cfg, top).level == 1
-    assert decide_effort_level(q, (0.10, 0.10, 0.90), cfg, top).level == 1
-    assert decide_effort_level(q, (0.10, 0.90, 0.90), cfg, top).level == 1
-    # A missing gate rank is not a passing gate.
-    assert decide_effort_level(q, (0.10, None, 0.10), cfg, top).level == 1
-    assert decide_effort_level(q, (0.10, 0.10, None), cfg, top).level == 1
-
-    # Exactly at a gate is inside it; exactly at a cut is inside the band above.
-    assert decide_effort_level(q, (0.10, 0.60, 0.60), cfg, top).level == 0
-    assert decide_effort_level(q, (0.35, 0.10, 0.10), cfg, top).level == 1
-    assert decide_effort_level(q, (0.60, 0.10, 0.10), cfg, top).level == 2
+    # A novel prompt carries no evidence either way: default_level.
+    novel = decide_effort_level(q, (0.99, 0.90, 0.10), cfg, top)
+    assert (novel.level, novel.reason) == (1, "novel")
+    assert decide_effort_level(q, (0.00, 0.61, 0.10), cfg, top).level == 1
+    # Exactly at the gate is still known territory.
+    assert decide_effort_level(q, (0.00, 0.60, 0.10), cfg, top).level == 0
 
 
-def test_map_falls_back_to_the_safe_level_without_an_estimate():
-    cfg = _cfg()
+def test_probe_renders_one_level_below_the_verdict():
+    cfg = _cfg(default_level=1)
+    q = _query()
+    probed = decide_effort_level(q, (0.99, 0.1, 0.1), cfg, 2, probe=True)
+    assert (probed.level, probed.reason) == (1, "probe/q>=q_high")
+    assert decide_effort_level(q, (0.40, 0.1, 0.1), cfg, 2, probe=True).level == 0
+    # Low cannot go lower; a novel or estimate-less request is not probed.
+    assert decide_effort_level(q, (0.10, 0.1, 0.1), cfg, 2, probe=True).level == 0
+    assert decide_effort_level(q, (0.99, 0.9, 0.1), cfg, 2, probe=True).level == 1
+    assert decide_effort_level(None, (None, None, None), cfg, 2, probe=True).level == 1
+
+
+def test_probe_clock_fires_every_nth_decision():
+    memory = _mem(probe_every=4)
+    fired = [memory.take_probe() for _ in range(8)]
+    assert fired == [False, False, False, True] * 2
+    assert not any(_mem(probe_every=0).take_probe() for _ in range(8))
+
+
+def test_map_falls_back_to_the_default_level_without_an_estimate():
+    cfg = _cfg(default_level=1)
     assert decide_effort_level(None, (None, None, None), cfg, 2).level == 1
     assert decide_effort_level(_query(), (None, 0.1, 0.1), cfg, 2).level == 1
     # A two-level server cannot reach level 2.
     assert decide_effort_level(_query(), (0.99, 0.1, 0.1), cfg, 1).level == 1
 
 
+def test_level_label_cancels_out_of_the_value():
+    """The same task rendered at the top level thinks ~10x longer than at low.
+
+    Ranked within its lane that is the *same* difficulty, so a neighbourhood
+    the server over-routed does not read back as hard."""
+    memory = _mem(memory_size=256, k=4, min_entries=4)
+    rng = np.random.default_rng(3)
+    # Two lanes, both seeing the same spread of tasks: low spends 10..1000,
+    # top spends 100..10000 (x10 from the sentence alone).
+    for i in range(40):
+        spend = int(10 * 10 ** (2 * i / 39))
+        memory.insert(rng.normal(size=DIM), spend, "natural", level=0)
+        memory.insert(rng.normal(size=DIM), spend * 10, "natural", level=2)
+    # A cluster of trivial tasks that the server happened to route to the top
+    # level: they spent 150 tokens there - huge for low, tiny for top.
+    centre = _vec(7)
+    for i in range(6):
+        memory.insert(centre + 0.02 * _vec(100 + i), 150, "natural", level=2)
+    got = memory.query(centre)
+    assert got is not None and got.n_valued == 4
+    # Within the top lane 150 sits near the bottom: this neighbourhood is easy.
+    assert got.estimate < 0.15
+    # The same spend recorded at low would read as mid-difficulty.
+    assert memory._difficulty(0, math.log1p(150)) > 0.4
+
+
+def test_legacy_file_migrates_to_within_level_difficulty(tmp_path):
+    path = str(tmp_path / "legacy.npz")
+    legacy = _mem(memory_path=path, k=2)
+    for i in range(8):
+        legacy.insert(_vec(i), 100 * (i + 1), "natural", level=i % 2, session_id=str(i))
+    legacy.save()
+    # Strip the lane digests as a file from before they existed.
+    import json
+
+    with np.load(path, allow_pickle=False) as data:
+        meta = json.loads(bytes(data["meta"]).decode())
+        arrays = {k: data[k] for k in data.files if k != "meta"}
+    for key in ("level_digests", "spend_digest", "probe_clock"):
+        meta.pop(key, None)
+    np.savez(path, meta=np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8), **arrays)
+
+    fresh = _mem(memory_path=path, k=2)
+    assert fresh.load()
+    assert fresh.n_entries == 8
+    assert {k: int(d.count) for k, d in fresh._level_digests.items()} == {0: 4, 1: 4}
+    assert fresh._est_digest.count == 0
+
+
 def test_ranks_are_streaming_and_absorb_the_observation():
     memory = _mem()
-    first = _query(estimate=1.0, novelty=0.2, spread=0.3)
-    # An empty digest cannot rank anything.
-    assert memory.ranks(first) == (None, None, None)
-    second = _query(estimate=2.0, novelty=0.5, spread=0.9)
+    first = _query(estimate=0.7, novelty=0.2, spread=0.3)
+    # The estimate passes through; empty digests cannot rank the rest.
+    assert memory.ranks(first) == (0.7, None, None)
+    second = _query(estimate=0.2, novelty=0.5, spread=0.9)
     est, nov, spread = memory.ranks(second)
-    assert est == 1.0 and nov == 1.0 and spread == 1.0
+    assert est == 0.2 and nov == 1.0 and spread == 1.0
     below = _query(estimate=0.0, novelty=0.0, spread=0.0)
     assert memory.ranks(below) == (0.0, 0.0, 0.0)

@@ -60,14 +60,19 @@ class HiddenEffortConfig:
     temperature: float = Field(default=0.05, gt=0.0)
     """Softmax temperature on cosine similarity in the neighbour weights."""
     q_mid: float = Field(default=0.35, ge=0.0, le=1.0)
-    """Estimate rank at or above which the request gets the middle level."""
+    """Neighbour difficulty (within-level spend percentile, 0..1) at or
+    above which the request leaves the resting low level for the middle."""
     q_high: float = Field(default=0.60, ge=0.0, le=1.0)
-    """Estimate rank at or above which it gets the top level."""
+    """Neighbour difficulty at or above which it gets the top level."""
     novelty_gate_q: float = Field(default=0.60, ge=0.0, le=1.0)
-    """Novelty rank the *downward* band requires: above it the memory has
-    nothing similar, so it cannot be trusted to say "easy"."""
+    """Novelty rank above which the memory has nothing comparable and the
+    request falls back to `default_level` instead of the map."""
     spread_gate_q: float = Field(default=0.60, ge=0.0, le=1.0)
-    """Neighbour-disagreement rank the downward band requires."""
+    """Kept for telemetry; the spread rank is reported, not cut on."""
+    probe_every: int = Field(default=8, ge=0)
+    """Every N-th decision above low renders one level lower, so lanes keep
+    receiving cheaper samples and neighbourhoods can be pulled down. 0
+    disables."""
     digest_compression: float = Field(default=100.0, ge=10.0)
     """t-digest compression of the estimate / novelty / spread digests."""
     memory_path: str | None = None

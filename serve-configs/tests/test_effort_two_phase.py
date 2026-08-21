@@ -46,7 +46,17 @@ def _scheduler(max_num_batched_tokens=2048, async_scheduling=None, **hidden_kw):
         use_v2_model_runner=True,
         **kw,
     )
-    kwargs = dict(enabled=True, memory_size=128, min_entries=4, k=4, flush_every=0)
+    # These tests pin the two-phase prefill, not the map: no novelty gate and
+    # no down-probe, so a (q_mid, q_high) pair fully determines the level.
+    kwargs = dict(
+        enabled=True,
+        memory_size=128,
+        min_entries=4,
+        k=4,
+        flush_every=0,
+        novelty_gate_q=1.0,
+        probe_every=0,
+    )
     kwargs.update(hidden_kw)
     hidden = HiddenEffortConfig(**kwargs)
     cfg = DynamicEffortConfig(hidden_effort=hidden)
@@ -372,6 +382,8 @@ def test_split_survives_async_scheduling(async_scheduling):
         flush_every=0,
         q_mid=0.0,
         q_high=0.0,
+        novelty_gate_q=1.0,
+        probe_every=0,
     )
     scheduler._effort_cfg = DynamicEffortConfig(hidden_effort=hidden)
     scheduler._effort_start_ids = [START]

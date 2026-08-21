@@ -2916,7 +2916,11 @@ class Scheduler(SchedulerInterface):
             else:
                 top = (len(tails) - 1) if tails else 0
                 decision = decide_effort_level(
-                    query, memory.ranks(query), memory.cfg, top
+                    query,
+                    memory.ranks(query),
+                    memory.cfg,
+                    top,
+                    probe=memory.ready and memory.take_probe(),
                 )
                 if state is not None:
                     state.novelty = query.novelty

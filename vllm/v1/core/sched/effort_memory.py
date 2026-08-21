@@ -15,6 +15,15 @@ Entries are inserted at request finish. A request that was force-closed or
 soft-closed is right-censored - the length it *would* have spent is unknown -
 so it is stored as a key with no value: it counts for novelty and can never
 pull the kNN average down.
+
+The value the kNN averages is *difficulty*, not raw spend: a request's spend
+is ranked within the running distribution of the effort level it was rendered
+at. Spend depends on the level as much as on the task (the same prompt thinks
+~10x longer under the top sentence than under the lowest), so averaging raw
+lengths would only echo the server's own past decisions back at it and ratchet
+every neighbourhood upward. Ranking within the lane cancels that offset: a
+trivial task routed to the top level ranks low there and a hard one routed
+low ranks high there, so each neighbourhood can move in both directions.
 """
 
 from __future__ import annotations
@@ -50,8 +59,8 @@ class MemoryQuery:
     """What the memory can say about one pooled vector."""
 
     estimate: float | None
-    """Cosine-weighted mean of `log1p(reasoning_tokens)` over the valued
-    neighbours, or `None` when none of the `k` neighbours carries a value."""
+    """Cosine-weighted mean of the neighbours' within-level spend ranks
+    (0..1), or `None` when none of the `k` neighbours carries a value."""
     novelty: float
     """`(1 - max cos) / 2`: how far the nearest entry is."""
     spread: float | None
@@ -114,6 +123,9 @@ class EffortMemory:
         self._est_digest = TDigest(compression=cfg.digest_compression)
         self._novelty_digest = TDigest(compression=cfg.digest_compression)
         self._spread_digest = TDigest(compression=cfg.digest_compression)
+        self._spend_digest = TDigest(compression=cfg.digest_compression)
+        self._level_digests: dict[int, TDigest] = {}
+        self._probe_clock = 0
 
     # ---------------------------------------------------------------- state
 
@@ -169,11 +181,40 @@ class EffortMemory:
         )
         self._sessions[slot] = session_id
         self._levels_used[slot] = np.int8(max(-128, min(127, level)))
+        if valued:
+            self._absorb_spend(int(level), float(self._values[slot]))
         if session_id is not None:
             self._by_session.setdefault(session_id, deque()).append(slot)
         self._inserts += 1
         self._since_flush += 1
         self.maybe_save()
+
+    def _absorb_spend(self, level: int, log_spend: float) -> None:
+        self._spend_digest.add(log_spend)
+        digest = self._level_digests.get(level)
+        if digest is None:
+            digest = self._level_digests[level] = TDigest(
+                compression=self.cfg.digest_compression
+            )
+        digest.add(log_spend)
+
+    def _difficulty(self, level: int, log_spend: float) -> float:
+        """Spend ranked within its own level's lane; the global spend rank
+        stands in until the lane has seen `k` natural closes."""
+        digest = self._level_digests.get(int(level))
+        if digest is not None and digest.count >= self.cfg.k:
+            rank = digest.rank(log_spend)
+            if rank is not None:
+                return rank
+        return self._spend_digest.rank(log_spend) or 0.0
+
+    def take_probe(self) -> bool:
+        """Every `probe_every`-th call answers True (0 disables)."""
+        every = int(self.cfg.probe_every)
+        if every <= 0:
+            return False
+        self._probe_clock = (self._probe_clock + 1) % every
+        return self._probe_clock == 0
 
     def _claim_slot(self, session_id: str | None) -> int:
         """FIFO ring, with a per-session cap that reuses the session's oldest."""
@@ -228,7 +269,13 @@ class EffortMemory:
                 (valued_sims - valued_sims.max()) / max(self.cfg.temperature, 1e-6)
             )
             w = w / w.sum()
-            vals = values[valued].astype(np.float64)
+            raw = values[valued].astype(np.float64)
+            lvls = self._levels_used[top][valued]
+            vals = np.fromiter(
+                (self._difficulty(int(lv), float(r)) for lv, r in zip(lvls, raw)),
+                dtype=np.float64,
+                count=int(valued.sum()),
+            )
             mean = float((w * vals).sum())
             estimate = mean
             if valued.sum() >= 2:
@@ -247,8 +294,11 @@ class EffortMemory:
         return result
 
     def ranks(self, q: MemoryQuery) -> tuple[float | None, float | None, float | None]:
-        """Percentile ranks of the query's three statistics, then absorb them."""
-        est_rank = None if q.estimate is None else self._est_digest.rank(q.estimate)
+        """`(estimate, novelty rank, spread rank)`, then absorb them.
+
+        The estimate is already a difficulty percentile and is passed through;
+        its digest is kept for reporting only."""
+        est_rank = q.estimate
         nov_rank = self._novelty_digest.rank(q.novelty)
         spread_rank = None if q.spread is None else self._spread_digest.rank(q.spread)
         if q.estimate is not None:
@@ -274,6 +324,12 @@ class EffortMemory:
             "est_digest": self._est_digest.to_dict(),
             "novelty_digest": self._novelty_digest.to_dict(),
             "spread_digest": self._spread_digest.to_dict(),
+            "spend_digest": self._spend_digest.to_dict(),
+            "level_digests": {
+                str(level): digest.to_dict()
+                for level, digest in self._level_digests.items()
+            },
+            "probe_clock": self._probe_clock,
         }
 
     def save(self) -> None:
@@ -343,9 +399,34 @@ class EffortMemory:
         self._n = n
         self._next = n % self._keys.shape[0]
         self._inserts = int(meta.get("inserts", n))
-        self._est_digest = TDigest.from_dict(meta["est_digest"])
         self._novelty_digest = TDigest.from_dict(meta["novelty_digest"])
         self._spread_digest = TDigest.from_dict(meta["spread_digest"])
+        self._probe_clock = int(meta.get("probe_clock", 0))
+        if "level_digests" in meta:
+            self._est_digest = TDigest.from_dict(meta["est_digest"])
+            self._spend_digest = TDigest.from_dict(meta["spend_digest"])
+            self._level_digests = {
+                int(level): TDigest.from_dict(d)
+                for level, d in meta["level_digests"].items()
+            }
+        else:
+            # A file written when the estimate was raw spend: rebuild the
+            # lanes from the stored spend + level and restart the estimate
+            # digest, whose units changed.
+            self._est_digest = TDigest(compression=self.cfg.digest_compression)
+            self._spend_digest = TDigest(compression=self.cfg.digest_compression)
+            self._level_digests = {}
+            for slot in range(n):
+                value = float(self._values[slot])
+                if not math.isnan(value):
+                    self._absorb_spend(int(self._levels_used[slot]), value)
+            logger.info(
+                "dynamic_effort: migrated %s to within-level difficulty "
+                "(%d valued entries, lanes %s)",
+                path,
+                self.n_valued,
+                {k: int(d.count) for k, d in sorted(self._level_digests.items())},
+            )
         return True
 
 
@@ -354,39 +435,41 @@ def decide_effort_level(
     ranks: tuple[float | None, float | None, float | None],
     cfg: HiddenEffortConfig,
     top_level: int,
+    probe: bool = False,
 ) -> LevelDecision:
-    """The asymmetric quantile map (§13.5).
+    """The quantile map, low-resting (§13.5).
 
-    Raise freely, lower only on confidence: one under-routed step can kill a
-    trajectory, over-routing only costs tokens. The two confidence gates guard
-    the *downward* band alone - `novelty` (nothing similar in the memory, so it
-    cannot be trusted to say "easy") and `spread` (the neighbours disagree).
+    Low is the resting level; the memory has to earn anything above it. The
+    estimate is the neighbours' within-level difficulty (0..1), so the cuts
+    apply to it directly: at or above `q_high` the top level, at or above
+    `q_mid` the middle one, otherwise low. A novel prompt - the nearest entry
+    is farther than `novelty_gate_q` of what the server has seen - carries no
+    evidence either way and gets `default_level`. A `probe` decision renders
+    one level below the map's verdict, so every neighbourhood keeps receiving
+    samples at the cheaper level and can be pulled down by them.
 
     Args:
         query: the kNN result, or `None` when the memory could not answer.
-        ranks: `(estimate, novelty, spread)` percentile ranks.
+        ranks: `(estimate, novelty rank, spread rank)`.
         cfg: hidden-effort settings.
         top_level: highest effort level the request has.
+        probe: render one level below the verdict.
 
     Returns:
         The effort level and why it was chosen.
     """
-    safe = min(1, top_level)
-    est_rank, nov_rank, spread_rank = ranks
-    if query is None or est_rank is None:
-        return LevelDecision(safe, "no-estimate", est_rank, nov_rank, spread_rank)
-    if est_rank >= cfg.q_high:
-        return LevelDecision(
-            min(2, top_level), "q>=q_high", est_rank, nov_rank, spread_rank
-        )
-    if est_rank >= cfg.q_mid:
-        return LevelDecision(safe, "q>=q_mid", est_rank, nov_rank, spread_rank)
-    gates_pass = (
-        nov_rank is not None
-        and spread_rank is not None
-        and nov_rank <= cfg.novelty_gate_q
-        and spread_rank <= cfg.spread_gate_q
-    )
-    if gates_pass:
-        return LevelDecision(0, "low-band", est_rank, nov_rank, spread_rank)
-    return LevelDecision(safe, "gated", est_rank, nov_rank, spread_rank)
+    default = min(cfg.default_level, top_level)
+    estimate, nov_rank, spread_rank = ranks
+    if query is None or estimate is None:
+        return LevelDecision(default, "no-estimate", estimate, nov_rank, spread_rank)
+    if nov_rank is not None and nov_rank > cfg.novelty_gate_q:
+        return LevelDecision(default, "novel", estimate, nov_rank, spread_rank)
+    if estimate >= cfg.q_high:
+        level, reason = min(2, top_level), "q>=q_high"
+    elif estimate >= cfg.q_mid:
+        level, reason = min(1, top_level), "q>=q_mid"
+    else:
+        level, reason = 0, "low"
+    if probe and level > 0:
+        level, reason = level - 1, f"probe/{reason}"
+    return LevelDecision(level, reason, estimate, nov_rank, spread_rank)
