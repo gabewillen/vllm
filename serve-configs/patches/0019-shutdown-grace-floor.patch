@@ -1,21 +1,3 @@
-From d8fbc9e843ebcf2404c56cab017e2f29f97327ce Mon Sep 17 00:00:00 2001
-From: gwillen <gabewillen@gmail.com>
-Date: Fri, 21 Aug 2026 17:53:20 +0000
-Subject: [PATCH] Process shutdown: let EngineCore persist scheduler state
- before it is killed
-
-core_client passes shutdown_timeout (default 0) straight to shutdown(), which
-SIGKILLed EngineCore in the same second as the SIGTERM; with a floor of 5s
-(as _shutdown_subprocesses already has) the engine reaches its teardown, but
-the TP worker teardown ran first and outlasted the grace. Scheduler.shutdown
-now runs before the executor's and saves the effort memory as its first act,
-so a systemctl restart keeps what the server learned (on 2026-08-21 three
-restarts each lost the entries since the last 256-insert flush).
----
- vllm/v1/core/sched/scheduler.py | 15 +++++++++------
- vllm/v1/engine/core.py          |  7 +++++--
- 2 files changed, 14 insertions(+), 8 deletions(-)
-
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
 index 6a8231c0c7..f52f599e3d 100644
 --- a/vllm/v1/core/sched/scheduler.py
@@ -69,6 +51,24 @@ index 55fe5b90c5..683288e1ae 100644
  
          # Undo the gc.freeze() from __init__ so that the objects allocated
          # during engine startup (model weights, KV caches, etc.) become
--- 
-2.43.0
-
+diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
+index 8d482f58fd..966f744c7b 100644
+--- a/vllm/v1/utils.py
++++ b/vllm/v1/utils.py
+@@ -597,10 +597,12 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
+         procs: List of processes to shutdown
+         timeout: Maximum time in seconds to wait for graceful shutdown
+     """
+-    if timeout is None:
+-        # Keep a small grace period for best-effort cleanup paths that do not
+-        # have a user-configured shutdown timeout.
+-        timeout = 5.0
++    # `timeout` is the request-drain budget; a SIGTERMed process still needs a
++    # few seconds of its own to run `EngineCore.shutdown` (executor teardown,
++    # scheduler state such as the effort memory). Floor it like
++    # `_shutdown_subprocesses` does, so timeout=0 means "abort requests now",
++    # not "SIGKILL before the handler runs".
++    timeout = max(timeout or 0.0, 5.0)
+ 
+     logger.debug(
+         "[shutdown] Process manager: start process_count=%d timeout=%ss names=%s",
