@@ -157,6 +157,22 @@ class BlockTable:
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
 
+    def trim_row(self, num_blocks: int, row_idx: int) -> None:
+        """Drop the last `num_blocks` (scheduler) blocks of a row.
+
+        The vacated entries are zeroed: mamba kernels dereference every slot
+        of their state window and skip the null block, and dummy runs read
+        stale rows.
+        """
+        if num_blocks <= 0:
+            return
+        if self.use_hybrid_blocks:
+            num_blocks *= self.blocks_per_kv_block
+        end = self.num_blocks_per_row[row_idx]
+        start = max(end - num_blocks, 0)
+        self.block_table.np[row_idx, start:end] = 0
+        self.num_blocks_per_row[row_idx] = start
+
     def clear_row(self, row_idx: int) -> None:
         num_blocks = self.num_blocks_per_row[row_idx]
         if num_blocks > 0:
@@ -341,6 +357,10 @@ class MultiGroupBlockTable:
     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.add_row(block_ids[i], row_idx)
+
+    def trim_row(self, num_blocks: tuple[int, ...], row_idx: int) -> None:
+        for i, block_table in enumerate(self.block_tables):
+            block_table.trim_row(num_blocks[i], row_idx)
 
     def clear_row(self, row_idx: int) -> None:
         for block_table in self.block_tables:

@@ -30,6 +30,14 @@
 # num_speculative_tokens_per_batch_size adapts K to live batch size (K=2 up
 # to 8 seqs, K=1 to 32, off above); verified: draft counters freeze at high
 # batch, so heavy batches pay only the K=0 floor above.
+# Patch 0015: the GDN state slots follow that schedule too. Each draft token
+# needs its own copy of the recurrent state (48 layers x 48x128x128 fp32
+# = 151 MB), and stock vLLM reserves num_speculative_tokens of them per
+# request for its whole life - 9 copies, 1.36 GB, ~35k KV-token-equivalents,
+# which capped this profile at ~39 concurrent requests (c64: 206 tok/s, 139
+# preemptions, 2026-08-21). Now a request holds slots for the drafts it
+# actually verifies this step (released two steps after the last draft that
+# needed them), so MTP costs no state memory where the schedule turns it off.
 #
 # Tiered KV offload ENABLED — requires the venv-local patch
 # artifacts/offload-debug/mtp-eagle-group-detection.patch (offloading

@@ -1512,7 +1512,14 @@ class GPUModelRunner(
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             # Update the block IDs.
+            trimmed_blocks = req_data.trimmed_block_counts.get(req_id)
             if not resumed_from_preemption:
+                if trimmed_blocks is not None:
+                    for block_ids, num_trimmed in zip(
+                        req_state.block_ids, trimmed_blocks
+                    ):
+                        if num_trimmed > 0:
+                            del block_ids[len(block_ids) - num_trimmed :]
                 if new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
@@ -1543,6 +1550,8 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            if trimmed_blocks is not None:
+                self.input_batch.block_table.trim_row(trimmed_blocks, req_index)
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 

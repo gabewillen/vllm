@@ -119,6 +119,31 @@ class BlockTables:
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = start + len(block_ids)
 
+    def replace_tail_block_ids(
+        self,
+        req_index: int,
+        num_trimmed: tuple[int, ...],
+        new_block_ids: tuple[list[int], ...] | None,
+    ) -> None:
+        """Drop the last `num_trimmed` (scheduler) blocks per group, then append
+        `new_block_ids`.
+
+        One staged write per group covers both: the staged writes of a step
+        run in parallel, so an overlapping zero-then-append pair would race.
+        Vacated entries are zeroed because mamba kernels dereference every
+        slot of their state window and skip only the null block.
+        """
+        for i in range(self.num_kv_cache_groups):
+            bpk = self.blocks_per_kv_block[i]
+            block_ids = new_block_ids[i] if new_block_ids is not None else []
+            if bpk > 1:
+                block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
+            end = int(self.num_blocks.np[i, req_index])
+            start = max(end - num_trimmed[i] * bpk, 0)
+            contents = block_ids + [0] * max(end - start - len(block_ids), 0)
+            self.block_tables[i].stage_write(req_index, start, contents)
+            self.num_blocks.np[i, req_index] = start + len(block_ids)
+
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
             return

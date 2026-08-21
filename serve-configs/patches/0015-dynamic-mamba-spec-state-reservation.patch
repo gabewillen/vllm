@@ -1,0 +1,702 @@
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index f5cd79b285..89546d71b1 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -166,6 +166,7 @@ class KVCacheCoordinator(ABC):
+         num_local_computed_tokens: int,
+         num_tokens_main_model: int,
+         apply_admission_cap: bool = False,
++        num_draft_tokens: int | None = None,
+     ) -> int:
+         """
+         Get the number of blocks needed to be allocated for the request.
+@@ -188,6 +189,9 @@ class KVCacheCoordinator(ABC):
+                 per-request admission cap (SWA / chunked-local). Set only by
+                 the full-sequence admission gate; per-step allocation must
+                 leave it False so the predictor matches `allocate_new_blocks`.
++            num_draft_tokens: Draft tokens verified for the request this step;
++                sizes the speculative state slots of Mamba layers. `None`
++                keeps their current reservation.
+ 
+         Returns:
+             The number of blocks to allocate.
+@@ -215,6 +219,7 @@ class KVCacheCoordinator(ABC):
+                     num_local_computed_tokens,
+                     num_tokens_main_model,
+                     apply_admission_cap=apply_admission_cap,
++                    num_draft_tokens=num_draft_tokens,
+                 )
+         return num_blocks_to_allocate
+ 
+@@ -270,6 +275,7 @@ class KVCacheCoordinator(ABC):
+         num_tokens: int,
+         num_tokens_main_model: int,
+         num_encoder_tokens: int = 0,
++        num_draft_tokens: int | None = None,
+     ) -> tuple[list[KVCacheBlock], ...]:
+         """
+         Allocate new blocks for the request to give it at least `num_tokens`
+@@ -284,6 +290,8 @@ class KVCacheCoordinator(ABC):
+                 with spec decode, it is num_tokens - num_lookahead_tokens.
+             num_encoder_tokens: The number of encoder tokens for allocating
+                 blocks for cross-attention.
++            num_draft_tokens: Draft tokens verified for the request this step;
++                see `get_num_blocks_to_allocate`.
+ 
+         Returns:
+             The new allocated blocks.
+@@ -295,10 +303,20 @@ class KVCacheCoordinator(ABC):
+                 if isinstance(manager, CrossAttentionManager)
+                 else num_tokens,
+                 num_tokens_main_model,
++                num_draft_tokens=num_draft_tokens,
+             )
+             for manager in self.single_type_managers
+         )
+ 
++    def take_block_trims(self) -> dict[str, tuple[int, ...]]:
++        """Tail blocks dropped per request and KV cache group this step."""
++        trims: dict[str, list[int]] = {}
++        num_groups = len(self.single_type_managers)
++        for i, manager in enumerate(self.single_type_managers):
++            for request_id, num_blocks in manager.take_pending_trims().items():
++                trims.setdefault(request_id, [0] * num_groups)[i] = num_blocks
++        return {req_id: tuple(counts) for req_id, counts in trims.items()}
++
+     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+         """
+         Cache the blocks for the request.
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 44097c3da2..92ed12076a 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -357,6 +357,7 @@ class KVCacheManager:
+         full_sequence_must_fit: bool = False,
+         reserved_blocks: int = 0,
+         has_scheduled_reqs: bool = True,
++        num_draft_tokens: int | None = None,
+     ) -> KVCacheBlocks | None:
+         """Add slots for a request with new tokens to append.
+ 
+@@ -389,6 +390,10 @@ class KVCacheManager:
+                 blocks an already in-flight (prefilling) sequence is relying on.
+             has_scheduled_reqs: Whether any requests are already scheduled to run
+                 this step, controls whether watermark is applied.
++            num_draft_tokens: Draft tokens of `num_new_tokens` that this step
++                verifies. Mamba layers keep one state slot per verified draft
++                and size that reservation by it; `None` keeps the reservation
++                the request already holds.
+ 
+         Blocks layout:
+         ```
+@@ -519,6 +524,7 @@ class KVCacheManager:
+             + num_external_computed_tokens,
+             num_local_computed_tokens=num_local_computed_tokens,
+             num_tokens_main_model=num_tokens_main_model,
++            num_draft_tokens=num_draft_tokens,
+         )
+ 
+         # Keep `reserved_blocks` free for other in-flight sequences, and an
+@@ -547,6 +553,7 @@ class KVCacheManager:
+             num_tokens_need_slot,
+             num_tokens_main_model,
+             num_encoder_tokens,
++            num_draft_tokens=num_draft_tokens,
+         )
+ 
+         # P/D: delay caching blocks if we have to recv from
+@@ -837,6 +844,16 @@ class KVCacheManager:
+                 blocks = mgr.req_to_blocks[request_id]
+                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
+ 
++    def take_block_trims(self) -> dict[str, tuple[int, ...]]:
++        """Tail blocks dropped from running requests' block tables this step.
++
++        Returns:
++            Per request, the number of blocks removed from the end of its
++            block table in each KV cache group. The worker applies these
++            before appending the step's new blocks.
++        """
++        return self.coordinator.take_block_trims()
++
+     def take_kv_cache_block_copies(
+         self,
+     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 51416ff5d5..38ff400ebb 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -128,6 +128,10 @@ class CachedRequestData:
+     new_block_ids: list[tuple[list[int], ...] | None]
+     num_computed_tokens: list[int]
+     num_output_tokens: list[int]
++    # Tail blocks to drop from a running request's block table, per KV cache
++    # group, before its new_block_ids are appended. Only requests whose
++    # reservation shrank this step (e.g. Mamba speculative state slots).
++    trimmed_block_counts: dict[str, tuple[int, ...]] = field(default_factory=dict)
+ 
+     # Version of dataclass repr with token IDs obfuscated.
+     def anon_repr(self) -> str:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index f7093b144e..ef7b937efe 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -732,6 +732,10 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            # Draft tokens of this step's window; Mamba layers reserve one
++            # state slot per verified draft.
++            num_draft_tokens = self._num_scheduled_draft_tokens(request, num_new_tokens)
++
+             # Schedule newly needed KV blocks for the request.
+             with record_function_or_nullcontext("schedule: allocate_slots"):
+                 while True:
+@@ -739,12 +743,21 @@ class Scheduler(SchedulerInterface):
+                         request,
+                         num_new_tokens,
+                         num_lookahead_tokens=self.num_lookahead_tokens,
++                        num_draft_tokens=num_draft_tokens,
+                     )
+ 
+                     if new_blocks is not None:
+                         # The request can be scheduled.
+                         break
+ 
++                    if num_draft_tokens > 0:
++                        # Verifying the drafts would not fit; run the step
++                        # without them before taking blocks from anyone else.
++                        num_new_tokens -= num_draft_tokens
++                        num_draft_tokens = 0
++                        request.spec_token_ids = []
++                        continue
++
+                     # The request cannot be scheduled.
+                     # Preempt the lowest-priority request.
+                     if self.policy == SchedulingPolicy.PRIORITY:
+@@ -810,17 +823,10 @@ class Scheduler(SchedulerInterface):
+ 
+             # Speculative decode related.
+             if request.spec_token_ids:
+-                num_scheduled_spec_tokens = (
+-                    num_new_tokens
+-                    + request.num_computed_tokens
+-                    - request.num_tokens
+-                    - request.num_output_placeholders
+-                )
+-                if num_scheduled_spec_tokens > 0:
+-                    spec_token_ids = request.spec_token_ids
+-                    if len(spec_token_ids) > num_scheduled_spec_tokens:
+-                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+-                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
++                if num_draft_tokens > 0:
++                    scheduled_spec_decode_tokens[request.request_id] = (
++                        request.spec_token_ids[:num_draft_tokens]
++                    )
+ 
+                 # New spec tokens will be set in `update_draft_token_ids` before the
+                 # next step when applicable.
+@@ -1353,6 +1359,7 @@ class Scheduler(SchedulerInterface):
+                 num_scheduled_tokens,
+                 scheduled_spec_decode_tokens,
+                 req_to_new_blocks,
++                self.kv_cache_manager.take_block_trims(),
+             )
+ 
+         # Record the request ids that were scheduled in this step (MRV1-only).
+@@ -1616,6 +1623,19 @@ class Scheduler(SchedulerInterface):
+         if self.log_stats:
+             session.record_event(EngineCoreEventType.QUEUED)
+ 
++    @staticmethod
++    def _num_scheduled_draft_tokens(request: Request, num_new_tokens: int) -> int:
++        """Draft tokens of `request.spec_token_ids` inside this step's window."""
++        if not request.spec_token_ids:
++            return 0
++        num_in_window = (
++            num_new_tokens
++            + request.num_computed_tokens
++            - request.num_tokens
++            - request.num_output_placeholders
++        )
++        return max(0, min(len(request.spec_token_ids), num_in_window))
++
+     def _make_cached_request_data(
+         self,
+         running_reqs: list[Request],
+@@ -1623,6 +1643,7 @@ class Scheduler(SchedulerInterface):
+         num_scheduled_tokens: dict[str, int],
+         spec_decode_tokens: dict[str, list[int]],
+         req_to_new_blocks: dict[str, KVCacheBlocks],
++        block_trims: dict[str, tuple[int, ...]] | None = None,
+     ) -> CachedRequestData:
+         req_ids: list[str] = []
+         new_token_ids: list[list[int]] = []
+@@ -1633,6 +1654,13 @@ class Scheduler(SchedulerInterface):
+         resumed_req_ids = set()
+ 
+         num_running_reqs = len(running_reqs)
++        # Resumed requests ship their whole block table, so a trim only
++        # concerns requests that stay on the append path.
++        trimmed_block_counts = {
++            req.request_id: block_trims[req.request_id]
++            for req in running_reqs
++            if block_trims and req.request_id in block_trims
++        }
+         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
+             req_id = req.request_id
+             req_ids.append(req_id)
+@@ -1673,6 +1701,7 @@ class Scheduler(SchedulerInterface):
+             new_block_ids=new_block_ids,
+             num_computed_tokens=num_computed_tokens,
+             num_output_tokens=num_output_tokens,
++            trimmed_block_counts=trimmed_block_counts,
+         )
+ 
+     def _try_schedule_encoder_inputs(
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 75acb7f497..1e65801c2c 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -111,6 +111,9 @@ class SingleTypeKVCacheManager(ABC):
+         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
+         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
+         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
++        # Tail blocks dropped from a running request's block table this step,
++        # to be mirrored by the worker before it appends the new blocks.
++        self._pending_trims: dict[str, int] = {}
+         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+         # Partial-tail offload hand-off for external KV connectors: when a
+         # producer registers its last-prompt-boundary partial tail and the
+@@ -147,6 +150,7 @@ class SingleTypeKVCacheManager(ABC):
+         num_local_computed_tokens: int,
+         num_tokens_main_model: int,
+         apply_admission_cap: bool = False,
++        num_draft_tokens: int | None = None,
+     ) -> int:
+         """
+         Get the number of blocks needed to be allocated for the request.
+@@ -167,6 +171,9 @@ class SingleTypeKVCacheManager(ABC):
+             apply_admission_cap: If True, clamp by `num_required_blocks` by
+                 `_max_admission_blocks_per_request`for recycling-aware specs
+                 (SWA, chunked-local).
++            num_draft_tokens: Draft tokens verified for this request in this
++                step. Managers that keep per-draft state (Mamba) size their
++                speculative slots by it; `None` keeps the current reservation.
+ 
+         Returns:
+             The number of blocks to allocate.
+@@ -325,7 +332,11 @@ class SingleTypeKVCacheManager(ABC):
+             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
+ 
+     def allocate_new_blocks(
+-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
++        self,
++        request_id: str,
++        num_tokens: int,
++        num_tokens_main_model: int,
++        num_draft_tokens: int | None = None,
+     ) -> list[KVCacheBlock]:
+         """
+         Allocate new blocks for the request to give it at least `num_tokens`
+@@ -338,6 +349,8 @@ class SingleTypeKVCacheManager(ABC):
+             num_tokens_main_model: The number of tokens for the main model (aka target
+                 model in spec decode). w/o spec decode, it is num_tokens;
+                 with spec decode, it is num_tokens - num_lookahead_tokens.
++            num_draft_tokens: Draft tokens verified for this request in this
++                step; see `get_num_blocks_to_allocate`.
+         Returns:
+             The new allocated blocks.
+         """
+@@ -494,6 +507,30 @@ class SingleTypeKVCacheManager(ABC):
+         """
+         return None
+ 
++    def take_pending_trims(self) -> dict[str, int]:
++        """Return and clear the tail-block trims recorded this step."""
++        if not self._pending_trims:
++            return {}
++        trims = self._pending_trims
++        self._pending_trims = {}
++        return trims
++
++    def _trim_tail_blocks(self, request_id: str, num_blocks: int) -> None:
++        """Free the last `num_blocks` blocks of a running request.
++
++        The worker's block table is append-only, so the trim is recorded for
++        the scheduler to ship with this step's `CachedRequestData`.
++        """
++        if num_blocks <= 0:
++            return
++        blocks = self.req_to_blocks[request_id]
++        tail = blocks[len(blocks) - num_blocks :]
++        del blocks[len(blocks) - num_blocks :]
++        self.block_pool.free_blocks(reversed(tail))
++        self._pending_trims[request_id] = (
++            self._pending_trims.get(request_id, 0) + num_blocks
++        )
++
+     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+         """
+         Pop the request's bookkeeping and return its blocks without yet
+@@ -1278,6 +1315,12 @@ class MambaManager(SingleTypeKVCacheManager):
+         self.block_size = kv_cache_spec.block_size
+         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
++        # Speculative state slots a request holds right now, and the draft
++        # counts it verified in the last two steps. A slot is released only
++        # once no step that may still read it (the previous one, plus the one
++        # in flight under async scheduling) needed it; see `_spec_slots_for`.
++        self._spec_slots: dict[str, int] = {}
++        self._draft_history: dict[str, tuple[int, int]] = {}
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+         if self.mamba_cache_mode == "align":
+             # Mapping from request ID to the index of the block
+@@ -1464,6 +1507,41 @@ class MambaManager(SingleTypeKVCacheManager):
+         """
+         return 0
+ 
++    def _spec_slots_for(
++        self, request_id: str, num_tokens: int, num_draft_tokens: int | None
++    ) -> tuple[int, int]:
++        """Speculative state slots to hold after this step's allocation.
++
++        The kernel writes one state per verified token and reads the next
++        step's initial state from the slot of the last accepted one, so a
++        request needs `max` over the drafts of this step and the two before it
++        (the previous step, and the one still in flight under async
++        scheduling). A shrink is deferred on a step that also moves the running
++        state block (block crossing) or follows an over-allocation, so the
++        freed blocks are always the window's unused tail.
++
++        Returns:
++            `(slots_after, slots_held)`.
++        """
++        held = self._spec_slots.get(request_id, 0)
++        if num_draft_tokens is None or self.num_speculative_blocks == 0:
++            return held, held
++        history = self._draft_history.get(request_id, (0, 0))
++        target = min(self.num_speculative_blocks, max(num_draft_tokens, *history))
++        if target < held:
++            num_state_blocks = cdiv(num_tokens, self.block_size)
++            if len(self.req_to_blocks[request_id]) != num_state_blocks + held:
++                return held, held
++        return target, held
++
++    def _commit_spec_slots(
++        self, request_id: str, slots: int, num_draft_tokens: int | None
++    ) -> None:
++        self._spec_slots[request_id] = slots
++        if num_draft_tokens is not None:
++            prev, _ = self._draft_history.get(request_id, (0, 0))
++            self._draft_history[request_id] = (num_draft_tokens, prev)
++
+     def get_num_blocks_to_allocate(
+         self,
+         request_id: str,
+@@ -1473,6 +1551,7 @@ class MambaManager(SingleTypeKVCacheManager):
+         num_local_computed_tokens: int,
+         num_tokens_main_model: int,
+         apply_admission_cap: bool = False,
++        num_draft_tokens: int | None = None,
+     ) -> int:
+         assert isinstance(self.kv_cache_spec, MambaSpec)
+         if (
+@@ -1485,12 +1564,12 @@ class MambaManager(SingleTypeKVCacheManager):
+             # and don't schedule it in the current step.
+             return self.block_pool.num_gpu_blocks + 1
+         if self.mamba_cache_mode != "align":
+-            # Allocate extra `num_speculative_blocks` blocks for
+-            # speculative decoding (MTP/EAGLE) with linear attention.
+-            if self.num_speculative_blocks > 0:
+-                num_tokens += (
+-                    self.kv_cache_spec.block_size * self.num_speculative_blocks
+-                )
++            # Allocate extra state blocks for the speculative tokens this step
++            # verifies (MTP/EAGLE) with linear attention.
++            num_spec_blocks, _ = self._spec_slots_for(
++                request_id, num_tokens, num_draft_tokens
++            )
++            num_tokens += self.kv_cache_spec.block_size * num_spec_blocks
+             return super().get_num_blocks_to_allocate(
+                 request_id,
+                 num_tokens,
+@@ -1507,12 +1586,13 @@ class MambaManager(SingleTypeKVCacheManager):
+             # We can ignore lookahead tokens because current draft models don't have
+             # mamba layers.
+             num_tokens = num_tokens_main_model
++            num_spec_blocks, num_spec_held = self._spec_slots_for(
++                request_id, num_tokens, num_draft_tokens
++            )
+ 
+             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
+             # num_tokens can include draft tokens that will later be rejected.
+-            num_required_blocks = (
+-                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+-            )
++            num_required_blocks = cdiv(num_tokens, self.block_size) + num_spec_blocks
+             num_new_blocks = (
+                 num_required_blocks
+                 - len(new_computed_blocks)
+@@ -1528,16 +1608,19 @@ class MambaManager(SingleTypeKVCacheManager):
+                 num_new_blocks = max(num_new_blocks, 0) + 1
+             if num_new_blocks > 0:
+                 if request_id in self._allocated_block_reqs:
+-                    # Old request. Needs at most 1 more blocks as we can reuse the
+-                    # speculative blocks in previous step.
+-                    num_new_blocks = 1 + int(has_partial_hit)
++                    # Old request. Needs at most one block for the running
++                    # state plus the speculative slots it grows by, as the
++                    # slots of the previous step are reused.
++                    num_new_blocks = (
++                        1
++                        + max(num_spec_blocks - num_spec_held, 0)
++                        + int(has_partial_hit)
++                    )
+                 else:
+                     # First prefill. Allocate 1 block for running state, the
+                     # speculative blocks, and one extra block if a partial cache
+                     # hit must be copy-on-written before the new tokens run.
+-                    num_new_blocks = (
+-                        1 + self.num_speculative_blocks + int(has_partial_hit)
+-                    )
++                    num_new_blocks = 1 + num_spec_blocks + int(has_partial_hit)
+ 
+             num_evictable_computed_blocks = self._get_num_evictable_blocks(
+                 new_computed_blocks
+@@ -1545,17 +1628,28 @@ class MambaManager(SingleTypeKVCacheManager):
+             return num_new_blocks + num_evictable_computed_blocks
+ 
+     def allocate_new_blocks(
+-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
++        self,
++        request_id: str,
++        num_tokens: int,
++        num_tokens_main_model: int,
++        num_draft_tokens: int | None = None,
+     ) -> list[KVCacheBlock]:
+         assert isinstance(self.kv_cache_spec, MambaSpec)
+         if self.mamba_cache_mode != "align":
+-            # Allocate extra `num_speculative_blocks` blocks for
+-            # speculative decoding (MTP/EAGLE) with linear attention.
+-            if self.num_speculative_blocks > 0:
+-                num_tokens += self.block_size * self.num_speculative_blocks
+-            return super().allocate_new_blocks(
+-                request_id, num_tokens, num_tokens_main_model
++            # Allocate extra state blocks for the speculative tokens this step
++            # verifies (MTP/EAGLE) with linear attention.
++            num_spec_blocks, num_spec_held = self._spec_slots_for(
++                request_id, num_tokens, num_draft_tokens
++            )
++            new_blocks = super().allocate_new_blocks(
++                request_id,
++                num_tokens + self.block_size * num_spec_blocks,
++                num_tokens_main_model,
+             )
++            if num_spec_blocks < num_spec_held:
++                self._trim_tail_blocks(request_id, num_spec_held - num_spec_blocks)
++            self._commit_spec_slots(request_id, num_spec_blocks, num_draft_tokens)
++            return new_blocks
+         else:
+             # We don't allocate blocks for lookahead tokens in align mode, because if
+             # x * block_size tokens are scheduled, num_tokens is
+@@ -1564,13 +1658,19 @@ class MambaManager(SingleTypeKVCacheManager):
+             # mamba layers.
+             num_tokens = num_tokens_main_model
+             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
++            num_spec_blocks, num_spec_held = self._spec_slots_for(
++                request_id, num_tokens, num_draft_tokens
++            )
++            self._commit_spec_slots(request_id, num_spec_blocks, num_draft_tokens)
+             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
+             # num_tokens can include draft tokens that will later be rejected.
+-            num_required_blocks = (
+-                cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
+-            )
++            num_required_blocks = cdiv(num_tokens, self.block_size) + num_spec_blocks
+             partial_hit = self._partial_hit_reqs.get(request_id)
+             has_partial_hit = partial_hit is not None
++            if num_spec_blocks < num_spec_held:
++                # The window is the block table's tail (checked by
++                # `_spec_slots_for`), so the surplus slots are its last blocks.
++                self._trim_tail_blocks(request_id, num_spec_held - num_spec_blocks)
+             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
+             # over-allocated at last round.
+             if num_required_blocks <= len(req_blocks) and not has_partial_hit:
+@@ -1582,18 +1682,16 @@ class MambaManager(SingleTypeKVCacheManager):
+                 # Record the last state block
+                 if blocks_allocated:
+                     # We always save the running state at the last
+-                    # (1 + num_speculative_blocks) block
++                    # (1 + num_spec_held) block
+                     self.last_state_block_idx[request_id] = (
+-                        prev_block_len - 1 - self.num_speculative_blocks
++                        prev_block_len - 1 - num_spec_held
+                     )
+                 elif prev_block_len > 0:
+                     # When a new request hits the prefix cache, the last block
+                     # saves the hit state.
+                     self.last_state_block_idx[request_id] = prev_block_len - 1
+ 
+-                num_skipped_blocks = (
+-                    num_required_blocks - self.num_speculative_blocks - 1
+-                )
++                num_skipped_blocks = num_required_blocks - num_spec_blocks - 1
+                 # null blocks
+                 if prev_block_len < num_skipped_blocks:
+                     req_blocks.extend(
+@@ -1606,7 +1704,7 @@ class MambaManager(SingleTypeKVCacheManager):
+                 if blocks_allocated:
+                     # reuse previous speculative blocks in this step
+                     for block_idx in range(
+-                        prev_block_len - self.num_speculative_blocks, prev_block_len
++                        prev_block_len - num_spec_held, prev_block_len
+                     ):
+                         if block_idx < num_skipped_blocks:
+                             req_blocks.append(req_blocks[block_idx])
+@@ -1617,11 +1715,11 @@ class MambaManager(SingleTypeKVCacheManager):
+                 if has_partial_hit:
+                     num_new_blocks = max(num_new_blocks, 0) + 1
+                 if blocks_allocated:
+-                    assert num_new_blocks <= 1 + int(has_partial_hit)
++                    assert num_new_blocks <= 1 + max(
++                        num_spec_blocks - num_spec_held, 0
++                    ) + int(has_partial_hit)
+                 else:
+-                    assert num_new_blocks <= self.num_speculative_blocks + 1 + int(
+-                        has_partial_hit
+-                    )
++                    assert num_new_blocks <= num_spec_blocks + 1 + int(has_partial_hit)
+                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                 returned_blocks = req_blocks[prev_block_len:]
+                 if partial_hit is not None:
+@@ -1667,6 +1765,9 @@ class MambaManager(SingleTypeKVCacheManager):
+                 return returned_blocks
+ 
+     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
++        self._spec_slots.pop(request_id, None)
++        self._draft_history.pop(request_id, None)
++        self._pending_trims.pop(request_id, None)
+         if self.mamba_cache_mode == "align":
+             self._allocated_block_reqs.discard(request_id)
+             self.last_state_block_idx.pop(request_id, None)
+diff --git a/vllm/v1/worker/block_table.py b/vllm/v1/worker/block_table.py
+index 85228364af..9e393aea56 100644
+--- a/vllm/v1/worker/block_table.py
++++ b/vllm/v1/worker/block_table.py
+@@ -157,6 +157,22 @@ class BlockTable:
+         self.num_blocks_per_row[row_idx] = 0
+         self.append_row(block_ids, row_idx)
+ 
++    def trim_row(self, num_blocks: int, row_idx: int) -> None:
++        """Drop the last `num_blocks` (scheduler) blocks of a row.
++
++        The vacated entries are zeroed: mamba kernels dereference every slot
++        of their state window and skip the null block, and dummy runs read
++        stale rows.
++        """
++        if num_blocks <= 0:
++            return
++        if self.use_hybrid_blocks:
++            num_blocks *= self.blocks_per_kv_block
++        end = self.num_blocks_per_row[row_idx]
++        start = max(end - num_blocks, 0)
++        self.block_table.np[row_idx, start:end] = 0
++        self.num_blocks_per_row[row_idx] = start
++
+     def clear_row(self, row_idx: int) -> None:
+         num_blocks = self.num_blocks_per_row[row_idx]
+         if num_blocks > 0:
+@@ -342,6 +358,10 @@ class MultiGroupBlockTable:
+         for i, block_table in enumerate(self.block_tables):
+             block_table.add_row(block_ids[i], row_idx)
+ 
++    def trim_row(self, num_blocks: tuple[int, ...], row_idx: int) -> None:
++        for i, block_table in enumerate(self.block_tables):
++            block_table.trim_row(num_blocks[i], row_idx)
++
+     def clear_row(self, row_idx: int) -> None:
+         for block_table in self.block_tables:
+             block_table.clear_row(row_idx)
+diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
+index 90fc104dc2..a6b3e20e05 100644
+--- a/vllm/v1/worker/gpu/block_table.py
++++ b/vllm/v1/worker/gpu/block_table.py
+@@ -119,6 +119,31 @@ class BlockTables:
+             self.block_tables[i].stage_write(req_index, start, block_ids)
+             self.num_blocks.np[i, req_index] = start + len(block_ids)
+ 
++    def replace_tail_block_ids(
++        self,
++        req_index: int,
++        num_trimmed: tuple[int, ...],
++        new_block_ids: tuple[list[int], ...] | None,
++    ) -> None:
++        """Drop the last `num_trimmed` (scheduler) blocks per group, then append
++        `new_block_ids`.
++
++        One staged write per group covers both: the staged writes of a step
++        run in parallel, so an overlapping zero-then-append pair would race.
++        Vacated entries are zeroed because mamba kernels dereference every
++        slot of their state window and skip only the null block.
++        """
++        for i in range(self.num_kv_cache_groups):
++            bpk = self.blocks_per_kv_block[i]
++            block_ids = new_block_ids[i] if new_block_ids is not None else []
++            if bpk > 1:
++                block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
++            end = int(self.num_blocks.np[i, req_index])
++            start = max(end - num_trimmed[i] * bpk, 0)
++            contents = block_ids + [0] * max(end - start - len(block_ids), 0)
++            self.block_tables[i].stage_write(req_index, start, contents)
++            self.num_blocks.np[i, req_index] = start + len(block_ids)
++
+     def apply_staged_writes(self) -> None:
+         if self.num_kv_cache_groups == 0:
+             return
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 77a65a8da3..4b04304b2b 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1011,7 +1011,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         ):
+             req_index = self.req_states.req_id_to_index[req_id]
+             num_computed_tokens_np[req_index] = num_computed_tokens
+-            if req_new_block_ids is not None:
++            trimmed_blocks = reqs.trimmed_block_counts.get(req_id)
++            if trimmed_blocks is not None:
++                self.block_tables.replace_tail_block_ids(
++                    req_index, trimmed_blocks, req_new_block_ids
++                )
++            elif req_new_block_ids is not None:
+                 self.block_tables.append_block_ids(
+                     req_index, req_new_block_ids, overwrite=False
+                 )
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index afd715d14e..4da56dc9fe 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1512,7 +1512,14 @@ class GPUModelRunner(
+                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
+ 
+             # Update the block IDs.
++            trimmed_blocks = req_data.trimmed_block_counts.get(req_id)
+             if not resumed_from_preemption:
++                if trimmed_blocks is not None:
++                    for block_ids, num_trimmed in zip(
++                        req_state.block_ids, trimmed_blocks
++                    ):
++                        if num_trimmed > 0:
++                            del block_ids[len(block_ids) - num_trimmed :]
+                 if new_block_ids is not None:
+                     # Append the new blocks to the existing block IDs.
+                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
+@@ -1543,6 +1550,8 @@ class GPUModelRunner(
+ 
+             # Update the persistent batch.
+             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
++            if trimmed_blocks is not None:
++                self.input_batch.block_table.trim_row(trimmed_blocks, req_index)
+             if new_block_ids is not None:
+                 self.input_batch.block_table.append_row(new_block_ids, req_index)
+ 

@@ -166,6 +166,7 @@ class KVCacheCoordinator(ABC):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        num_draft_tokens: int | None = None,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -188,6 +189,9 @@ class KVCacheCoordinator(ABC):
                 per-request admission cap (SWA / chunked-local). Set only by
                 the full-sequence admission gate; per-step allocation must
                 leave it False so the predictor matches `allocate_new_blocks`.
+            num_draft_tokens: Draft tokens verified for the request this step;
+                sizes the speculative state slots of Mamba layers. `None`
+                keeps their current reservation.
 
         Returns:
             The number of blocks to allocate.
@@ -215,6 +219,7 @@ class KVCacheCoordinator(ABC):
                     num_local_computed_tokens,
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
+                    num_draft_tokens=num_draft_tokens,
                 )
         return num_blocks_to_allocate
 
@@ -270,6 +275,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
+        num_draft_tokens: int | None = None,
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -284,6 +290,8 @@ class KVCacheCoordinator(ABC):
                 with spec decode, it is num_tokens - num_lookahead_tokens.
             num_encoder_tokens: The number of encoder tokens for allocating
                 blocks for cross-attention.
+            num_draft_tokens: Draft tokens verified for the request this step;
+                see `get_num_blocks_to_allocate`.
 
         Returns:
             The new allocated blocks.
@@ -295,9 +303,19 @@ class KVCacheCoordinator(ABC):
                 if isinstance(manager, CrossAttentionManager)
                 else num_tokens,
                 num_tokens_main_model,
+                num_draft_tokens=num_draft_tokens,
             )
             for manager in self.single_type_managers
         )
+
+    def take_block_trims(self) -> dict[str, tuple[int, ...]]:
+        """Tail blocks dropped per request and KV cache group this step."""
+        trims: dict[str, list[int]] = {}
+        num_groups = len(self.single_type_managers)
+        for i, manager in enumerate(self.single_type_managers):
+            for request_id, num_blocks in manager.take_pending_trims().items():
+                trims.setdefault(request_id, [0] * num_groups)[i] = num_blocks
+        return {req_id: tuple(counts) for req_id, counts in trims.items()}
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """

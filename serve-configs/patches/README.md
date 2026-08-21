@@ -1,7 +1,7 @@
 # vLLM patches for the Qwen3.8-27B deployment
 
 **These patches are now commits on this branch.** `qwen3.8-27B` is upstream
-`acb0f1dcd` (`vllm 0.27.2rc1.dev110+gacb0f1dcd`) with the nine changes below
+`acb0f1dcd` (`vllm 0.27.2rc1.dev110+gacb0f1dcd`) with the ten changes below
 applied in order, so the deployment installs directly:
 
 ```bash
@@ -23,6 +23,8 @@ upstream base.
 | `084ccc5b9` | 0007 GDN in_proj_ba skinny GEMM |
 | `4b3a669a2` | 0008 qwen3_5 quantized target lm_head |
 | `qwen3.8-27B` (merge of `qwen3.8-27B-effort-v3`, 2026-08-21) | 0009 dynamic reasoning effort v3 - per-request telemetry + hidden-state level routing; the v1 ladder/caps and v2 rank rule/soft-limit were removed, this is the only implementation |
+| 0015 v1/core/{single_type_kv_cache_manager.py, kv_cache_coordinator.py, kv_cache_manager.py}, v1/core/sched/{output.py, scheduler.py}, v1/worker/{block_table.py, gpu_model_runner.py}, v1/worker/gpu/{block_table.py, model_runner.py} | **Dynamic Mamba speculative-state reservation.** A Mamba/GDN layer keeps one copy of its recurrent state per verified draft token so a rejected draft can roll back; `MambaManager` reserved `num_speculative_tokens` of those slots per request at first prefill and kept them for the request's whole life. On Qwen3.8-27B one copy is 48 layers x 48x128x128 fp32 = 151 MB, so K=7 meant 9 copies = 1.36 GB per request (~35k attention-token equivalents against a 1.39M-token pool): the latency profile topped out at ~39 concurrent requests and thrashed above (c64: 206 tok/s, 139 preemptions, measured 2026-08-21) even though `num_speculative_tokens_per_batch_size` had already turned drafting off above batch 32 - the schedule was a knob on the proposer that the allocator never saw. Now (a) the scheduler passes each request's verified draft count for the step (`Scheduler._num_scheduled_draft_tokens` -> `KVCacheManager.allocate_slots(num_draft_tokens=...)` -> coordinator -> `MambaManager._spec_slots_for`), and the manager holds `max` over the drafts of this step and the two before it (the previous step reads the slot of its last accepted token as the initial state; under async scheduling the step in flight does too), capped at K; (b) surplus slots are freed as tail blocks and shipped to the worker as `CachedRequestData.trimmed_block_counts`, which both runners apply before appending the step's new blocks (`BlockTable.trim_row` / `BlockTables.replace_tail_block_ids`, one staged write so it cannot race the append; vacated entries are zeroed to the null block, which the kernels skip); a shrink is deferred on a step that also moves the running state block or follows an over-allocation, so only the window's unused tail is ever freed; (c) a request whose drafts would not fit is scheduled without them for that step instead of preempting someone; (d) `MambaSpec.max_memory_usage_bytes` still sizes the pool for full K, so profiling and the pool math are unchanged. The adaptive EMA draft length (0005) keeps working: the reservation follows what was actually drafted. General to any Mamba/GDN model and spec method, both cache modes (`align` and `none`/`all`). | Without it: every request on a hybrid model with MTP holds K+1 state copies from its first prefill to its last token whether or not it is drafting, so the concurrency ceiling is the state pool, not the KV pool. CPU tests: `tests/v1/core/test_mamba_spec_state_reservation.py` (slots follow the batch-size schedule across a boundary and back, release lag, drafts dropped before preemption, steady state = K+1 without a schedule; both cache modes), `tests/v1/worker/test_gpu_block_table.py::test_replace_tail_block_ids_trims_then_appends_in_one_write`; existing `tests/v1/core/test_prefix_caching.py` / `test_mamba_align_chunk_split.py` / `test_single_type_kv_cache_manager.py` / `test_scheduler.py` / `test_async_scheduler.py` unchanged (300 pass, 2 pre-existing structured-output failures) |
+| `qwen3.8-27B` (2026-08-21) | 0015 Mamba/GDN speculative state slots follow the per-step draft count instead of being reserved for the request's life |
 | `5e67ad3e4` | l4-configs: L4-tuned block-fp8 GEMM configs for the Qwen3.8-27B TP4 shapes |
 
 The rest of this file documents what each change does and why.
@@ -30,7 +32,7 @@ The rest of this file documents what each change does and why.
 ---
 
 
-None of these nine changes is in any vLLM release. Installing this branch
+None of these ten changes is in any vLLM release. Installing this branch
 carries all of them. If you instead run a stock wheel in a venv, apply them
 with `apply-to-venv.sh` after every venv rebuild, which silently drops them.
 

@@ -128,6 +128,10 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # Tail blocks to drop from a running request's block table, per KV cache
+    # group, before its new_block_ids are appended. Only requests whose
+    # reservation shrank this step (e.g. Mamba speculative state slots).
+    trimmed_block_counts: dict[str, tuple[int, ...]] = field(default_factory=dict)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:

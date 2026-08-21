@@ -732,6 +732,10 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            # Draft tokens of this step's window; Mamba layers reserve one
+            # state slot per verified draft.
+            num_draft_tokens = self._num_scheduled_draft_tokens(request, num_new_tokens)
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -739,11 +743,20 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_draft_tokens=num_draft_tokens,
                     )
 
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
+
+                    if num_draft_tokens > 0:
+                        # Verifying the drafts would not fit; run the step
+                        # without them before taking blocks from anyone else.
+                        num_new_tokens -= num_draft_tokens
+                        num_draft_tokens = 0
+                        request.spec_token_ids = []
+                        continue
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -810,17 +823,10 @@ class Scheduler(SchedulerInterface):
 
             # Speculative decode related.
             if request.spec_token_ids:
-                num_scheduled_spec_tokens = (
-                    num_new_tokens
-                    + request.num_computed_tokens
-                    - request.num_tokens
-                    - request.num_output_placeholders
-                )
-                if num_scheduled_spec_tokens > 0:
-                    spec_token_ids = request.spec_token_ids
-                    if len(spec_token_ids) > num_scheduled_spec_tokens:
-                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                if num_draft_tokens > 0:
+                    scheduled_spec_decode_tokens[request.request_id] = (
+                        request.spec_token_ids[:num_draft_tokens]
+                    )
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
@@ -1353,6 +1359,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
                 scheduled_spec_decode_tokens,
                 req_to_new_blocks,
+                self.kv_cache_manager.take_block_trims(),
             )
 
         # Record the request ids that were scheduled in this step (MRV1-only).
@@ -1616,6 +1623,19 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
 
+    @staticmethod
+    def _num_scheduled_draft_tokens(request: Request, num_new_tokens: int) -> int:
+        """Draft tokens of `request.spec_token_ids` inside this step's window."""
+        if not request.spec_token_ids:
+            return 0
+        num_in_window = (
+            num_new_tokens
+            + request.num_computed_tokens
+            - request.num_tokens
+            - request.num_output_placeholders
+        )
+        return max(0, min(len(request.spec_token_ids), num_in_window))
+
     def _make_cached_request_data(
         self,
         running_reqs: list[Request],
@@ -1623,6 +1643,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int],
         spec_decode_tokens: dict[str, list[int]],
         req_to_new_blocks: dict[str, KVCacheBlocks],
+        block_trims: dict[str, tuple[int, ...]] | None = None,
     ) -> CachedRequestData:
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
@@ -1633,6 +1654,13 @@ class Scheduler(SchedulerInterface):
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
+        # Resumed requests ship their whole block table, so a trim only
+        # concerns requests that stay on the append path.
+        trimmed_block_counts = {
+            req.request_id: block_trims[req.request_id]
+            for req in running_reqs
+            if block_trims and req.request_id in block_trims
+        }
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
             req_id = req.request_id
             req_ids.append(req_id)
@@ -1673,6 +1701,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            trimmed_block_counts=trimmed_block_counts,
         )
 
     def _try_schedule_encoder_inputs(

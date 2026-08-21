@@ -193,3 +193,42 @@ def test_get_dummy_block_tables_returns_zeroed_rows():
     assert (dummy[0] == 0).all()
     # CUDA graph invariant: same persistent tensor, not a fresh allocation.
     assert dummy[0].data_ptr() == block_tables.input_block_tables[0].data_ptr()
+
+
+def test_replace_tail_block_ids_trims_then_appends_in_one_write():
+    """A request whose Mamba speculative slots shrank ships a tail trim with
+    its new blocks. Both land in one staged write per group: staged writes
+    run in parallel, so a separate zero-then-append pair would race. The
+    vacated entries read as the null block."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16, 32],
+        max_num_reqs=2,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[8, 8],
+        device=device,
+        kernel_block_sizes=[16, 16],
+    )
+    block_tables.append_block_ids(
+        req_index=0, new_block_ids=([1, 2, 3, 4], [10, 11]), overwrite=True
+    )
+    block_tables.apply_staged_writes()
+
+    # Group 0: drop 3, append 1. Group 1 (two kernel blocks per KV block):
+    # drop 1, append nothing.
+    block_tables.replace_tail_block_ids(
+        req_index=0, num_trimmed=(3, 1), new_block_ids=([7], [])
+    )
+    block_tables.apply_staged_writes()
+    torch.accelerator.synchronize()
+
+    assert torch.equal(
+        block_tables.block_tables[0].gpu[0, :4],
+        torch.tensor([1, 7, 0, 0], dtype=torch.int32, device=device),
+    )
+    assert torch.equal(
+        block_tables.block_tables[1].gpu[0, :4],
+        torch.tensor([20, 21, 0, 0], dtype=torch.int32, device=device),
+    )
+    assert block_tables.num_blocks.np[0, 0] == 2
+    assert block_tables.num_blocks.np[1, 0] == 2

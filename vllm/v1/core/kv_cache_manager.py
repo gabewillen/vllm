@@ -357,6 +357,7 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        num_draft_tokens: int | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -389,6 +390,10 @@ class KVCacheManager:
                 blocks an already in-flight (prefilling) sequence is relying on.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
+            num_draft_tokens: Draft tokens of `num_new_tokens` that this step
+                verifies. Mamba layers keep one state slot per verified draft
+                and size that reservation by it; `None` keeps the reservation
+                the request already holds.
 
         Blocks layout:
         ```
@@ -519,6 +524,7 @@ class KVCacheManager:
             + num_external_computed_tokens,
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
+            num_draft_tokens=num_draft_tokens,
         )
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
@@ -547,6 +553,7 @@ class KVCacheManager:
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
+            num_draft_tokens=num_draft_tokens,
         )
 
         # P/D: delay caching blocks if we have to recv from
@@ -836,6 +843,16 @@ class KVCacheManager:
                 start_idx = start_token // mgr.block_size
                 blocks = mgr.req_to_blocks[request_id]
                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
+
+    def take_block_trims(self) -> dict[str, tuple[int, ...]]:
+        """Tail blocks dropped from running requests' block tables this step.
+
+        Returns:
+            Per request, the number of blocks removed from the end of its
+            block table in each KV cache group. The worker applies these
+            before appending the step's new blocks.
+        """
+        return self.coordinator.take_block_trims()
 
     def take_kv_cache_block_copies(
         self,
