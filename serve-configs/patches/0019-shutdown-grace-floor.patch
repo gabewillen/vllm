@@ -1,40 +1,74 @@
-From d496432eaca6d0d56b19876423d7d0b4ebd59b61 Mon Sep 17 00:00:00 2001
+From d8fbc9e843ebcf2404c56cab017e2f29f97327ce Mon Sep 17 00:00:00 2001
 From: gwillen <gabewillen@gmail.com>
 Date: Fri, 21 Aug 2026 17:53:20 +0000
-Subject: [PATCH] Process shutdown: floor the SIGTERM grace at 5s so EngineCore
- runs its teardown
+Subject: [PATCH] Process shutdown: let EngineCore persist scheduler state
+ before it is killed
 
 core_client passes shutdown_timeout (default 0) straight to shutdown(), which
-then SIGKILLs EngineCore in the same second as the SIGTERM. The engine never
-reaches EngineCore.shutdown, so the executor teardown and Scheduler.shutdown
-(effort memory save, patch 0017) never ran on a systemctl restart - the
-afternoon's 225 memory entries were lost on 2026-08-21. _shutdown_subprocesses
-already floors its grace at 5s; do the same here.
+SIGKILLed EngineCore in the same second as the SIGTERM; with a floor of 5s
+(as _shutdown_subprocesses already has) the engine reaches its teardown, but
+the TP worker teardown ran first and outlasted the grace. Scheduler.shutdown
+now runs before the executor's and saves the effort memory as its first act,
+so a systemctl restart keeps what the server learned (on 2026-08-21 three
+restarts each lost the entries since the last 256-insert flush).
 ---
- vllm/v1/utils.py | 10 ++++++----
- 1 file changed, 6 insertions(+), 4 deletions(-)
+ vllm/v1/core/sched/scheduler.py | 15 +++++++++------
+ vllm/v1/engine/core.py          |  7 +++++--
+ 2 files changed, 14 insertions(+), 8 deletions(-)
 
-diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
-index 8d482f58fd..966f744c7b 100644
---- a/vllm/v1/utils.py
-+++ b/vllm/v1/utils.py
-@@ -597,10 +597,12 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
-         procs: List of processes to shutdown
-         timeout: Maximum time in seconds to wait for graceful shutdown
-     """
--    if timeout is None:
--        # Keep a small grace period for best-effort cleanup paths that do not
--        # have a user-configured shutdown timeout.
--        timeout = 5.0
-+    # `timeout` is the request-drain budget; a SIGTERMed process still needs a
-+    # few seconds of its own to run `EngineCore.shutdown` (executor teardown,
-+    # scheduler state such as the effort memory). Floor it like
-+    # `_shutdown_subprocesses` does, so timeout=0 means "abort requests now",
-+    # not "SIGKILL before the handler runs".
-+    timeout = max(timeout or 0.0, 5.0)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 6a8231c0c7..f52f599e3d 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3321,6 +3321,15 @@ class Scheduler(SchedulerInterface):
  
-     logger.debug(
-         "[shutdown] Process manager: start process_count=%d timeout=%ss names=%s",
+     def shutdown(self) -> None:
+         logger.debug_once("[shutdown] Scheduler: start")
++        if self._effort_memory is not None and self._effort_memory.n_entries:
++            try:
++                self._effort_memory.save()
++                logger.info(
++                    "dynamic_effort: memory saved on shutdown (%d entries)",
++                    self._effort_memory.n_entries,
++                )
++            except OSError:
++                logger.exception("dynamic_effort: memory save on shutdown failed")
+         if self.kv_event_publisher:
+             self.kv_event_publisher.shutdown()
+         if self.connector is not None:
+@@ -3329,12 +3338,6 @@ class Scheduler(SchedulerInterface):
+         if self.ec_connector is not None:
+             self.ec_connector.shutdown()
+ 
+-        if self._effort_memory is not None and self._effort_memory.n_entries:
+-            try:
+-                self._effort_memory.save()
+-            except OSError:
+-                logger.exception("dynamic_effort: memory save on shutdown failed")
+-
+         logger.debug_once("[shutdown] Scheduler: complete")
+ 
+     ########################################################################
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 55fe5b90c5..683288e1ae 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -748,10 +748,13 @@ class EngineCore:
+     def shutdown(self):
+         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
+         self.structured_output_manager.clear_backend()
+-        if self.model_executor:
+-            self.model_executor.shutdown()
++        # Scheduler first: its teardown persists host-side state (effort
++        # memory) and is quick, while the executor's worker teardown can
++        # outlast the process manager's grace period.
+         if self.scheduler:
+             self.scheduler.shutdown()
++        if self.model_executor:
++            self.model_executor.shutdown()
+ 
+         # Undo the gc.freeze() from __init__ so that the objects allocated
+         # during engine startup (model weights, KV caches, etc.) become
 -- 
 2.43.0
 
