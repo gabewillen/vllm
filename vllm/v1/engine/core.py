@@ -748,10 +748,13 @@ class EngineCore:
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
         self.structured_output_manager.clear_backend()
-        if self.model_executor:
-            self.model_executor.shutdown()
+        # Scheduler first: its teardown persists host-side state (effort
+        # memory) and is quick, while the executor's worker teardown can
+        # outlast the process manager's grace period.
         if self.scheduler:
             self.scheduler.shutdown()
+        if self.model_executor:
+            self.model_executor.shutdown()
 
         # Undo the gc.freeze() from __init__ so that the objects allocated
         # during engine startup (model weights, KV caches, etc.) become

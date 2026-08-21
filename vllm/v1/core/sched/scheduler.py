@@ -3321,6 +3321,15 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        if self._effort_memory is not None and self._effort_memory.n_entries:
+            try:
+                self._effort_memory.save()
+                logger.info(
+                    "dynamic_effort: memory saved on shutdown (%d entries)",
+                    self._effort_memory.n_entries,
+                )
+            except OSError:
+                logger.exception("dynamic_effort: memory save on shutdown failed")
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
@@ -3328,12 +3337,6 @@ class Scheduler(SchedulerInterface):
 
         if self.ec_connector is not None:
             self.ec_connector.shutdown()
-
-        if self._effort_memory is not None and self._effort_memory.n_entries:
-            try:
-                self._effort_memory.save()
-            except OSError:
-                logger.exception("dynamic_effort: memory save on shutdown failed")
 
         logger.debug_once("[shutdown] Scheduler: complete")
 

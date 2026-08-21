@@ -1,0 +1,40 @@
+From d496432eaca6d0d56b19876423d7d0b4ebd59b61 Mon Sep 17 00:00:00 2001
+From: gwillen <gabewillen@gmail.com>
+Date: Fri, 21 Aug 2026 17:53:20 +0000
+Subject: [PATCH] Process shutdown: floor the SIGTERM grace at 5s so EngineCore
+ runs its teardown
+
+core_client passes shutdown_timeout (default 0) straight to shutdown(), which
+then SIGKILLs EngineCore in the same second as the SIGTERM. The engine never
+reaches EngineCore.shutdown, so the executor teardown and Scheduler.shutdown
+(effort memory save, patch 0017) never ran on a systemctl restart - the
+afternoon's 225 memory entries were lost on 2026-08-21. _shutdown_subprocesses
+already floors its grace at 5s; do the same here.
+---
+ vllm/v1/utils.py | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
+index 8d482f58fd..966f744c7b 100644
+--- a/vllm/v1/utils.py
++++ b/vllm/v1/utils.py
+@@ -597,10 +597,12 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
+         procs: List of processes to shutdown
+         timeout: Maximum time in seconds to wait for graceful shutdown
+     """
+-    if timeout is None:
+-        # Keep a small grace period for best-effort cleanup paths that do not
+-        # have a user-configured shutdown timeout.
+-        timeout = 5.0
++    # `timeout` is the request-drain budget; a SIGTERMed process still needs a
++    # few seconds of its own to run `EngineCore.shutdown` (executor teardown,
++    # scheduler state such as the effort memory). Floor it like
++    # `_shutdown_subprocesses` does, so timeout=0 means "abort requests now",
++    # not "SIGKILL before the handler runs".
++    timeout = max(timeout or 0.0, 5.0)
+ 
+     logger.debug(
+         "[shutdown] Process manager: start process_count=%d timeout=%ss names=%s",
+-- 
+2.43.0
+
