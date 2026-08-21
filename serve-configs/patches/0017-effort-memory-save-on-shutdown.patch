@@ -1,0 +1,17 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index a5e874614f..9a675ac123 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3325,6 +3325,12 @@ class Scheduler(SchedulerInterface):
+         if self.ec_connector is not None:
+             self.ec_connector.shutdown()
+ 
++        if self._effort_memory is not None and self._effort_memory.n_entries:
++            try:
++                self._effort_memory.save()
++            except OSError:
++                logger.exception("dynamic_effort: memory save on shutdown failed")
++
+         logger.debug_once("[shutdown] Scheduler: complete")
+ 
+     ########################################################################

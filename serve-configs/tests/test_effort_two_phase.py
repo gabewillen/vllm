@@ -10,6 +10,8 @@ Every failure mode has to land on today's behaviour with a byte-identical
 prompt, because that is what makes the split safe to ship.
 """
 
+import os
+
 import numpy as np
 import pytest
 
@@ -321,6 +323,32 @@ def test_memory_records_the_finished_request():
     assert scheduler._effort_memory.n_valued == 1
     assert "a" not in scheduler._effort_vectors
     assert request.request_id not in scheduler._effort
+
+
+def test_shutdown_persists_the_memory(tmp_path):
+    """A restart must not discard what the server learned between flushes."""
+    path = str(tmp_path / "memory.npz")
+    scheduler = _scheduler(memory_path=path)
+    _add(scheduler, "a")
+    out = scheduler.schedule()
+    vector = np.ones(HIDDEN, dtype=np.float16)
+    scheduler.update_from_output(out, _runner_output(out, {"a": vector}))
+    tail = scheduler.schedule()
+    scheduler.update_from_output(tail, _runner_output(tail, sampled={"a": [START]}))
+    scheduler._effort["a"].think_count = 321
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _runner_output(step, sampled={"a": [END]}))
+    scheduler.finish_requests("a", RequestStatus.FINISHED_STOPPED)
+    assert scheduler._effort_memory.n_entries == 1
+    assert not os.path.exists(path)
+
+    scheduler.shutdown()
+
+    reloaded = EffortMemory(
+        HIDDEN, scheduler._effort_cfg.hidden_effort, model=MODEL, levels=NUM_LEVELS
+    )
+    assert reloaded.load()
+    assert reloaded.n_entries == 1
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
