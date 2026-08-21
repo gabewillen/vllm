@@ -192,5 +192,8 @@ tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
 attention-backend: TRITON_ATTN
 additional-config: '{"lm_head_dtype": "fp8"}'
+# Drain in-flight requests on stop/restart (up to 5 min) instead of aborting
+# them; systemd TimeoutStopSec must stay above this.
+shutdown-timeout: 300
 port: 8012
 middleware: ["vllm_keepalive.KeepAliveMiddleware"]

@@ -16,7 +16,7 @@ TimeoutStartSec=1800
 # Cgroup kill (default control-group) tears down all TP workers with the
 # parent, so no stale /dev/shm psm_* segments are left to wedge the next
 # start (manual SIGKILLs were the only source of those).
-TimeoutStopSec=60
+TimeoutStopSec=330
 Restart=on-failure
 RestartSec=15
 # Hardening that keeps the GPU/IPC paths working: no privilege escalation, a
