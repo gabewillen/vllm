@@ -229,12 +229,17 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
+    def get_computed_blocks(
+        self, request: Request, require_draft_complete: bool = False
+    ) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
+            require_draft_complete: Stop the hit at the first block whose
+                drafter KV is incomplete (lazy drafting), so a request that
+                will draft recomputes those tokens instead of reusing them.
 
         Returns:
             A tuple containing:
@@ -260,11 +265,15 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens, num_uncached = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+        self.block_pool.require_draft_complete = require_draft_complete
+        try:
+            computed_blocks, num_new_computed_tokens, num_uncached = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, max_cache_hit_length
+                )
             )
-        )
+        finally:
+            self.block_pool.require_draft_complete = False
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -709,6 +718,26 @@ class KVCacheManager:
             event.kv_cache_spec_kind = kind
             event.kv_cache_spec_sliding_window = sliding_window
         return events
+
+    def mark_draft_stale(self, request: Request, from_token: int) -> None:
+        """Flag the request's blocks from `from_token` on as lacking drafter KV.
+
+        Blocks entirely before it were computed with the drafter running, and
+        blocks inherited from the prefix cache keep their own mark.
+        """
+        hit_counts = request.num_prefix_hit_blocks
+        for group_id, group_blocks in enumerate(
+            self.coordinator.get_blocks(request.request_id)
+        ):
+            block_size = self.kv_cache_config.kv_cache_groups[
+                group_id
+            ].kv_cache_spec.block_size
+            start = from_token // block_size
+            if group_id < len(hit_counts):
+                start = max(start, hit_counts[group_id])
+            for block in group_blocks[start:]:
+                if block.block_hash is not None:
+                    block.draft_stale = True
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""

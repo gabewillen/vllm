@@ -234,6 +234,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+        # Skip the drafter entirely on steps the scheduler drafts nothing for;
+        # the scheduler tracks which requests lose draft completeness.
+        self.lazy_draft = (
+            self.speculative_config is not None and self.speculative_config.lazy_draft
+        )
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
@@ -1782,7 +1787,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        if self.speculator is not None and self.speculator.supports_mm_inputs:
+        skip_draft = self.lazy_draft and num_spec_tokens_to_schedule == 0
+        if (
+            self.speculator is not None
+            and self.speculator.supports_mm_inputs
+            and not skip_draft
+        ):
             # Get cached multimodal embeddings for draft forward.
             # NOTE: This is done here because postprocess updates
             # num_computed_prefill_tokens.
@@ -1806,7 +1816,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        if self.speculator is not None and skip_draft:
+            num_drafted = 0
+        elif self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The

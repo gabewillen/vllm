@@ -314,6 +314,28 @@ class Scheduler(SchedulerInterface):
             and self.num_spec_tokens > 1
         )
         self._accepted_ema: dict[str, float] = {}
+        # Lazy drafting: the runner skips the drafter on steps that schedule
+        # zero drafts. With a stateful drafter the requests of such a step
+        # (and the blocks they cache) lose draft completeness for good.
+        self.lazy_draft = (
+            speculative_config is not None
+            and speculative_config.lazy_draft
+            and vllm_config.use_v2_model_runner
+        )
+        if (
+            speculative_config is not None
+            and speculative_config.lazy_draft
+            and not self.lazy_draft
+        ):
+            logger.warning(
+                "speculative_config.lazy_draft needs the V2 model runner; "
+                "the drafter runs on every step."
+            )
+        self.lazy_draft_state = (
+            self.lazy_draft
+            and speculative_config is not None
+            and speculative_config.draft_keeps_state()
+        )
         # Dynamic reasoning effort: per-request controller state, pending
         # (unacked) budget updates, and relaxed repetition params.
         self._effort: dict[str, EffortState] = {}
@@ -526,14 +548,46 @@ class Scheduler(SchedulerInterface):
     def _get_local_prefix_cache_hit(
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
+        # A fresh lookup re-derives draft completeness from the blocks it hits.
+        request.draft_stale = False
         connector = self.connector
         if connector is not None and connector.supports_divergent_local_hybrid_hits:
             return self.kv_cache_manager.get_computed_blocks_for_connector(request)
 
         blocks, num_local, shared_prefix_boundary = (
-            self.kv_cache_manager.get_computed_blocks(request)
+            self.kv_cache_manager.get_computed_blocks(
+                request, require_draft_complete=self._will_draft(len(self.running))
+            )
         )
         return blocks, num_local, shared_prefix_boundary, False
+
+    def _will_draft(self, num_running: int) -> bool:
+        """Whether a request admitted into `num_running` others would draft.
+
+        Only an efficiency hint for prefix-cache lookups under lazy drafting:
+        a request that is going to draft must not inherit blocks with
+        incomplete drafter KV, one that is not may reuse them (and is then
+        marked stale by `_note_prefix_hit`).
+        """
+        if not self.lazy_draft_state:
+            return False
+        if self.dynamic_sd_lookup is None:
+            return True
+        batch_size = min(num_running + 1, len(self.dynamic_sd_lookup) - 1)
+        return self.dynamic_sd_lookup[batch_size] > 0
+
+    def _note_prefix_hit(self, request: Request, blocks: KVCacheBlocks) -> None:
+        """Record the reused blocks and inherit their draft staleness."""
+        if not self.lazy_draft_state:
+            return
+        request.num_prefix_hit_blocks = tuple(len(g) for g in blocks.blocks)
+        if request.draft_stale:
+            return
+        for group_blocks in blocks.blocks:
+            for block in group_blocks:
+                if block.draft_stale:
+                    request.draft_stale = True
+                    return
 
     def _reserve_prefill_lookahead(
         self,
@@ -1018,6 +1072,7 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+                    self._note_prefix_hit(request, new_computed_blocks)
 
                     # Skip request with pending mm encoding prefetches
                     if (
@@ -1405,6 +1460,16 @@ class Scheduler(SchedulerInterface):
                 num_spec_tokens_to_schedule,
                 self._adaptive_num_spec_tokens(scheduled_running_reqs),
             )
+        if self.lazy_draft_state and num_spec_tokens_to_schedule == 0:
+            # The runner will not run the drafter over this step's tokens;
+            # blocks already cached at allocation carry the same mark.
+            for req_id in num_scheduled_tokens:
+                request = self.requests[req_id]
+                if not request.draft_stale:
+                    request.draft_stale = True
+                    self.kv_cache_manager.mark_draft_stale(
+                        request, request.num_computed_tokens
+                    )
 
         scheduled_encoder_input_stats = None
         if (
@@ -1502,6 +1567,9 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        # Resuming recomputes every block the prefix cache cannot serve with
+        # complete drafter KV, so staleness is re-derived from the lookup.
+        request.draft_stale = False
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -2357,6 +2425,18 @@ class Scheduler(SchedulerInterface):
             finished_req_ids.clear()
 
         if (
+            self.lazy_draft
+            and self.log_stats
+            and scheduler_output.num_spec_tokens_to_schedule == 0
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            if spec_decoding_stats is None:
+                spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+            spec_decoding_stats.num_draft_skipped_tokens += (
+                scheduler_output.total_num_scheduled_tokens
+            )
+
+        if (
             stats := self.make_stats(
                 spec_decoding_stats,
                 kv_connector_stats,
@@ -2479,8 +2559,9 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
-            if request.is_prefill_chunk:
-                # Ignore draft tokens for prefill chunks.
+            if request.is_prefill_chunk or request.draft_stale:
+                # Ignore draft tokens for prefill chunks and for requests
+                # whose drafter state is incomplete (lazy drafting).
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue

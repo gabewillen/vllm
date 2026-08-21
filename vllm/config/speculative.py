@@ -205,6 +205,17 @@ class SpeculativeConfig:
     acceptance improves."""
     adaptive_draft_min_tokens: int = Field(default=1, ge=1)
     """Lower bound on the adaptive draft length."""
+    lazy_draft: bool = False
+    """Skip the drafter's forward pass on steps that schedule zero draft
+    tokens (a batch-size schedule or adaptive draft length that turns drafting
+    off). A drafter that keeps per-token state (EAGLE/MTP KV, draft-model KV)
+    then misses the skipped tokens and that state cannot be rebuilt without the
+    target hidden states of those tokens, so such requests - and any request
+    that later reuses the prefix-cache blocks they produced - never draft again.
+    Blocks produced by a drafting request stay complete and are preferred on
+    lookup. Exact for the target distribution by construction; trades the
+    drafter's per-step cost in wide batches against speculation for requests
+    that lived through one. V2 model runner only."""
 
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -1531,6 +1542,10 @@ class SpeculativeConfig:
 
     def use_ngram_gpu(self) -> bool:
         return self.method == "ngram_gpu"
+
+    def draft_keeps_state(self) -> bool:
+        """Whether skipping a draft step leaves the drafter's KV/state behind."""
+        return self.use_eagle() or self.uses_draft_model()
 
     def use_multi_module_mtp(self) -> bool:
         if self.method != "mtp" or self.draft_model_config is None:

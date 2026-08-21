@@ -171,6 +171,13 @@ class Request:
         self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
+        # Lazy drafting skipped the drafter over some of this request's
+        # tokens (or it reuses blocks where that happened), so its draft
+        # KV/state is incomplete and it is never scheduled with drafts.
+        self.draft_stale = False
+        # Per KV cache group, how many leading blocks came from the prefix
+        # cache; only the blocks after them were computed by this request.
+        self.num_prefix_hit_blocks: tuple[int, ...] = ()
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 

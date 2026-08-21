@@ -137,6 +137,9 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # Cached by a request whose drafter had skipped some of its tokens, so the
+    # drafter's KV in this block is incomplete (see SpeculativeConfig.lazy_draft).
+    draft_stale: bool = False
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -161,6 +164,7 @@ class KVCacheBlock:
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
         self._block_hash_num_tokens = None
+        self.draft_stale = False
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__

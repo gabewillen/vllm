@@ -41,7 +41,11 @@ class AsyncScheduler(Scheduler):
             )
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
-            request.spec_token_ids = self._spec_token_placeholders
+            # A request with incomplete drafter state (lazy drafting) is
+            # never verified against drafts.
+            request.spec_token_ids = (
+                [] if request.draft_stale else self._spec_token_placeholders
+            )
 
             if self.use_v2_model_runner:
                 # Set the next step index in which this request is eligible to be

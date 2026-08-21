@@ -58,17 +58,31 @@ class BlockHashToBlockMap:
             BlockHashWithGroupId, KVCacheBlock | dict[int, KVCacheBlock]
         ] = {}
 
-    def get_one_block(self, key: BlockHashWithGroupId) -> KVCacheBlock | None:
-        """
-        Gets any block with the given block hash key.
+    def get_one_block(
+        self, key: BlockHashWithGroupId, require_draft_complete: bool = False
+    ) -> KVCacheBlock | None:
+        """Get a block with the given block hash key.
+
+        Among duplicates a block with complete drafter KV is preferred; with
+        `require_draft_complete` a key whose blocks are all `draft_stale` is
+        a miss.
         """
         blocks = self._cache.get(key)
-        if blocks is not None:
-            if isinstance(blocks, KVCacheBlock):
-                return blocks
-            if isinstance(blocks, dict):
-                return next(iter(blocks.values()))
-            self._unexpected_blocks_type(blocks)
+        if blocks is None:
+            return None
+        if isinstance(blocks, KVCacheBlock):
+            if require_draft_complete and blocks.draft_stale:
+                return None
+            return blocks
+        if isinstance(blocks, dict):
+            first = None
+            for block in blocks.values():
+                if not block.draft_stale:
+                    return block
+                if first is None:
+                    first = block
+            return None if require_draft_complete else first
+        self._unexpected_blocks_type(blocks)
         return None
 
     def contain(self, key: BlockHashWithGroupId, block_id: int) -> bool:
@@ -171,6 +185,9 @@ class BlockPool:
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        # Set for the duration of a prefix-cache lookup that must not reuse
+        # blocks with incomplete drafter KV (see KVCacheManager).
+        self.require_draft_complete = False
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -215,7 +232,7 @@ class BlockPool:
                 block_hash, group_id
             )
             block = self.cached_block_hash_to_block.get_one_block(
-                block_hash_with_group_id
+                block_hash_with_group_id, self.require_draft_complete
             )
             if not block:
                 return None
@@ -295,6 +312,7 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            blk.draft_stale = request.draft_stale
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 

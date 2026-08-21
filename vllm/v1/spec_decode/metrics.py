@@ -29,6 +29,8 @@ class SpecDecodingStats:
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
     num_draft_tokens_per_pos: list[int] = field(default_factory=list)
+    # Target tokens the drafter did not process (lazy drafting).
+    num_draft_skipped_tokens: int = 0
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -69,9 +71,13 @@ class SpecDecodingLogging:
         self.num_draft_tokens: list[int] = []
         self.num_accepted_tokens: list[int] = []
         self.accepted_tokens_per_pos_lists: list[list[int]] = []
+        self.num_draft_skipped_tokens = 0
         self.last_log_time = time.monotonic()
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
+        self.num_draft_skipped_tokens += spec_decoding_stats.num_draft_skipped_tokens
+        if spec_decoding_stats.num_drafts == 0:
+            return
         self.num_drafts.append(spec_decoding_stats.num_drafts)
         self.num_draft_tokens.append(spec_decoding_stats.num_draft_tokens)
         self.num_accepted_tokens.append(spec_decoding_stats.num_accepted_tokens)
@@ -81,6 +87,12 @@ class SpecDecodingLogging:
 
     def log(self, log_fn=logger.info):
         if not self.num_drafts:
+            if self.num_draft_skipped_tokens:
+                log_fn(
+                    "SpecDecoding metrics: drafter skipped on %d tokens",
+                    self.num_draft_skipped_tokens,
+                )
+                self.reset()
             return
         num_drafts = np.sum(self.num_drafts)
         num_draft_tokens = np.sum(self.num_draft_tokens)
@@ -125,7 +137,8 @@ class SpecDecodingLogging:
             "Accepted: %d tokens, "
             "Drafted: %d tokens, "
             "Per-position acceptance rate: %s, "
-            "Avg Draft acceptance rate: %.1f%%",
+            "Avg Draft acceptance rate: %.1f%%, "
+            "Drafter skipped: %d tokens",
             mean_acceptance_length,
             accepted_throughput,
             draft_throughput,
@@ -133,6 +146,7 @@ class SpecDecodingLogging:
             num_draft_tokens,
             rates_str,
             draft_acceptance_rate,
+            self.num_draft_skipped_tokens,
         )
         self.reset()
 
@@ -229,6 +243,10 @@ class SpecDecodingProm:
                 ("vllm:spec_decode_num_drafts", "Number of spec decoding drafts."),
                 ("vllm:spec_decode_num_draft_tokens", "Number of draft tokens."),
                 ("vllm:spec_decode_num_accepted_tokens", "Number of accepted tokens."),
+                (
+                    "vllm:spec_decode_num_draft_skipped_tokens",
+                    "Target tokens the drafter skipped (lazy drafting).",
+                ),
             ]
 
         counters = [
@@ -243,6 +261,9 @@ class SpecDecodingProm:
         self.counter_spec_decode_num_drafts = counters[0]
         self.counter_spec_decode_num_draft_tokens = counters[1]
         self.counter_spec_decode_num_accepted_tokens = counters[2]
+        self.counter_spec_decode_num_draft_skipped_tokens = (
+            counters[3] if len(counters) > 3 else None
+        )
 
         self.counter_spec_decode_num_accepted_tokens_per_pos: dict[
             int, list[prometheus_client.Counter]
@@ -275,6 +296,10 @@ class SpecDecodingProm:
         self.counter_spec_decode_num_accepted_tokens[engine_idx].inc(
             spec_decoding_stats.num_accepted_tokens
         )
+        if self.counter_spec_decode_num_draft_skipped_tokens is not None:
+            self.counter_spec_decode_num_draft_skipped_tokens[engine_idx].inc(
+                spec_decoding_stats.num_draft_skipped_tokens
+            )
         for pos, counter in enumerate(
             self.counter_spec_decode_num_accepted_tokens_per_pos.get(engine_idx, [])
         ):

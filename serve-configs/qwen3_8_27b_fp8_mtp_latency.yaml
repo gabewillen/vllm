@@ -24,9 +24,11 @@
 # draft head at TP4 added ~4k extra NCCL all-reduces (~10.7 ms each on PCIe)
 # per prefill window. draft_tensor_parallel_size=1 runs the head unsharded on
 # every rank (no draft all-reduce); use_local_argmax_reduction drops the
-# vocab all-gather. The remaining -11% is the draft prefill forward, which
-# vLLM deliberately runs even at K=0 to keep the draft KV in sync — a design
-# floor, not a bug.
+# vocab all-gather. The remaining -11% was the draft forward that vLLM ran
+# even at K=0 to keep the draft KV in sync; patch 0016 (`lazy_draft`) skips
+# it on zero-draft steps (measured c64: 786 -> ~946 tok/s ceiling), at the
+# price that a request which lived through a wide batch does not speculate
+# again and the blocks it made are recomputed by the next drafting request.
 # num_speculative_tokens_per_batch_size: K=7 up to 16 seqs, off above.
 # Measured 2026-08-21 (INT4, effort v3, random 1024/512, K=7-always vs
 # MTP-off): c1 102 vs 51, c4 212 vs 164, c8 304 vs 267, c16 388 vs 381,
@@ -118,7 +120,7 @@ gpu-memory-utilization: 0.92
 max-num-seqs: 96
 max-num-batched-tokens: 8192
 compilation-config: '{"max_cudagraph_capture_size": 96}'
-speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 16, 7], [17, 96, 0]]}'
+speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "lazy_draft": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 16, 7], [17, 96, 0]]}'
 kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
 reasoning-parser: qwen3
 # Dynamic reasoning effort v3 (venv patch 0009, docs/dynamic-reasoning.claude.md
