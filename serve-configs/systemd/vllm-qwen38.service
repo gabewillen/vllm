@@ -1,6 +1,5 @@
 [Unit]
 Description=vLLM Qwen3.8-27B-FP8 latency profile (MTP K7, TP4, 262k ctx) on 4x L4
-Conflicts=vllm-qwen38-throughput.service
 After=network-online.target
 Wants=network-online.target
 
@@ -33,9 +32,8 @@ Environment=HOME=/home/gwillen
 Environment=PYTHONHASHSEED=8012
 Environment=PYTHONPATH=/shared/vllm/serve-configs/middleware
 Environment=NCCL_P2P_LEVEL=SYS
-# Latency profile runs Model Runner V2 (full CUDA graphs + fused multi-step
-# MTP drafts; see qwen3_8_27b_fp8_mtp_latency.yaml). The throughput unit
-# (vllm-qwen38-throughput.service) must NOT set this: V2 rejects --enable-dbo.
+# Model Runner V2 (full CUDA graphs + fused multi-step MTP drafts; see
+# qwen3_8_27b_fp8_mtp_latency.yaml). Single profile since 2026-08-21.
 Environment=VLLM_USE_V2_MODEL_RUNNER=1
 
 [Install]

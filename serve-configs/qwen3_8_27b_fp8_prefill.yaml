@@ -1,6 +1,6 @@
 # Qwen3.8-27B-FP8 on 4x L4 — PREFILL-optimized profile (TP1 x PP4).
 #
-# Serve (same venv as qwen3_8_27b_fp8_max.yaml):
+# Serve:
 #   HF_HOME=/data/huggingface HF_HUB_OFFLINE=1 \
 #     /shared/vllm/.venv-qwen38/bin/vllm serve \
 #     --config /shared/vllm/serve-configs/qwen3_8_27b_fp8_prefill.yaml
@@ -16,7 +16,7 @@
 # THE TRADEOFF: decode throughput halves vs the TP4 profile
 # (233 tok/s / TPOT 295 ms vs 474.6 tok/s / 143 ms on 128x 1k/1k).
 # Use this profile when cold long-prompt latency dominates (batch document
-# ingestion, first-pass summarization); use qwen3_8_27b_fp8_max.yaml (TP4)
+# ingestion, first-pass summarization); use qwen3_8_27b_fp8_mtp_latency.yaml (TP4)
 # for interactive/decode-heavy serving. Measured levers that did NOT help:
 # L4-tuned Triton block-FP8 configs (-5%) and 16k chunks (bubbles);
 # enable_sp is UNTESTABLE here (vLLM's SP threshold heuristic silently

@@ -3,9 +3,9 @@
 Status: P0-P2 shipped as patch 0009 and GPU-validated 2026-08-18 (§2c); P6 (§11)
 rewrites the controller and P7 (§12) makes the close soft and the rule
 evidence-gated - both CPU-tested, GPU validation pending; P3-P5 open. §11.0 is
-a standing constraint on every signal added from here on. Target: the two Qwen3.8-27B-FP8 profiles on the
+a standing constraint on every signal added from here on. Target: the Qwen3.8-27B profile on the
 4x L4 box (`serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml`, V2 runner + MTP;
-`serve-configs/qwen3_8_27b_fp8_max.yaml`, V1 runner + DBO). Ships as venv-local
+the separate throughput profile was retired 2026-08-21). Ships as venv-local
 patches `0009+` (`serve-configs/patches/`), same contract as 0005-0008.
 
 ## 1. What "dynamic" means here
