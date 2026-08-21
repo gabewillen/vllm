@@ -1,31 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Running quantile sketches for the dynamic-effort signals.
+"""Streaming t-digest for the dynamic-effort memory.
 
-The controller is self-normalizing: instead of a per-model calibration table
-of absolute means and standard deviations, the scheduler keeps one streaming
-t-digest per signal, fed by every request that emits signals. Features are
-then *percentile ranks* in that digest, so a threshold like "top quartile of
-uncertainty" means the same thing on any model, quantization or sampler
-setting.
-
-The digests are persisted to a JSON file (``dynamic_effort.quantile_path``)
-so a restart warms instantly; while a digest is cold (fewer than
-``min_samples`` observations) it reports ``None`` and the controller never
-escalates.
+The effort memory (``effort_memory.py``) keeps one digest each for its value
+estimate, novelty and spread, so the level cuts are *percentile ranks* of what
+this server has actually seen rather than absolute thresholds: "top 40 % of
+estimated reasoning length" means the same thing on any model, quantization
+or sampler setting. The digests are serialised with the memory.
 """
 
 from __future__ import annotations
 
-import json
 import math
-import os
-import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from typing import Any
-
-SKETCH_VERSION = 1
-SIGNAL_KEYS = ("entropy", "margin", "p_end", "acceptance")
 
 
 class TDigest:
@@ -171,27 +159,6 @@ class TDigest:
             seen += weight
         return self.max
 
-    def edges(self, num_edges: int) -> list[float] | None:
-        """Monotone quantile grid ``[quantile(0), ..., quantile(1)]``.
-
-        The worker converts a value to a rank by binary search in this grid,
-        which is how the rank rule stays identical on both evaluation sites.
-        """
-        if num_edges < 2:
-            raise ValueError("num_edges must be >= 2")
-        means, _, total = self._sorted()
-        if not means or total <= 0.0:
-            return None
-        out: list[float] = []
-        prev = -math.inf
-        for i in range(num_edges):
-            value = self.quantile(i / (num_edges - 1))
-            assert value is not None
-            # Guarantee non-decreasing edges even under float noise.
-            prev = value = max(value, prev)
-            out.append(value)
-        return out
-
     # -- persistence -------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
@@ -221,139 +188,3 @@ class TDigest:
             float(hi) if hi is not None else (means[-1] if means else -math.inf)
         )
         return digest
-
-
-class SignalSketches:
-    """One :class:`TDigest` per dynamic-effort signal, with JSON persistence.
-
-    ``rank`` and ``quantile`` return ``None`` while a signal is cold (fewer
-    than ``min_samples`` observations); the controller treats that as "never
-    escalate", which is the documented cold-start behaviour.
-    """
-
-    def __init__(
-        self,
-        min_samples: int = 2048,
-        compression: float = 100.0,
-        path: str | None = None,
-        flush_every: int = 5000,
-        keys: Sequence[str] = SIGNAL_KEYS,
-    ):
-        self.min_samples = int(min_samples)
-        self.compression = float(compression)
-        self.path = path
-        self.flush_every = int(flush_every)
-        self.digests: dict[str, TDigest] = {
-            key: TDigest(compression=compression) for key in keys
-        }
-        self._since_flush = 0
-        self.model: str | None = None
-        self.auc: dict[str, Any] | None = None
-        """Offline discriminative power of the uncertainty features on this
-        model, written by ``serve-configs/effort_calibrate.py``. ``None`` means
-        "no evidence", which under ``rule="length"`` keeps them off."""
-
-    # -- ingestion ---------------------------------------------------------
-
-    def observe(self, key: str, value: float, weight: float = 1.0) -> None:
-        digest = self.digests.get(key)
-        if digest is None:
-            return
-        digest.add(value, weight)
-        self._since_flush += 1
-
-    def warm(self, key: str) -> bool:
-        digest = self.digests.get(key)
-        return digest is not None and digest.count >= self.min_samples
-
-    def count(self, key: str) -> float:
-        digest = self.digests.get(key)
-        return 0.0 if digest is None else digest.count
-
-    @property
-    def uncertainty_auc(self) -> float | None:
-        """The recorded discriminative AUC of the entropy/margin features."""
-        if not self.auc:
-            return None
-        value = self.auc.get("uncertainty_auc")
-        if value is None or not math.isfinite(float(value)):
-            return None
-        return float(value)
-
-    # -- queries -----------------------------------------------------------
-
-    def rank(self, key: str, value: float | None) -> float | None:
-        if value is None or not self.warm(key):
-            return None
-        return self.digests[key].rank(value)
-
-    def quantile(self, key: str, q: float) -> float | None:
-        if not self.warm(key):
-            return None
-        return self.digests[key].quantile(q)
-
-    def edges(self, key: str, num_edges: int) -> list[float] | None:
-        if not self.warm(key):
-            return None
-        return self.digests[key].edges(num_edges)
-
-    # -- persistence -------------------------------------------------------
-
-    def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
-            "version": SKETCH_VERSION,
-            "model": self.model,
-            "min_samples": self.min_samples,
-            "signals": {k: d.to_dict() for k, d in self.digests.items()},
-        }
-        if self.auc is not None:
-            # Optional and additive: a file written before the AUC pass still
-            # loads, and reports "no evidence".
-            data["auc"] = self.auc
-        return data
-
-    def load_dict(self, data: dict[str, Any]) -> None:
-        if int(data.get("version", 0)) != SKETCH_VERSION:
-            raise ValueError(
-                f"effort sketch version {data.get('version')} != {SKETCH_VERSION}"
-            )
-        self.model = data.get("model")
-        auc = data.get("auc")
-        self.auc = auc if isinstance(auc, dict) else None
-        for key, blob in (data.get("signals") or {}).items():
-            if key in self.digests:
-                self.digests[key] = TDigest.from_dict(blob)
-
-    def load(self) -> bool:
-        """Warm the digests from ``path``; ``False`` when nothing was loaded."""
-        if not self.path or not os.path.exists(self.path):
-            return False
-        with open(self.path, encoding="utf-8") as f:
-            self.load_dict(json.load(f))
-        return True
-
-    def save(self) -> None:
-        """Atomically write the digests to ``path``."""
-        if not self.path:
-            return
-        directory = os.path.dirname(os.path.abspath(self.path)) or "."
-        os.makedirs(directory, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self.to_dict(), f)
-            os.replace(tmp, self.path)
-        except BaseException:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-            raise
-        self._since_flush = 0
-
-    def maybe_save(self) -> bool:
-        """Persist once ``flush_every`` observations have accumulated."""
-        if not self.path or self.flush_every <= 0:
-            return False
-        if self._since_flush < self.flush_every:
-            return False
-        self.save()
-        return True

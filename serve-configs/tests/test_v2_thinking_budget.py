@@ -5,9 +5,6 @@ Drives the pure torch reference (``apply_thinking_budget_torch`` and the
 ``ThinkingBudgetState`` slot logic) on CPU tensors through a scripted target
 model plus a greedy rejection sampler, and cross-checks the committed token
 streams against the V1 ``ThinkingBudgetStateHolder`` on the same drafts.
-
-The sims here are also the harness ``test_effort_soft_limit`` reuses; both
-accept an optional :class:`SoftLimit` and record the ramp bias they wrote.
 """
 
 from types import SimpleNamespace
@@ -17,15 +14,12 @@ import pytest
 import torch
 
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample import thinking_budget_state as v1_module
 from vllm.v1.sample.logits_processor.interface import BatchUpdate
-from vllm.v1.sample.soft_limit import SoftLimit
 from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
 from vllm.v1.worker.gpu.sample import thinking_budget as v2_module
 from vllm.v1.worker.gpu.sample.thinking_budget import (
-    NO_REVISION,
     ThinkingBudgetState,
     apply_thinking_budget_torch,
     find_last_marker,
@@ -65,10 +59,7 @@ class V2Sim:
         start=START,
         end=END,
         natural_end=None,
-        soft_limit: SoftLimit | None = None,
     ):
-        self.soft_limit = soft_limit
-        self.last_bias: dict[int, dict[int, float]] = {}
         self.max_num_reqs = max_num_reqs
         self.all_token_ids = torch.zeros((max_num_reqs, MAX_LEN), dtype=torch.int32)
         self.total_len = torch.zeros(max_num_reqs, dtype=torch.int32)
@@ -132,19 +123,12 @@ class V2Sim:
             self.start_ids,
             self.natural_end_ids,
             self.end_ids,
-            self.soft_limit,
         )
         out: dict[int, dict[int, int]] = {r: {} for r, _ in batch}
         rows, toks = (logits == FORCE).nonzero(as_tuple=True)
         for row, tok in zip(rows.tolist(), toks.tolist()):
             out[eim[row]][elp[row]] = tok
         assert int((logits == FORCE).sum()) == len(rows)
-        self.last_bias = {r: {} for r, _ in batch}
-        soft_token = int(self.natural_end_ids[0])
-        for row in range(logits.shape[0]):
-            value = float(logits[row, soft_token])
-            if 0.0 < value < FORCE:
-                self.last_bias[eim[row]][elp[row]] = value
         return out
 
 
@@ -158,22 +142,16 @@ class V1Sim:
         start=START,
         end=END,
         natural_end=None,
-        soft_limit: SoftLimit | None = None,
     ):
         natural = list(natural_end if natural_end is not None else end)
         cfg = SimpleNamespace(
             reasoning_start_token_ids=start,
             reasoning_end_token_ids=end,
             natural_reasoning_end_token_ids=natural,
-            dynamic_effort=(
-                None if soft_limit is None else SimpleNamespace(soft_limit=soft_limit)
-            ),
         )
         self.holder = ThinkingBudgetStateHolder(
             cfg, max_num_reqs, num_spec_tokens, torch.device("cpu"), False
         )
-        self.soft_token = natural[0]
-        self.last_bias: dict[int, dict[int, float]] = {}
         self.outputs: dict[int, list[int]] = {}
         self.max_num_reqs = max_num_reqs
 
@@ -202,7 +180,6 @@ class V1Sim:
         for r, drafts in batch:
             specs[r] = list(drafts)
         out: dict[int, dict[int, int]] = {r: {} for r, _ in batch}
-        self.last_bias = {r: {} for r, _ in batch}
         if self.holder.in_spec_mode and any(specs):
             # Rejection-sampler step: bonus rows first, then the target rows.
             self.holder.update_state(outputs, specs)
@@ -214,15 +191,12 @@ class V1Sim:
                 hit = (bonus[r] == FORCE).nonzero()
                 if len(hit):
                     out[r][len(drafts)] = int(hit[0])
-                self._record_bias(bonus[r], r, len(drafts))
             cu = 0
             for i in range(n):
                 for p in range(len(specs[i])):
                     hit = (target[cu + p] == FORCE).nonzero()
                     if len(hit):
                         out[i][p] = int(hit[0])
-                    if i in self.last_bias:
-                        self._record_bias(target[cu + p], i, p)
                 cu += len(specs[i])
         else:
             # Plain sampler step (no drafts this step, e.g. right after prefill).
@@ -233,13 +207,7 @@ class V1Sim:
                 hit = (logits[r] == FORCE).nonzero()
                 if len(hit):
                     out[r][0] = int(hit[0])
-                self._record_bias(logits[r], r, 0)
         return out
-
-    def _record_bias(self, row: torch.Tensor, req_idx: int, local_pos: int) -> None:
-        value = float(row[self.soft_token])
-        if 0.0 < value < FORCE:
-            self.last_bias[req_idx][local_pos] = value
 
 
 def _verify(n_out: int, drafts: list[int], forced: dict[int, int]) -> list[int]:
@@ -282,15 +250,10 @@ def _run(sim, req_idx, budget, drafts_fn, steps):
 class _Paired:
     """V1 + V2 running in lock-step on identical drafts."""
 
-    def __init__(self, k: int, start=START, end=END, soft_limit=None, natural_end=None):
+    def __init__(self, k: int, start=START, end=END, natural_end=None):
         self.k = k
-        self.v1 = V1Sim(
-            k, start=start, end=end, natural_end=natural_end, soft_limit=soft_limit
-        )
-        self.v2 = V2Sim(
-            start=start, end=end, natural_end=natural_end, soft_limit=soft_limit
-        )
-        self.last_bias: dict[int, dict[int, float]] = {}
+        self.v1 = V1Sim(k, start=start, end=end, natural_end=natural_end)
+        self.v2 = V2Sim(start=start, end=end, natural_end=natural_end)
 
     def add(self, req_idx, prompt, budget):
         self.v1.add(req_idx, prompt, budget)
@@ -313,11 +276,6 @@ class _Paired:
                 assert f1[r][first] == f2[r][first], (f1, f2)
             else:
                 assert not f2[r], (f1, f2)
-            b1, b2 = self.v1.last_bias.get(r, {}), self.v2.last_bias.get(r, {})
-            assert set(b1) == set(b2), (b1, b2)
-            for pos, value in b1.items():
-                assert value == pytest.approx(b2[pos]), (b1, b2)
-        self.last_bias = dict(self.v2.last_bias)
         return f2
 
 
@@ -467,51 +425,6 @@ def test_natural_end_stops_forcing_and_new_think_restarts_count():
     assert forced == {2: END[0], 3: END[0]}
 
 
-def test_budget_raise_via_revision_update_mid_think():
-    k = 7
-    sim = _Paired(k)
-    sim.add(0, [], 10)
-    sim.commit(0, START)
-    n_out = len(sim.output(0))
-    drafts = _good_drafts(k)(n_out)
-    sim.commit(0, _verify(n_out - 1, drafts, sim.forced([(0, drafts)])[0]))
-    assert len(sim.output(0)) == 1 + 8  # 8 thinking tokens, budget 10 -> next
-    # step would force at column 2. Raise the budget to 20 with revision 1 in
-    # both runners; a stale revision 0 (budget 4) afterwards is ignored.
-    assert sim.v1.holder.update_budget(0, 1, 20)
-    assert not sim.v1.holder.update_budget(0, 0, 4)
-    assert not sim.v1.holder.update_budget(0, 1, 4)
-    v2_state = _cpu_state()
-    v2_state.add_request(0, SamplingParams(thinking_token_budget=10))
-    assert v2_state.update_budgets({"r0": (1, 20)}, {"r0": 0}) == {"r0": 1}
-    assert v2_state.update_budgets({"r0": (0, 4)}, {"r0": 0}) == {}
-    assert v2_state.update_budgets({"r0": (1, 4)}, {"r0": 0}) == {}
-    v2_state.apply_staged_writes()
-    assert int(v2_state.thinking_token_budget.gpu[0]) == 20
-    sim.v2.budget[0] = int(v2_state.thinking_token_budget.gpu[0])
-    for _ in range(4):
-        n_out = len(sim.output(0))
-        drafts = _good_drafts(k)(n_out)
-        forced = sim.forced([(0, drafts)])[0]
-        sim.commit(0, _verify(n_out - 1, drafts, forced))
-    assert _think_len(sim.output(0)) == 20
-
-
-def test_budget_lowered_by_update_forces_earlier():
-    sim = _Paired(0)
-    sim.add(0, [], 50)
-    sim.commit(0, START)
-    for _ in range(4):
-        forced = sim.forced([(0, [])])[0]
-        sim.commit(0, _verify(len(sim.output(0)) - 1, [], forced))
-    assert sim.v1.holder.update_budget(0, 3, 6)  # think_count 4 -> 2 more
-    sim.v2.budget[0] = 6
-    for _ in range(4):
-        forced = sim.forced([(0, [])])[0]
-        sim.commit(0, _verify(len(sim.output(0)) - 1, [], forced))
-    assert _think_len(sim.output(0)) == 6
-
-
 class _FakeUva:
     def __init__(self, size, dtype):
         self.cpu = torch.zeros(size, dtype=dtype)
@@ -556,19 +469,16 @@ def test_state_disabled_without_reasoning_config():
     state = ThinkingBudgetState(req_states, None)
     assert not state.enabled
     state.add_request(0, SamplingParams(thinking_token_budget=3))
-    assert state.update_budgets({"r": (1, 5)}, {"r": 0}) == {}
     assert not state.requires_logits_processing(np.array([0]))
 
 
-def test_state_slot_reuse_scrubs_budget_cache_and_revision():
+def test_state_slot_reuse_scrubs_budget_cache():
     state = _cpu_state()
     st = state.req_states
     st.all_token_ids.gpu[1, :4] = torch.tensor(START + [_script(0)] * 3)
     st.total_len.gpu[1] = 4
     state.add_request(1, SamplingParams(thinking_token_budget=2))
-    state.update_budgets({"a": (5, 3)}, {"a": 1})
     state.apply_staged_writes()
-    assert state.budget_revision[1] == 5
     logits = torch.zeros((1, VOCAB))
     state.apply(
         logits,
@@ -581,16 +491,14 @@ def test_state_slot_reuse_scrubs_budget_cache_and_revision():
     assert logits[0, END[0]] == FORCE
     assert int(state.cached_last_start[1]) == 0
     # Slot 1 is reused by a request without a budget: nothing applies and the
-    # revision / cache / budget are scrubbed.
+    # cache / budget are scrubbed.
     st.all_token_ids.gpu[1, :2] = torch.tensor([START[0], 9])
     st.total_len.gpu[1] = 2
     state.add_request(1, SamplingParams())
     state.apply_staged_writes()
-    assert state.budget_revision[1] == NO_REVISION
     assert not state.use_thinking_budget[1]
     assert int(state.thinking_token_budget.gpu[1]) == -1
     assert not state.requires_logits_processing(np.array([1]))
-    assert state.update_budgets({"b": (9, 1)}, {"b": 1}) == {}
     # And by a budgeted request whose prompt is not in a think block: the
     # cache from the earlier occupant must not leak.
     st.all_token_ids.gpu[1, :2] = torch.tensor([7, 9])
@@ -642,8 +550,5 @@ def test_find_last_marker_and_multi_token_prefix_rule():
 
 
 def test_frozen_interfaces_have_defaults():
-    so = SchedulerOutput.make_empty()
-    assert so.thinking_budget_updates == {}
     mro = ModelRunnerOutput(req_ids=[], req_id_to_index={})
-    assert mro.thinking_budget_acks is None
     assert mro.effort_signals is None

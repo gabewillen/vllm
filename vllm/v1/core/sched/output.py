@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
-    from vllm.v1.sample.effort_policy import EffortPolicy
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
@@ -30,7 +29,6 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
-    EffortPolicy = object
 
 
 @dataclass
@@ -260,21 +258,8 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
-    # req_id -> (revision, absolute thinking budget) for dynamic effort. On a
-    # worker-evaluated request this channel only ever carries a stall clamp.
-    thinking_budget_updates: dict[str, tuple[int, int]] = field(default_factory=dict)
-
-    # Dynamic effort policy for this step: the scheduler's quantile sketches
-    # resolved into monotone grids plus the per-rung ordinal thresholds. None
-    # while no dynamic request is in flight.
-    effort_policy: EffortPolicy | None = None
-
-    # Requests whose loop / churn evidence vetoes escalation this step (the
-    # token-level detector stays in the scheduler).
-    effort_vetoes: list[str] = field(default_factory=list)
-
     # Requests whose dynamic-effort *body* prefill completes in this step, so
-    # the worker returns the last prefill row for the starting-rung decision
+    # the worker returns the last prefill row for the level decision
     # (docs/dynamic-reasoning.claude.md §13.3).
     effort_prefill_capture: list[str] = field(default_factory=list)
 
@@ -287,11 +272,6 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
-
-    # req_id -> (revision, absolute thinking token budget). Applied by the
-    # model runner before this step's sampling for strictly increasing
-    # revisions only; acked via ModelRunnerOutput.thinking_budget_acks.
-    thinking_budget_updates: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

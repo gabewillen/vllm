@@ -254,9 +254,9 @@ class FinishedRequestStats:
     is_corrupted: bool = False
     num_cached_tokens: int = 0
     effort: dict[str, Any] | None = None
-    """Dynamic reasoning-effort report (rung, escalations, reasoning_tokens,
-    late, stall_clamps, grace_tokens, close_kind) for
-    `reasoning_effort: "dynamic"` requests."""
+    """Dynamic reasoning-effort report (level, decided, reasoning_tokens,
+    close_kind, memory_entries, neighbours) for `reasoning_effort: "dynamic"`
+    requests."""
 
 
 @dataclass

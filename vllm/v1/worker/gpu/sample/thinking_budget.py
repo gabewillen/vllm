@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-request thinking token budgets for Model Runner V2.
 
-State per batch slot: the (versioned) budget plus a cache of the last
+State per batch slot: the budget plus a cache of the last
 reasoning start/end marker positions in the committed token history. Each
 step, ``apply`` forces the reasoning end sequence on every target logits row
 whose effective prefix (committed tokens plus the draft tokens before that
@@ -11,12 +11,6 @@ V1 ``ThinkingBudgetStateHolder``: the first over-budget row forces the first
 end token, later rows in the same draft window force the next end tokens
 while the drafts follow the sequence, and a rejected draft simply re-forces
 next step because the decision is recomputed from committed tokens.
-
-When a soft limit is configured (``vllm/v1/sample/soft_limit.py``) the same
-row decision also carries the ramp: a row whose think prefix sits in
-``[budget, budget + ramp_tokens)`` gets a rising bias on the first token of the
-*natural* end marker instead of the force, and the force itself moves to
-``budget + ramp_tokens``.
 
 ``apply_thinking_budget`` dispatches to Triton kernels on CUDA and to a pure
 torch reference (``apply_thinking_budget_torch``) on other devices; the
@@ -31,7 +25,6 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.sample.soft_limit import SoftLimit, soft_limit_from_reasoning_config
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -40,7 +33,6 @@ if TYPE_CHECKING:
 
 _INT32_MAX = np.iinfo(np.int32).max
 _COLD_SCAN_BLOCK = 1024
-NO_REVISION = -1
 
 
 class ThinkingBudgetState:
@@ -72,13 +64,6 @@ class ThinkingBudgetState:
         )
         self.enabled = bool(start_ids and end_ids and natural_end_ids)
         self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
-        # The ramp biases the marker the parser detects, so a soft close reads
-        # like the model's own; the force keeps the (graceful) end sequence.
-        self.soft_limit: SoftLimit = (
-            soft_limit_from_reasoning_config(reasoning_config)
-            if self.enabled
-            else SoftLimit(enabled=False)
-        )
         if not self.enabled:
             return
 
@@ -87,8 +72,6 @@ class ThinkingBudgetState:
         )
         self.thinking_token_budget.np.fill(-1)
         self.thinking_token_budget.copy_to_uva()
-        # Revision of the last applied budget update per slot (CPU only).
-        self.budget_revision = np.full(self.max_num_reqs, NO_REVISION, dtype=np.int64)
 
         self.cached_last_start = torch.full(
             (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
@@ -117,7 +100,6 @@ class ThinkingBudgetState:
             return
         budget = sampling_params.thinking_token_budget
         self.use_thinking_budget[req_idx] = budget is not None
-        self.budget_revision[req_idx] = NO_REVISION
         if budget is None:
             budget = -1
         else:
@@ -126,34 +108,6 @@ class ThinkingBudgetState:
         if self.thinking_token_budget.np[req_idx] != budget:
             self.thinking_token_budget.np[req_idx] = budget
             self._budget_dirty = True
-
-    def update_budgets(
-        self,
-        updates: dict[str, tuple[int, int]],
-        req_id_to_index: dict[str, int],
-    ) -> dict[str, int]:
-        """Apply versioned budget updates; return req_id -> revision applied.
-
-        Only requests that opted into a budget at ``add_request`` and only
-        strictly increasing revisions are applied. The staged budget tensor
-        is flushed by ``apply_staged_writes``.
-        """
-        if not self.enabled or not updates:
-            return {}
-        acks: dict[str, int] = {}
-        for req_id, (revision, budget) in updates.items():
-            req_idx = req_id_to_index.get(req_id)
-            if req_idx is None or not self.use_thinking_budget[req_idx]:
-                continue
-            if revision <= self.budget_revision[req_idx]:
-                continue
-            self.budget_revision[req_idx] = revision
-            budget = min(max(budget, 0), _INT32_MAX)
-            if self.thinking_token_budget.np[req_idx] != budget:
-                self.thinking_token_budget.np[req_idx] = budget
-                self._budget_dirty = True
-            acks[req_id] = revision
-        return acks
 
     def apply_staged_writes(self) -> None:
         if not self.enabled:
@@ -173,27 +127,6 @@ class ThinkingBudgetState:
     def requires_logits_processing(self, idx_mapping_np: np.ndarray) -> bool:
         return self.enabled and bool(np.any(self.use_thinking_budget[idx_mapping_np]))
 
-    def refresh_marker_cache(self, idx_mapping: torch.Tensor) -> None:
-        """Bring the cached reasoning start/end positions up to date.
-
-        The worker-side escalation rule derives each request's think-token
-        count from this cache, so it must run before the rule and before the
-        force kernel (which refreshes it again, idempotently).
-        """
-        if not self.enabled:
-            return
-        update_marker_cache(
-            idx_mapping,
-            self.thinking_token_budget.gpu,
-            self.req_states.all_token_ids.gpu,
-            self.req_states.total_len.gpu,
-            self.cached_last_start,
-            self.cached_last_end,
-            self.cached_scan_pos,
-            self.reasoning_start_token_ids,
-            self.natural_reasoning_end_token_ids,
-        )
-
     def apply(
         self,
         logits: torch.Tensor,
@@ -202,7 +135,6 @@ class ThinkingBudgetState:
         idx_mapping_np: np.ndarray,
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
-        budget_override: torch.Tensor | None = None,
     ) -> None:
         if not self.requires_logits_processing(idx_mapping_np):
             return
@@ -211,9 +143,7 @@ class ThinkingBudgetState:
             logits,
             idx_mapping,
             expanded_idx_mapping,
-            self.thinking_token_budget.gpu
-            if budget_override is None
-            else budget_override,
+            self.thinking_token_budget.gpu,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
             input_ids,
@@ -224,7 +154,6 @@ class ThinkingBudgetState:
             self.reasoning_start_token_ids,
             self.natural_reasoning_end_token_ids,
             self.reasoning_end_token_ids,
-            self.soft_limit,
         )
 
 
@@ -364,9 +293,6 @@ def _thinking_budget_kernel(
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
-    SOFT_RAMP: tl.constexpr,
-    SOFT_MAX_BIAS: tl.constexpr,
-    SOFT_CURVE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -431,19 +357,6 @@ def _thinking_budget_kernel(
     num_reasoning_tokens = effective_len - reasoning_start
     if num_reasoning_tokens < budget:
         return
-
-    if SOFT_RAMP > 0:
-        # Soft-limit ramp: bias the natural end marker instead of forcing,
-        # until the ramp is spent.
-        over = num_reasoning_tokens - budget
-        if over < SOFT_RAMP:
-            x = over.to(tl.float32) / SOFT_RAMP
-            if SOFT_CURVE != 1.0:
-                x = tl.where(x > 0.0, tl.exp2(SOFT_CURVE * tl.log2(x)), 0.0)
-            soft_token_id = tl.load(natural_reasoning_end_token_ids_ptr)
-            soft_ptr = logits_ptr + token_idx * logits_stride + soft_token_id
-            tl.store(soft_ptr, tl.load(soft_ptr) + SOFT_MAX_BIAS * x)
-            return
 
     # If the tail already ends with a prefix of the forced end sequence
     # (even from a resumed prompt), continue from the next marker token.
@@ -610,18 +523,16 @@ def forced_end_tokens_torch(
     reasoning_start_token_ids: torch.Tensor,
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
-    soft_limit: SoftLimit | None = None,
 ) -> tuple[list[int], list[int]]:
     """Torch reference of ``_thinking_budget_kernel``'s force decision.
 
     Returns the ``(row, token_id)`` pairs to force: the end-sequence token
     following the longest end-sequence prefix the row's effective prefix
-    already ends with. With a soft limit the force starts one ramp later.
+    already ends with.
     """
-    ramp = 0 if soft_limit is None else soft_limit.ramp
     rows: list[int] = []
     force_tokens: list[int] = []
-    for row, over, end_prefix_len in _over_budget_rows(
+    for row, _, end_prefix_len in _over_budget_rows(
         expanded_idx_mapping,
         thinking_token_budget,
         all_token_ids,
@@ -634,52 +545,9 @@ def forced_end_tokens_torch(
         natural_reasoning_end_token_ids,
         reasoning_end_token_ids,
     ):
-        if over < ramp:
-            continue
         rows.append(row)
         force_tokens.append(int(reasoning_end_token_ids[end_prefix_len]))
     return rows, force_tokens
-
-
-def soft_limit_rows_torch(
-    expanded_idx_mapping: torch.Tensor,
-    thinking_token_budget: torch.Tensor,
-    all_token_ids: torch.Tensor,
-    total_len: torch.Tensor,
-    input_ids: torch.Tensor,
-    expanded_local_pos: torch.Tensor,
-    cached_last_start: torch.Tensor,
-    cached_last_end: torch.Tensor,
-    reasoning_start_token_ids: torch.Tensor,
-    natural_reasoning_end_token_ids: torch.Tensor,
-    reasoning_end_token_ids: torch.Tensor,
-    soft_limit: SoftLimit,
-) -> tuple[list[int], list[float]]:
-    """Torch reference of the ramp: ``(row, bias)`` for rows inside it."""
-    if not soft_limit.active:
-        return [], []
-    rows: list[int] = []
-    biases: list[float] = []
-    for row, over, _ in _over_budget_rows(
-        expanded_idx_mapping,
-        thinking_token_budget,
-        all_token_ids,
-        total_len,
-        input_ids,
-        expanded_local_pos,
-        cached_last_start,
-        cached_last_end,
-        reasoning_start_token_ids,
-        natural_reasoning_end_token_ids,
-        reasoning_end_token_ids,
-    ):
-        if over >= soft_limit.ramp_tokens:
-            continue
-        bias = soft_limit.bias(over, 0)
-        if bias > 0.0:
-            rows.append(row)
-            biases.append(bias)
-    return rows, biases
 
 
 def apply_thinking_budget_torch(
@@ -697,7 +565,6 @@ def apply_thinking_budget_torch(
     reasoning_start_token_ids: torch.Tensor,
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
-    soft_limit: SoftLimit | None = None,
 ) -> None:
     """Torch reference of ``apply_thinking_budget`` (runs on CPU tensors)."""
     update_marker_cache_torch(
@@ -724,65 +591,12 @@ def apply_thinking_budget_torch(
         natural_reasoning_end_token_ids,
         reasoning_end_token_ids,
     )
-    if soft_limit is not None and soft_limit.active:
-        soft_rows, biases = soft_limit_rows_torch(*walk, soft_limit)
-        if soft_rows:
-            token = int(natural_reasoning_end_token_ids[0])
-            logits[
-                torch.tensor(soft_rows, dtype=torch.int64, device=logits.device),
-                token,
-            ] += torch.tensor(biases, dtype=logits.dtype, device=logits.device)
-    rows, force_tokens = forced_end_tokens_torch(*walk, soft_limit)
+    rows, force_tokens = forced_end_tokens_torch(*walk)
     if rows:
         logits[
             torch.tensor(rows, dtype=torch.int64, device=logits.device),
             torch.tensor(force_tokens, dtype=torch.int64, device=logits.device),
         ] = 1.0e9
-
-
-def update_marker_cache(
-    req_ids: torch.Tensor,
-    thinking_token_budget: torch.Tensor,
-    all_token_ids: torch.Tensor,
-    total_len: torch.Tensor,
-    cached_last_start: torch.Tensor,
-    cached_last_end: torch.Tensor,
-    cached_scan_pos: torch.Tensor,
-    reasoning_start_token_ids: torch.Tensor,
-    natural_reasoning_end_token_ids: torch.Tensor,
-) -> None:
-    """Refresh the committed reasoning marker cache (Triton on CUDA)."""
-    if all_token_ids.device.type != "cuda":
-        update_marker_cache_torch(
-            req_ids,
-            thinking_token_budget,
-            all_token_ids,
-            total_len,
-            cached_last_start,
-            cached_last_end,
-            cached_scan_pos,
-            reasoning_start_token_ids,
-            natural_reasoning_end_token_ids,
-        )
-        return
-    start_len = reasoning_start_token_ids.shape[0]
-    natural_end_len = natural_reasoning_end_token_ids.shape[0]
-    _update_committed_marker_cache_kernel[(req_ids.shape[0],)](
-        req_ids,
-        thinking_token_budget,
-        all_token_ids,
-        all_token_ids.stride(0),
-        total_len,
-        cached_last_start,
-        cached_last_end,
-        cached_scan_pos,
-        reasoning_start_token_ids,
-        natural_reasoning_end_token_ids,
-        START_LEN=start_len,
-        NATURAL_END_LEN=natural_end_len,
-        MAX_LEN=max(start_len, natural_end_len),
-        BLOCK=_COLD_SCAN_BLOCK,
-    )
 
 
 def apply_thinking_budget(
@@ -800,7 +614,6 @@ def apply_thinking_budget(
     reasoning_start_token_ids: torch.Tensor,
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
-    soft_limit: SoftLimit | None = None,
 ) -> None:
     if logits.device.type != "cuda":
         apply_thinking_budget_torch(
@@ -818,7 +631,6 @@ def apply_thinking_budget(
             reasoning_start_token_ids,
             natural_reasoning_end_token_ids,
             reasoning_end_token_ids,
-            soft_limit,
         )
         return
 
@@ -862,7 +674,4 @@ def apply_thinking_budget(
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
         END_LEN=end_len,
-        SOFT_RAMP=0 if soft_limit is None else soft_limit.ramp,
-        SOFT_MAX_BIAS=0.0 if soft_limit is None else float(soft_limit.max_bias),
-        SOFT_CURVE=1.0 if soft_limit is None else float(soft_limit.curve),
     )

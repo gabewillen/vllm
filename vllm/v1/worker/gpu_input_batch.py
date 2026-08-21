@@ -1165,23 +1165,6 @@ class InputBatch:
             and len(self.repetition_penalties_reqs) == 0
         )
 
-    def update_thinking_budgets(
-        self, updates: dict[str, tuple[int, int]]
-    ) -> dict[str, int]:
-        """Apply versioned thinking budget updates; return req_id -> revision.
-
-        Must run after ``refresh_metadata`` so holder indices match the batch.
-        """
-        holder = self.thinking_budget_state_holder
-        if holder is None or not updates:
-            return {}
-        acks: dict[str, int] = {}
-        for req_id, (revision, budget) in updates.items():
-            index = self.req_id_to_index.get(req_id)
-            if index is not None and holder.update_budget(index, revision, budget):
-                acks[req_id] = revision
-        return acks
-
     @property
     def no_thinking_budget(self) -> bool:
         return (

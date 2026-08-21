@@ -109,9 +109,10 @@ compilation-config: '{"max_cudagraph_capture_size": 96}'
 speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
 kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
 reasoning-parser: qwen3
-# Dynamic reasoning effort (venv patches 0009-0012,
-# docs/dynamic-reasoning.claude.md §13; results in
-# docs/dynamic-reasoning-v3-results.md).
+# Dynamic reasoning effort v3 (venv patch 0009, docs/dynamic-reasoning.claude.md
+# §13; results in docs/dynamic-reasoning-v3-results.md). The v1 rung ladder and
+# the v2 rank rule / soft-limit close were removed on 2026-08-21; this is the
+# only dynamic-effort implementation in the tree.
 #
 # `reasoning_effort: "dynamic"` gives a request one effort LEVEL before it
 # thinks and renders that level's sentence at the TRUE TAIL of the prompt (a
@@ -128,17 +129,20 @@ reasoning-parser: qwen3
 # memory; spread: the neighbours disagree), because one under-thought step can
 # kill a trajectory while over-thinking only costs tokens.
 #
-# There is NO thinking cap on this path: no rung ladder, no mid-generation
-# escalation, no soft-limit ramp. The model closes its own think block, and the
-# only thing that can cut it short is the loop-stall guard (n-gram + rolling
-# hash + the request's own repetition_detection), which reports
-# close_kind=stall. Nothing is trained and there is no offline corpus: a cold
-# memory, a missing vector or a prompt with no usable seam all render the
-# default level with a byte-identical prompt.
+# There is NO thinking cap on this path: no ladder, no mid-generation
+# escalation, no soft-limit ramp, no forced close. The model closes its own
+# think block (close_kind=natural) or the client's max_tokens / a timeout ends
+# it (close_kind=client-limit, not valued in the memory). Nothing is trained and
+# there is no offline corpus: a cold memory, a missing vector or a prompt with
+# no usable seam all render the default level with a byte-identical prompt.
 # default_effort: a request that OMITS reasoning_effort is routed instead of
 # falling through to the chat template's own default, which for Qwen3.8 is
 # xhigh - the most expensive level there is. An explicit level (including
-# "none") is never overridden. The throughput profile uses the same setup with its own memory file.
+# "none") is never overridden. The throughput profile uses the same setup with
+# its own memory file. Per-request telemetry (VLLM_EFFORT_TELEMETRY, drop-in
+# effort-telemetry.conf): per-step entropy/margin rows plus one `event: finish`
+# record with requested vs effective effort and this report
+# (level, decided, reasoning_tokens, close_kind, memory_entries, neighbours).
 reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder

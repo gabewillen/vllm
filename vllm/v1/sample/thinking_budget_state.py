@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Per-batch thinking token budget state; applied after penalties at sample time.
-
-Two actuations live here: the soft-limit ramp (a rising bias on the natural end
-token from the cap onward) and the hard force of the configured end sequence,
-which the ramp pushes back to ``cap + ramp_tokens``. See
-``vllm/v1/sample/soft_limit.py``.
-"""
+"""Per-batch thinking token budget state; applied after penalties at sample time."""
 
 from typing import TYPE_CHECKING, Any
 
@@ -18,7 +12,6 @@ from vllm.v1.sample.logits_processor.interface import (
     BatchUpdate,
     MoveDirectionality,
 )
-from vllm.v1.sample.soft_limit import SoftLimit, soft_limit_from_reasoning_config
 
 if TYPE_CHECKING:
     from vllm.config.reasoning import ReasoningConfig
@@ -63,23 +56,11 @@ class ThinkingBudgetStateHolder:
         if reasoning_config is None:
             self.think_start_token_ids = []
             self.think_end_token_ids = []
-            natural_end: list[int] = []
         else:
             rs = reasoning_config.reasoning_start_token_ids
             re = reasoning_config.reasoning_end_token_ids
             self.think_start_token_ids = rs if rs else []
             self.think_end_token_ids = re if re else []
-            natural = getattr(reasoning_config, "natural_reasoning_end_token_ids", None)
-            natural_end = list(natural) if natural else list(self.think_end_token_ids)
-
-        # The ramp biases the marker the *parser* detects, not the (possibly
-        # graceful, multi-token) forced close: a soft close must read like the
-        # model's own.
-        self.soft_limit: SoftLimit = soft_limit_from_reasoning_config(reasoning_config)
-        self.soft_end_token_id: int | None = natural_end[0] if natural_end else None
-        if self.soft_end_token_id is None:
-            self.soft_limit = SoftLimit(enabled=False)
-        self.soft_ramp = self.soft_limit.ramp
 
         self.device = device
         self._state: dict[int, dict[str, Any]] = {}
@@ -129,25 +110,6 @@ class ThinkingBudgetStateHolder:
                 state = self._state.pop(i1, None)
                 if state is not None:
                     self._state[i2] = state
-
-    def update_budget(self, index: int, revision: int, budget: int) -> bool:
-        """Apply a versioned budget update to a tracked request.
-
-        Only strictly increasing revisions are applied. The remaining-budget
-        countdown is shifted by the budget delta; a request already forcing
-        the end sequence keeps forcing (the update landed late).
-        """
-        state = self._state.get(index)
-        if state is None or revision <= state["budget_revision"]:
-            return False
-        state["budget_revision"] = revision
-        budget = max(budget, 0)
-        state["soft_cap"] = budget
-        hard = budget + self.soft_ramp
-        delta = hard - state["thinking_token_budget"]
-        state["thinking_token_budget"] = hard
-        state["check_count_down"] += delta
-        return True
 
     def update_state(
         self,
@@ -209,10 +171,6 @@ class ThinkingBudgetStateHolder:
     def _init_state_entry(
         self, prompt_tok_ids: list[int] | None, thinking_token_budget: int
     ) -> dict[str, Any]:
-        # The request asks for a cap; the ramp turns it into a soft cap (where
-        # the bias starts) and a hard budget (where the force fires).
-        soft_cap = thinking_token_budget
-        thinking_token_budget = soft_cap + self.soft_ramp
         if prompt_tok_ids is None:
             last_start = -1
             last_end = -1
@@ -258,8 +216,6 @@ class ThinkingBudgetStateHolder:
             "prompt_tok_ids": prompt_tok_ids,
             "output_tok_ids": [],
             "thinking_token_budget": thinking_token_budget,
-            "soft_cap": soft_cap,
-            "budget_revision": -1,
             "prev_output_length": 0,
             "spec_token_ids": [],
             "force_index": [],
@@ -550,21 +506,11 @@ class ThinkingBudgetStateHolder:
         # avoid per-iteration scalar sync writes to GPU tensors.
         active_indices_cpu: list[int] = []
         force_tokens_cpu: list[int] = []
-        soft_indices_cpu: list[int] = []
-        soft_bias_cpu: list[float] = []
 
         for seq_idx in sorted(self._state.keys()):
             if seq_idx not in self.cu_num_tokens:
                 continue
             state = self._state[seq_idx]
-            self._collect_soft_rows(
-                seq_idx,
-                state,
-                logits.shape[0],
-                predict_bonus_token,
-                soft_indices_cpu,
-                soft_bias_cpu,
-            )
             if state.get("in_end", False):
                 # logits processor in spec mode are called twice
                 # once for bonus token logits and
@@ -633,86 +579,4 @@ class ThinkingBudgetStateHolder:
                 fill = logits.new_full((len(active_indices_cpu),), 1e9)
                 logits.index_put_((active_indices, force_tokens), fill)
 
-        if soft_indices_cpu:
-            self._add_soft_bias(logits, soft_indices_cpu, soft_bias_cpu)
-
         return logits
-
-    def _soft_row_positions(
-        self, seq_idx: int, spec_len: int, predict_bonus_token: bool
-    ) -> list[tuple[int, int]]:
-        """`(logits row, local draft position)` of one request's rows."""
-        base = self.cu_num_tokens[seq_idx]
-        if not self.in_spec_mode:
-            return [(base, 0)]
-        if predict_bonus_token:
-            return [(base, spec_len)]
-        return [(base + j, j) for j in range(spec_len)]
-
-    def _collect_soft_rows(
-        self,
-        seq_idx: int,
-        state: dict[str, Any],
-        num_rows: int,
-        predict_bonus_token: bool,
-        indices: list[int],
-        biases: list[float],
-    ) -> None:
-        """Ramp bias for the rows of one request sitting inside its ramp."""
-        if not self.soft_limit.active or self.soft_end_token_id is None:
-            return
-        cap = state.get("soft_cap")
-        if cap is None or cap < 0:
-            return
-        if state["start_thinking"] < 0 and not state.get("continue_thinking", False):
-            return
-        if state.get("in_end", False) and state.get("end_count", 0) > 0:
-            # The close is already being emitted; biasing it again is noise.
-            return
-        # Neither counter is exact on its own: ``think_count`` is refreshed
-        # only once the countdown runs out, and ``check_count_down`` is reset
-        # to the full budget when the state flips to forcing. Whichever is
-        # larger is the request's committed think position.
-        think_count = max(
-            state.get("think_count", 0),
-            state["thinking_token_budget"] - state["check_count_down"],
-        )
-        ramp = self.soft_limit.ramp_tokens
-        spec_len = len(state.get("spec_token_ids", []))
-        for row, local_pos in self._soft_row_positions(
-            seq_idx, spec_len, predict_bonus_token
-        ):
-            if row >= num_rows or row >= self._mask_capacity:
-                continue
-            over = think_count + local_pos - cap
-            if not 0 < over < ramp:
-                # At or below the cap the bias is 0; a full ramp past it the
-                # force owns the row.
-                continue
-            indices.append(row)
-            biases.append(self.soft_limit.bias(think_count + local_pos, cap))
-
-    def _add_soft_bias(
-        self, logits: torch.Tensor, rows: list[int], biases: list[float]
-    ) -> None:
-        device = logits.device
-        token = self.soft_end_token_id
-        assert token is not None
-        values = logits.new_tensor(biases)
-        if current_platform.is_rocm() and logits.is_contiguous():
-            vocab_size = logits.shape[1]
-            flat = async_tensor_h2d(
-                [row * vocab_size + token for row in rows],
-                dtype=torch.long,
-                device=device,
-            )
-            logits.view(-1).index_add_(0, flat, values)
-        elif current_platform.is_rocm():
-            for row, bias in zip(rows, biases):
-                logits[row, token] += bias
-        else:
-            row_idx = async_tensor_h2d(rows, dtype=torch.long, device=device)
-            col_idx = async_tensor_h2d(
-                [token] * len(rows), dtype=torch.long, device=device
-            )
-            logits.index_put_((row_idx, col_idx), values, accumulate=True)

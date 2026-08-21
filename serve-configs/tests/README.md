@@ -13,6 +13,8 @@ query-length capture policy, micro-batch metadata slicing) and the
 `serve-configs/middleware/vllm_keepalive.py` ASGI behavior. GPU behavior is
 covered by the goal-run evidence linked from `serve-configs/patches/README.md`.
 
-Patch 0009 (dynamic reasoning effort) is covered by `test_effort_telemetry.py`,
-`test_v2_thinking_budget.py` and `test_effort_controller.py`. To run them against
+Patch 0009 (dynamic reasoning effort v3 + telemetry) is covered by
+`test_effort_telemetry.py`, `test_effort_levels.py`, `test_effort_memory.py`,
+`test_effort_two_phase.py`, `test_effort_hidden_pooling.py` and
+`test_v2_thinking_budget.py`. To run them against
 a lane worktree instead of the installed package use `work/run-tests.sh <worktree> .`.

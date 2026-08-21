@@ -25,9 +25,6 @@ class SamplerOutput:
     effort_signals: torch.Tensor | None = None
     # [num_reqs] bool host mask of the opted-in requests.
     effort_flags: np.ndarray | None = None
-    # [num_reqs, 4] int32 (rung, escalations, grace tokens, late) from the
-    # worker-side escalation rule; None when no request is worker-evaluated.
-    effort_reports: torch.Tensor | None = None
 
 
 @triton.jit

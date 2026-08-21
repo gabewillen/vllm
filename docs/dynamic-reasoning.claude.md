@@ -1198,3 +1198,28 @@ cost of a higher level is now *entirely* the sentence, because there is no cap
 to grant. §13.6's deletions are done and then some — what remains is the
 worker-side escalation tensors, which are inert (nothing sets `worker_eval`) and
 are the next cutover on this branch.
+
+### 13.11 Addendum — v3 is the release; v1 and v2 removed (2026-08-21)
+
+`qwen3.8-27B-effort-v3` was merged into `qwen3.8-27B` and deployed on the
+latency profile (INT4, V2 runner, `default_effort: dynamic`). In the same
+pass everything that belonged to v1 (§2c rung ladder, per-rung caps,
+mid-generation escalation, the `(mean, sd)` calibration table, stall clamp,
+batch-size rung cap, deadline, `late`) and v2 (§11 quantile sketches, rank
+rule, p(end) grace, worker-side escalation tensors; §12 soft-limit close,
+`force_end_str`; versioned `thinking_budget_updates` / `thinking_budget_acks`)
+was deleted from the tree: `effort_policy.py`, `effort_escalation.py`,
+`soft_limit.py`, `effort_calibrate.py`, `SignalSketches`, and the tests that
+covered them. `effort_quantiles.py` keeps only the t-digest the memory uses.
+The V1 `ThinkingBudgetStateHolder` is back to upstream and the V2
+`ThinkingBudgetState` is upstream plus the greedy-force fix and its CPU torch
+reference, so an explicit `thinking_token_budget` forces at the budget exactly
+as stock vLLM does. The deployment patch set is now 0001–0008 plus one
+consolidated `0009-dynamic-reasoning-effort-v3.patch` (telemetry + v3).
+
+What ships: §13 as described in §13.10, the per-step telemetry of §3, and one
+`event: finish` record per request in the telemetry sink with
+`requested_effort` / `effective_effort` and `EffortState.report` (`level`,
+`decided`, `reasoning_tokens`, `close_kind`, `memory_entries`, `neighbours`).
+`work/effort-finish-report.py` summarises it. §§2c, 11 and 12 above are history
+and describe code that no longer exists; the numbers they record stand.

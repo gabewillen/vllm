@@ -18,7 +18,6 @@ from vllm.v1.outputs import (
     RoutedExpertsTensors,
 )
 from vllm.v1.sample.effort_signals import signals_to_dict
-from vllm.v1.worker.gpu.sample.effort_escalation import reports_to_dict
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.utils import raise_if_nan_logits
 
@@ -154,9 +153,6 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.effort_signals_np: np.ndarray | None = None
             if sampler_output.effort_signals is not None:
                 self.effort_signals_np = async_copy_to_np(sampler_output.effort_signals)
-            self.effort_reports_np: np.ndarray | None = None
-            if sampler_output.effort_reports is not None:
-                self.effort_reports_np = async_copy_to_np(sampler_output.effort_reports)
             self.effort_prefill_states_np: np.ndarray | None = None
             if effort_prefill_states is not None:
                 self.effort_prefill_states_np = async_copy_to_np(
@@ -209,11 +205,6 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 self.model_runner_output.req_ids,
                 self.effort_signals_np,
                 self.sampler_output.effort_flags,
-            )
-
-        if self.effort_reports_np is not None:
-            self.model_runner_output.effort_reports = reports_to_dict(
-                self.model_runner_output.req_ids, self.effort_reports_np
             )
 
         if self.effort_prefill_states_np is not None:

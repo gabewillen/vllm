@@ -1,0 +1,3987 @@
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index 0ac93be082..7c093a399b 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -3,11 +3,161 @@
+ 
+ from dataclasses import field
+ 
++from pydantic import Field
++
+ from vllm.config.model import ModelConfig
+ from vllm.config.utils import config
+ from vllm.reasoning import ReasoningParserManager
+ from vllm.tokenizers import cached_tokenizer_from_config
+ 
++VALID_REASONING_EFFORTS = frozenset(
++    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "dynamic"}
++)
++"""The `reasoning_effort` values the chat completion API accepts; kept in step
++with `ChatCompletionRequest.reasoning_effort`."""
++
++QWEN_LOW_EFFORT_SENTENCE = (
++    "Reasoning effort is set to low. Keep your thinking brief and focused, "
++    "moving directly to the conclusion without unnecessary elaboration."
++)
++
++QWEN_HIGH_EFFORT_SENTENCE = (
++    "Reasoning effort is set to high. Think this through carefully and "
++    "completely before answering, checking your work as you go."
++)
++
++
++@config
++class HiddenEffortConfig:
++    """Prefill hidden-state routing of the effort level (§13).
++
++    The last prompt token's final hidden state - the vector `lm_head` consumes,
++    produced by the prefill that was going to happen anyway - is matched against
++    an online memory of the server's own finished requests, keyed by cosine and
++    valued by the reasoning tokens each of them actually spent. Nothing is
++    fitted; the cuts are percentile ranks of running digests.
++
++    Off by default: a deployment that does not set this renders every dynamic
++    request at `default_level`.
++    """
++
++    enabled: bool = False
++    """Split the prompt at the effort sentence and choose the level from the
++    body's pooled hidden state."""
++    shadow: bool = False
++    """Compute and log the decision but always render `default_level` (§13.8
++    step 1). The memory still fills, so a shadow day warms it for free."""
++    memory_size: int = Field(default=4096, ge=16)
++    """Entries in the ring. 512 already reach the measured AUC of 2048, so
++    4096 is headroom; it costs `memory_size * hidden_size * 4` bytes of host
++    RAM (84 MB at 4096 x 5120) and half that on disk."""
++    min_entries: int = Field(default=128, ge=1)
++    """Entries the memory needs before it may decide. Below this the request
++    is rendered at `default_level`, and the query result - which is still
++    computed once there are `k` entries - only warms the digests."""
++    k: int = Field(default=16, ge=1)
++    """Neighbours the value estimate averages over."""
++    temperature: float = Field(default=0.05, gt=0.0)
++    """Softmax temperature on cosine similarity in the neighbour weights."""
++    q_mid: float = Field(default=0.35, ge=0.0, le=1.0)
++    """Estimate rank at or above which the request gets the middle level."""
++    q_high: float = Field(default=0.60, ge=0.0, le=1.0)
++    """Estimate rank at or above which it gets the top level."""
++    novelty_gate_q: float = Field(default=0.60, ge=0.0, le=1.0)
++    """Novelty rank the *downward* band requires: above it the memory has
++    nothing similar, so it cannot be trusted to say "easy"."""
++    spread_gate_q: float = Field(default=0.60, ge=0.0, le=1.0)
++    """Neighbour-disagreement rank the downward band requires."""
++    digest_compression: float = Field(default=100.0, ge=10.0)
++    """t-digest compression of the estimate / novelty / spread digests."""
++    memory_path: str | None = None
++    """`.npz` the memory is persisted to and warmed from. `None` keeps it in
++    memory, so a restart starts cold."""
++    flush_every: int = Field(default=256, ge=0)
++    """Inserts between two writes of `memory_path`; 0 disables."""
++    split_min_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
++    """Safety net: the fraction of the prompt the body must cover before the
++    split is made at all. The effort sentence sits at the very tail of the
++    prompt, so the body is normally everything the model reads except the
++    sentence - but on a hybrid model the KV block can be wide (1648 tokens on
++    the Qwen3.8 profile) and a non-final prefill chunk may only end on a block
++    boundary, so the body is quantised down to one. A prompt with no boundary
++    at or above this fraction takes no decision at all and runs at
++    `default_level`, with a byte-identical prompt."""
++    effort_sentences: list[str] | None = None
++    """One prompt sentence per effort level, lowest first. `None` uses
++    `[low, "", high]`: the model's own `low` and `xhigh` wording, with the
++    middle level rendering no sentence at all - the chat template's `medium`.
++    The sentence is the *whole* actuator: it is placed at the true tail of the
++    prompt, after the last message, so the body before it is byte-identical
++    across levels and one body per conversation is cached."""
++    default_level: int = Field(default=0, ge=0)
++    """Level a request gets when no decision can be made - a cold memory, a
++    missing vector, a prompt with no usable seam. 0 is the `low` sentence."""
++
++    def __post_init__(self) -> None:
++        if self.q_high < self.q_mid:
++            raise ValueError("hidden_effort.q_high must be >= q_mid")
++        if self.k > self.memory_size:
++            raise ValueError("hidden_effort.k must not exceed memory_size")
++        if self.effort_sentences is not None and len(self.effort_sentences) < 2:
++            raise ValueError("hidden_effort.effort_sentences needs at least two levels")
++        if self.default_level >= len(self.sentences()):
++            raise ValueError("hidden_effort.default_level is outside the levels")
++
++    def sentences(self) -> list[str]:
++        """The tail sentence of each effort level, lowest first."""
++        if self.effort_sentences is not None:
++            return list(self.effort_sentences)
++        return [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_HIGH_EFFORT_SENTENCE]
++
++
++@config
++class DynamicEffortConfig:
++    """Server defaults for `reasoning_effort: "dynamic"`.
++
++    A dynamic request is given one effort **level** before it thinks, chosen
++    from its own pooled prefill hidden state (`hidden_effort`), and rendered as
++    that level's sentence at the tail of the prompt. Nothing else touches the
++    think block: no thinking cap, no forced close, no mid-generation
++    escalation and no stall detector. The model ends its own reasoning, bounded
++    only by the client's `max_tokens` and timeouts, exactly as a fixed effort
++    level is.
++    """
++
++    hidden_effort: HiddenEffortConfig = field(default_factory=HiddenEffortConfig)
++    """Which level a request gets, and the memory that decides it."""
++    default_effort: str | None = None
++    """`reasoning_effort` to assume when a chat completion **omits** it.
++
++    `None` (the default) keeps today's behaviour: an omitted value reaches the
++    chat template as `None` and the template picks its own default, which for
++    Qwen3.8 is `xhigh` - the most expensive level there is. Setting this to
++    `"dynamic"` makes the omitted case route itself instead. An explicit
++    `reasoning_effort` on the request is never overridden, including `"none"`.
++    A deployment that wants the template default back sets it to `None`."""
++    render_effort: str = "medium"
++    """`reasoning_effort` value handed to the chat template for dynamic
++    requests, so block 0 of the prompt is identical for every level and the
++    level lives only in the tail sentence."""
++
++    def __post_init__(self) -> None:
++        if self.default_effort is not None and self.default_effort not in (
++            VALID_REASONING_EFFORTS
++        ):
++            raise ValueError(
++                f"dynamic_effort.default_effort must be null or one of "
++                f"{sorted(VALID_REASONING_EFFORTS)}, got {self.default_effort!r}"
++            )
++
++    @property
++    def level_sentences(self) -> list[str]:
++        return self.hidden_effort.sentences()
++
++    @property
++    def num_levels(self) -> int:
++        return len(self.level_sentences)
++
+ 
+ @config
+ class ReasoningConfig:
+@@ -25,6 +175,8 @@ class ReasoningConfig:
+     """String that indicates the start of reasoning."""
+     reasoning_end_str: str = ""
+     """String forced when the thinking budget is exhausted."""
++    dynamic_effort: DynamicEffortConfig | None = None
++    """Server defaults for `reasoning_effort: "dynamic"`; `None` rejects it."""
+ 
+     _reasoning_start_token_ids: list[int] | None = field(
+         default=None, init=False, repr=False
+diff --git a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+new file mode 100644
+index 0000000000..e3dd25f16a
+--- /dev/null
++++ b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+@@ -0,0 +1,160 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Frontend half of `reasoning_effort: "dynamic"` (docs/dynamic-reasoning §13).
++
++`dynamic` never reaches the chat template. The request is rewritten in place:
++the template sees `render_effort` (medium: no effort sentence, so block 0 of the
++prompt is identical for every level), and each effort level is rendered as a
++**trailing user message carrying only that level's sentence**, after the last
++message of the conversation. That is the true tail of the prompt, which is where
++the model actually honours it - measured on this box 2026-08-19: with the
++sentence on the last *user* message of an agent turn (the placement patch 0009
++shipped) the `xhigh` wording moves reasoning length 1.14x against no sentence,
++because a tool result sits between it and the generation point; as a trailing
++user message it moves it 1.23x up and 0.78x down.
++
++The engine gets the shared body and one tail per level and picks the level from
++the body's own pooled hidden state before the model thinks. No thinking budget
++is set: on this path the model ends its own think block.
++"""
++
++import copy
++from typing import TYPE_CHECKING, Any
++
++from vllm.config.reasoning import DynamicEffortConfig
++
++if TYPE_CHECKING:
++    from vllm.entrypoints.openai.chat_completion.protocol import (
++        ChatCompletionRequest,
++    )
++
++_LEVEL_KEY = "dynamic_effort_level"
++
++
++class DynamicEffortError(ValueError):
++    """Client error in a dynamic-effort request (rendered as HTTP 400)."""
++
++
++def build_dynamic_effort_overrides(
++    cfg: DynamicEffortConfig, xargs: dict[str, Any] | None
++) -> dict[str, Any]:
++    """Validate the per-request `vllm_xargs` and merge them over `cfg`."""
++    xargs = xargs or {}
++    overrides: dict[str, Any] = {}
++    if _LEVEL_KEY in xargs and xargs[_LEVEL_KEY] is not None:
++        raw = xargs[_LEVEL_KEY]
++        if isinstance(raw, bool) or not isinstance(raw, int):
++            raise DynamicEffortError(f"vllm_xargs.{_LEVEL_KEY} must be an integer")
++        if not 0 <= raw < cfg.num_levels:
++            raise DynamicEffortError(
++                f"vllm_xargs.{_LEVEL_KEY} must be in [0, {cfg.num_levels - 1}]"
++            )
++        overrides["forced_level"] = raw
++    return overrides
++
++
++def append_to_last_message(messages: list[Any], sentence: str) -> bool:
++    """Append `sentence` as a trailing user message; True if it was added."""
++    if not sentence:
++        return False
++    messages.append({"role": "user", "content": sentence})
++    return True
++
++
++def apply_default_effort(
++    request: "ChatCompletionRequest", cfg: DynamicEffortConfig | None
++) -> None:
++    """Fill in `reasoning_effort` when the client omitted it entirely.
++
++    Only an *absent* value is filled: an explicit level, including `"none"`,
++    is left exactly as the client sent it. With `default_effort` unset the
++    request is untouched and the chat template picks its own default.
++    """
++    if request.reasoning_effort is not None:
++        return
++    if cfg is None or not cfg.default_effort:
++        return
++    request.reasoning_effort = cfg.default_effort  # type: ignore[assignment]
++
++
++def apply_dynamic_effort(
++    request: "ChatCompletionRequest", cfg: DynamicEffortConfig | None
++) -> None:
++    """Rewrite a `reasoning_effort: "dynamic"` request in place.
++
++    Raises:
++        DynamicEffortError: on conflicts, bad overrides or a server without
++            `dynamic_effort` in its reasoning config.
++    """
++    if request.reasoning_effort != "dynamic":
++        return
++    if cfg is None:
++        raise DynamicEffortError(
++            "reasoning_effort='dynamic' is not enabled on this server; start it "
++            "with --reasoning-config '{\"dynamic_effort\": {...}}'"
++        )
++    if request.thinking_token_budget is not None:
++        raise DynamicEffortError(
++            "reasoning_effort='dynamic' does not cap thinking; drop "
++            "thinking_token_budget or ask for a fixed effort level"
++        )
++    kwargs = request.chat_template_kwargs or {}
++    if "enable_thinking" in kwargs and not kwargs["enable_thinking"]:
++        raise DynamicEffortError(
++            "reasoning_effort='dynamic' conflicts with "
++            "chat_template_kwargs.enable_thinking=false"
++        )
++    overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
++    default_level = overrides.get("forced_level", cfg.hidden_effort.default_level)
++    variants = render_effort_variants(request.messages, cfg.level_sentences)
++    request.messages = variants[default_level]
++    request._dynamic_effort_variant_messages = variants
++    overrides["default_level"] = default_level
++    request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
++    request._dynamic_effort = overrides
++
++
++def render_effort_variants(
++    messages: list[Any], sentences: list[str]
++) -> list[list[Any]]:
++    """One message list per level, each with that level's tail sentence."""
++    variants: list[list[Any]] = []
++    for sentence in sentences:
++        rendered = copy.deepcopy(messages)
++        append_to_last_message(rendered, sentence)
++        variants.append(rendered)
++    return variants
++
++
++def split_body_and_tails(
++    variant_token_ids: list[list[int]],
++) -> tuple[int, list[list[int]]] | None:
++    """Split the rendered level variants into the shared body and per-level tails.
++
++    The variants differ only in the trailing sentence message, so their longest
++    common token prefix *is* the body of the §13.3 seam. The boundary is pulled
++    one token back so that the token at position `body_len` - the one an
++    eagle-family drafter reads ahead at a chunked-prefill boundary - is the same
++    whichever level is chosen.
++
++    Args:
++        variant_token_ids: the fully rendered prompt of each level, in level
++            order.
++
++    Returns:
++        `(body_len, tails)`, or `None` when the variants share no usable body.
++    """
++    if len(variant_token_ids) < 2 or any(not ids for ids in variant_token_ids):
++        return None
++    first = variant_token_ids[0]
++    common = len(first)
++    for ids in variant_token_ids[1:]:
++        limit = min(common, len(ids))
++        i = 0
++        while i < limit and ids[i] == first[i]:
++            i += 1
++        common = i
++    body_len = common - 1
++    if body_len < 1 or any(len(ids) <= body_len for ids in variant_token_ids):
++        return None
++    return body_len, [list(ids[body_len:]) for ids in variant_token_ids]
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index e8bb4e5678..8cbef8ac01 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -51,6 +51,7 @@ from vllm.sampling_params import (
+     ThinkingTokenBudget,
+ )
+ from vllm.utils import random_uuid
++from vllm.v1.core.sched.effort_controller import CLOSE_CLIENT_LIMIT, CLOSE_NATURAL
+ 
+ logger = init_logger(__name__)
+ 
+@@ -124,6 +125,42 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
+     routed_experts: str | None = None
+ 
+ 
++class EffortInfo(OpenAIBaseModel):
++    """Dynamic reasoning-effort outcome (`reasoning_effort: "dynamic"` only)."""
++
++    level: int
++    """Effort level the request ran at: an index into the server's level
++    sentences, lowest first."""
++    decided: bool = False
++    """The level came from the prompt's pooled prefill hidden state rather than
++    the server default (a cold memory or a prompt with no usable seam)."""
++    reasoning_tokens: int
++    close_kind: Literal["natural", "client-limit"] = "natural"
++    """How the think block ended: `natural` (the model closed it - nothing on
++    this path caps or forces the close) or `client-limit` (the request ran out
++    of `max_tokens` or was aborted while still thinking)."""
++    memory_entries: int = 0
++    """Entries the decision memory held when this request was decided."""
++    neighbours: int = 0
++    """Valued neighbours the kNN estimate averaged over."""
++
++    @classmethod
++    def from_report(cls, report: dict[str, Any] | None) -> "EffortInfo | None":
++        if report is None:
++            return None
++        close_kind = report.get("close_kind", CLOSE_NATURAL)
++        if close_kind not in (CLOSE_NATURAL, CLOSE_CLIENT_LIMIT):
++            close_kind = CLOSE_NATURAL
++        return cls(
++            level=report.get("level", 0),
++            decided=bool(report.get("decided", 0)),
++            reasoning_tokens=report.get("reasoning_tokens", 0),
++            close_kind=close_kind,
++            memory_entries=report.get("memory_entries", 0),
++            neighbours=report.get("neighbours", 0),
++        )
++
++
+ class ChatCompletionResponse(OpenAIBaseModel):
+     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
+     object: Literal["chat.completion"] = "chat.completion"
+@@ -147,6 +184,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
+         default=None, description="ECTransfer parameters."
+     )
+     metrics: PerRequestTimingMetrics | None = None
++    effort: EffortInfo | None = None
+ 
+ 
+ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
+@@ -179,6 +217,8 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
+     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
+     prompt_text: str | None = None
+     metrics: PerRequestTimingMetrics | None = None
++    # Set on the final usage chunk of a dynamic-effort request only.
++    effort: EffortInfo | None = None
+ 
+ 
+ class ChatCompletionToolsParam(OpenAIBaseModel):
+@@ -243,16 +283,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         | None
+     ) = "none"
+     reasoning_effort: (
+-        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
++        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "dynamic"]
++        | None
+     ) = Field(
+         default=None,
+         description=(
+             "Constrains effort on reasoning for reasoning models. "
+             "Currently supported values are none, minimal, low, medium, "
+-            "high, xhigh, and max. Reducing reasoning effort can result in "
+-            "faster responses and fewer tokens used on reasoning in a response. "
+-            "Note that 'max' is specific to the DeepSeek V4 series and is not "
+-            "part of the standard OpenAI API specification."
++            "high, xhigh, max, and dynamic. Reducing reasoning effort can "
++            "result in faster responses and fewer tokens used on reasoning in "
++            "a response. Note that 'max' is specific to the DeepSeek V4 series "
++            "and is not part of the standard OpenAI API specification. "
++            "'dynamic' is vLLM-specific: the engine picks an effort level per "
++            "request from the prompt's prefill hidden state (requires "
++            "--reasoning-config with dynamic_effort)."
+         ),
+     )
+     thinking_token_budget: ThinkingTokenBudget = None
+@@ -566,6 +610,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
+ 
+     _grammar_from_parser: bool = PrivateAttr(default=False)
+     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
++    _dynamic_effort: dict[str, Any] | None = PrivateAttr(default=None)
++    """Validated dynamic-effort overrides; set only by `apply_dynamic_effort`."""
++    _dynamic_effort_variant_messages: list[Any] | None = PrivateAttr(default=None)
++    """One message list per level, each carrying that level's tail sentence; set
++    by `apply_dynamic_effort` when `hidden_effort` is on. The serving layer
++    renders each of them to find the shared body (§13.3)."""
++    _effort_request: dict[str, Any] | None = PrivateAttr(default=None)
++    """`{"requested": <as sent, None if omitted>, "effective": <served>}` for
++    the effort telemetry finish record."""
+ 
+     def build_chat_params(
+         self,
+@@ -709,6 +762,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         if self.ec_transfer_params:
+             # Pass in ec_transfer_params via extra_args
+             extra_args["ec_transfer_params"] = self.ec_transfer_params
++        if self._dynamic_effort is not None:
++            extra_args["dynamic_effort"] = self._dynamic_effort
++            extra_args.setdefault("effort_telemetry", True)
++        if self._effort_request is not None:
++            extra_args["effort_request"] = self._effort_request
+         return SamplingParams.from_optional(
+             n=self.n,
+             presence_penalty=self.presence_penalty,
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 12c028276a..694026d760 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -5,11 +5,13 @@ import asyncio
+ import time
+ from collections.abc import AsyncGenerator, AsyncIterator
+ from collections.abc import Sequence as GenericSequence
++from copy import copy
+ from http import HTTPStatus
+ from typing import Any, Final, cast
+ 
+ from fastapi import Request
+ 
++from vllm.config.reasoning import DynamicEffortConfig
+ from vllm.engine.protocol import EngineClient
+ from vllm.entrypoints.chat_utils import (
+     ChatTemplateContentFormatOption,
+@@ -23,6 +25,12 @@ from vllm.entrypoints.generate.base.serving import (
+     clamp_prompt_logprobs,
+     format_token_id_placeholder,
+ )
++from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
++    DynamicEffortError,
++    apply_default_effort,
++    apply_dynamic_effort,
++    split_body_and_tails,
++)
+ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionLogProb,
+     ChatCompletionLogProbs,
+@@ -34,6 +42,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionResponseStreamChoice,
+     ChatCompletionStreamResponse,
+     ChatMessage,
++    EffortInfo,
+ )
+ from vllm.entrypoints.openai.engine.protocol import (
+     DeltaMessage,
+@@ -175,6 +184,11 @@ class OpenAIServingChat(GenerateBaseServing):
+         self.supports_code_interpreter = False
+         self.python_tool = None
+ 
++    def _dynamic_effort_config(self) -> DynamicEffortConfig | None:
++        vllm_config = getattr(self.engine_client, "vllm_config", None)
++        reasoning_config = getattr(vllm_config, "reasoning_config", None)
++        return getattr(reasoning_config, "dynamic_effort", None)
++
+     def _effective_chat_template_kwargs(
+         self, request: ChatCompletionRequest
+     ) -> dict[str, Any]:
+@@ -214,6 +228,48 @@ class OpenAIServingChat(GenerateBaseServing):
+ 
+         return await self.online_renderer.render_chat(request)
+ 
++    async def _attach_effort_tails(
++        self,
++        request: ChatCompletionRequest,
++        engine_inputs: list[EngineInput],
++    ) -> ErrorResponse | None:
++        """Render the other levels and record the §13.3 body/tail seam.
++
++        The prompt already submitted is the default-level variant. Rendering the rest
++        costs one chat-template pass and one tokenization each; the engine only
++        ever prefills the body once, because the body is identical across levels.
++        Anything unexpected (multiple prompts, an empty seam) silently leaves
++        the request on today's single-level path.
++        """
++        variants = request._dynamic_effort_variant_messages
++        request._dynamic_effort_variant_messages = None
++        if variants is None or request._dynamic_effort is None:
++            return None
++        if len(engine_inputs) != 1:
++            return None
++        rendered = [self._extract_prompt_components(engine_inputs[0]).token_ids]
++        for messages in variants[1:]:
++            variant_request = copy(request)
++            variant_request.messages = messages
++            result = await self.render_chat_request(variant_request)
++            if isinstance(result, ErrorResponse):
++                return result
++            _, variant_inputs = result
++            if len(variant_inputs) != 1:
++                return None
++            rendered.append(
++                self._extract_prompt_components(variant_inputs[0]).token_ids
++            )
++        if any(ids is None for ids in rendered):
++            return None
++        split = split_body_and_tails([list(ids) for ids in rendered])  # type: ignore[arg-type]
++        if split is None:
++            return None
++        body_len, tails = split
++        request._dynamic_effort["body_len"] = body_len
++        request._dynamic_effort["tails"] = tails
++        return None
++
+     async def create_chat_completion(
+         self,
+         request: ChatCompletionRequest,
+@@ -238,6 +294,20 @@ class OpenAIServingChat(GenerateBaseServing):
+         # Streaming response
+         tokenizer = self.renderer.tokenizer
+         assert tokenizer is not None
++        requested_effort = request.reasoning_effort
++        effort_config = self._dynamic_effort_config()
++        # An omitted reasoning_effort takes the server's default before
++        # anything else looks at it, so `dynamic` can be that default.
++        apply_default_effort(request, effort_config)
++        request._effort_request = {
++            "requested": requested_effort,
++            "effective": request.reasoning_effort,
++        }
++        if request.reasoning_effort == "dynamic":
++            try:
++                apply_dynamic_effort(request, effort_config)
++            except DynamicEffortError as e:
++                return self.create_error_response(str(e))
+         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+         parser: Parser | None = None
+         if self.parser_cls is not None:
+@@ -252,6 +322,10 @@ class OpenAIServingChat(GenerateBaseServing):
+             return result
+ 
+         conversation, engine_inputs = result
++        if request._dynamic_effort_variant_messages is not None:
++            variant_error = await self._attach_effort_tails(request, engine_inputs)
++            if variant_error is not None:
++                return variant_error
+ 
+         request_id = (
+             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+@@ -801,6 +875,9 @@ class OpenAIServingChat(GenerateBaseServing):
+                     usage=final_usage,
+                     system_fingerprint=self.system_fingerprint,
+                     metrics=stream_per_request_metrics,
++                    effort=EffortInfo.from_report(
++                        last_res.effort if last_res is not None else None
++                    ),
+                 )
+                 final_usage_data = final_usage_chunk.model_dump_json(
+                     exclude_unset=True, exclude_none=True
+@@ -1098,6 +1175,7 @@ class OpenAIServingChat(GenerateBaseServing):
+             kv_transfer_params=final_res.kv_transfer_params,
+             ec_transfer_params=final_res.ec_transfer_params,
+             metrics=per_request_metrics,
++            effort=EffortInfo.from_report(final_res.effort),
+         )
+ 
+         # Log complete response if output logging is enabled
+diff --git a/vllm/outputs.py b/vllm/outputs.py
+index 29584e0e34..12e3ff8596 100644
+--- a/vllm/outputs.py
++++ b/vllm/outputs.py
+@@ -122,6 +122,9 @@ class RequestOutput:
+             prefix-cache writes for this request.
+         kv_transfer_params: The params for remote K/V transfer.
+         ec_transfer_params: The params for remote encoder-cache transfer.
++        effort: Dynamic reasoning-effort report (level, decided,
++            reasoning_tokens, close_kind, memory_entries, neighbours), set on
++            the final output.
+     """
+ 
+     def __init__(
+@@ -141,6 +144,7 @@ class RequestOutput:
+         *,
+         kv_transfer_params: dict[str, Any] | None = None,
+         ec_transfer_params: dict[str, Any] | None = None,
++        effort: dict[str, int] | None = None,
+         # Forward compatibility, code that uses args added in new release can
+         # still run with older versions of vLLM without breaking.
+         **kwargs: Any,
+@@ -163,6 +167,7 @@ class RequestOutput:
+         self.num_cache_creation_tokens = num_cache_creation_tokens
+         self.kv_transfer_params = kv_transfer_params
+         self.ec_transfer_params = ec_transfer_params
++        self.effort = effort
+ 
+     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
+         """Merge subsequent RequestOutput into this one"""
+@@ -170,6 +175,8 @@ class RequestOutput:
+         self.finished |= next_output.finished
+         self.kv_transfer_params = next_output.kv_transfer_params
+         self.ec_transfer_params = next_output.ec_transfer_params
++        if next_output.effort is not None:
++            self.effort = next_output.effort
+ 
+         for next_completion in next_output.outputs:
+             for i, completion in enumerate(self.outputs):
+diff --git a/vllm/v1/core/sched/effort_controller.py b/vllm/v1/core/sched/effort_controller.py
+new file mode 100644
+index 0000000000..125418f0cd
+--- /dev/null
++++ b/vllm/v1/core/sched/effort_controller.py
+@@ -0,0 +1,169 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Dynamic reasoning-effort state: one level per request, chosen before thinking.
++
++`reasoning_effort: "dynamic"` picks an effort **level** from the prompt's own
++pooled prefill hidden state, before the model has produced a single reasoning
++token, and renders that level's sentence at the tail of the prompt
++(docs/dynamic-reasoning.claude.md §13).
++
++That sentence is the whole actuator. Nothing here touches the think block: no
++thinking cap, no forced close, no mid-generation escalation, no stall detector.
++The model ends its own reasoning, bounded only by the client's `max_tokens` and
++timeouts - exactly as it is at a fixed effort level. What is left is
++bookkeeping: how many reasoning tokens the request spent and whether it closed
++its think block itself, which is what the memory needs in order to value the
++entry (a request cut off by the client is right-censored).
++"""
++
++from collections.abc import Sequence
++from dataclasses import dataclass, field
++from typing import Any
++
++from vllm.config.reasoning import DynamicEffortConfig
++
++CLOSE_NATURAL = "natural"
++"""The model ended its own think block."""
++CLOSE_CLIENT_LIMIT = "client-limit"
++"""The request ran out of `max_tokens`, was aborted, or otherwise ended while
++still inside the think block. The length it would have spent is unknown."""
++
++
++@dataclass
++class EffortEvent:
++    """Per-step observations for one request (all CPU scalars)."""
++
++    new_token_ids: Sequence[int]
++    """Committed output tokens of this step, in commit order."""
++
++
++@dataclass
++class EffortState:
++    """Controller state for one request."""
++
++    request_id: str
++    num_levels: int
++    start_ids: list[int]
++    end_ids: list[int]
++
++    level: int = 0
++    """Effort level the prefill decision chose; index into the level sentences."""
++    decided: bool = False
++    """A hidden-state decision was made (as opposed to the server default)."""
++
++    in_think: bool = False
++    think_count: int = 0
++    reasoning_tokens: int = 0
++    close_kind: str = CLOSE_NATURAL
++    finished: bool = False
++
++    # Decision provenance, for telemetry only.
++    novelty: float | None = None
++    spread: float | None = None
++    neighbours: int = 0
++    memory_entries: int = 0
++
++    _tail: Any = field(default=None, repr=False)
++
++    def __post_init__(self) -> None:
++        from collections import deque
++
++        self._tail = deque(maxlen=max(len(self.start_ids), len(self.end_ids), 1))
++
++    @property
++    def top_level(self) -> int:
++        return max(self.num_levels - 1, 0)
++
++    @property
++    def report(self) -> dict[str, Any]:
++        return {
++            "level": self.level,
++            "decided": int(self.decided),
++            "reasoning_tokens": self.reasoning_tokens,
++            "close_kind": self.close_kind,
++            "memory_entries": self.memory_entries,
++            "neighbours": self.neighbours,
++        }
++
++
++def _rfind(seq: Sequence[int], sub: Sequence[int]) -> int:
++    """Index of the last occurrence of `sub` in `seq`, or -1."""
++    if not sub or len(sub) > len(seq):
++        return -1
++    if len(sub) == 1:
++        rev = list(seq)[::-1]
++        try:
++            return len(seq) - 1 - rev.index(sub[0])
++        except ValueError:
++            return -1
++    for i in range(len(seq) - len(sub), -1, -1):
++        if list(seq[i : i + len(sub)]) == list(sub):
++            return i
++    return -1
++
++
++def new_effort_state(
++    request_id: str,
++    cfg: DynamicEffortConfig,
++    start_ids: list[int],
++    end_ids: list[int],
++    prompt_token_ids: Sequence[int] | None,
++) -> EffortState:
++    """Build the state for a request; a prompt ending mid-think starts in it."""
++    state = EffortState(
++        request_id=request_id,
++        num_levels=cfg.num_levels,
++        start_ids=start_ids,
++        end_ids=end_ids,
++    )
++    if prompt_token_ids:
++        last_start = _rfind(prompt_token_ids, start_ids)
++        last_end = _rfind(prompt_token_ids, end_ids)
++        if last_start >= 0 and last_start > last_end:
++            state.in_think = True
++            state.think_count = len(prompt_token_ids) - last_start - len(start_ids)
++    return state
++
++
++def _tail_endswith(tail, seq: Sequence[int]) -> bool:
++    n = len(seq)
++    if n == 0 or len(tail) < n:
++        return False
++    if n == 1:
++        return tail[-1] == seq[0]
++    return list(tail)[-n:] == list(seq)
++
++
++def step_effort(state: EffortState, cfg: DynamicEffortConfig, ev: EffortEvent) -> None:
++    """Advance one request by one step.
++
++    Pure bookkeeping: it counts reasoning tokens and notices the model's own
++    end marker. There is no action to take - the level was chosen before the
++    request started thinking and nothing may change it afterwards.
++    """
++    for tok in ev.new_token_ids:
++        state._tail.append(tok)
++        if not state.in_think:
++            if _tail_endswith(state._tail, state.start_ids):
++                state.in_think = True
++                state.think_count = 0
++            continue
++        state.think_count += 1
++        if _tail_endswith(state._tail, state.end_ids):
++            state.in_think = False
++            # The end sequence itself is not reasoning content.
++            state.think_count = max(state.think_count - len(state.end_ids), 0)
++            state.reasoning_tokens += state.think_count
++
++
++def finish_effort(state: EffortState) -> dict[str, Any]:
++    """Close the state at request finish and return the report."""
++    if state.in_think:
++        # Still thinking when the request ended: the client's max_tokens, a
++        # timeout or an abort stopped it, so the length it would have spent is
++        # unknown and the memory must not value this entry.
++        state.reasoning_tokens += state.think_count
++        state.in_think = False
++        state.close_kind = CLOSE_CLIENT_LIMIT
++    state.finished = True
++    return state.report
+diff --git a/vllm/v1/core/sched/effort_memory.py b/vllm/v1/core/sched/effort_memory.py
+new file mode 100644
+index 0000000000..0e4e759f4b
+--- /dev/null
++++ b/vllm/v1/core/sched/effort_memory.py
+@@ -0,0 +1,392 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Online memory of pooled prefill states, keyed by cosine, valued by thinking.
++
++The v3 dynamic-effort signal (docs/dynamic-reasoning.claude.md §13,
++docs/effort-hidden-probe.md): the last prompt token's final hidden state - the
++vector `lm_head` consumes, which the prefill produced anyway - is looked up
++against a memory the server filled from its own finished requests. The value is
++how many reasoning tokens that request actually spent. Nothing is fitted: the
++estimate is a cosine-weighted mean of the neighbours' observed lengths and the
++only constants are percentile ranks of running digests, the same
++self-calibration §11.0 already blesses for entropy and margin.
++
++Entries are inserted at request finish. A request that was force-closed or
++soft-closed is right-censored - the length it *would* have spent is unknown -
++so it is stored as a key with no value: it counts for novelty and can never
++pull the kNN average down.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import math
++import os
++import tempfile
++from collections import deque
++from dataclasses import dataclass
++from typing import Any
++
++import numpy as np
++
++from vllm.config.reasoning import HiddenEffortConfig
++from vllm.logger import init_logger
++from vllm.v1.core.sched.effort_controller import CLOSE_NATURAL
++from vllm.v1.core.sched.effort_quantiles import TDigest
++
++logger = init_logger(__name__)
++
++MEMORY_VERSION = 1
++"""Bumped whenever the stored layout or the value semantics change."""
++
++SESSION_CAP_DIVISOR = 64
++"""At most `memory_size / SESSION_CAP_DIVISOR` entries per session id, so one
++long conversation cannot evict the memory."""
++
++
++@dataclass(frozen=True)
++class MemoryQuery:
++    """What the memory can say about one pooled vector."""
++
++    estimate: float | None
++    """Cosine-weighted mean of `log1p(reasoning_tokens)` over the valued
++    neighbours, or `None` when none of the `k` neighbours carries a value."""
++    novelty: float
++    """`(1 - max cos) / 2`: how far the nearest entry is."""
++    spread: float | None
++    """Weighted stdev of the valued neighbours' values; `None` with < 2."""
++    max_cos: float
++    n_entries: int
++    n_valued: int
++    """Valued entries among the `k` neighbours."""
++
++
++@dataclass(frozen=True)
++class LevelDecision:
++    """The asymmetric map's verdict for one request (§13.5)."""
++
++    level: int
++    reason: str
++    estimate_rank: float | None = None
++    novelty_rank: float | None = None
++    spread_rank: float | None = None
++
++
++def _unit(vec: np.ndarray) -> np.ndarray:
++    v = np.asarray(vec, dtype=np.float32).reshape(-1)
++    n = float(np.linalg.norm(v))
++    return v / max(n, 1e-9)
++
++
++class EffortMemory:
++    """Ring of pooled prefill states with a cosine kNN over them.
++
++    Scheduler-side, one per engine core. Keys are L2-normalised float32 rows
++    (a plain BLAS `sgemv` per query); the persisted copy is fp16, which is the
++    10 KB/entry the design costs on disk.
++    """
++
++    def __init__(
++        self,
++        hidden_size: int,
++        cfg: HiddenEffortConfig,
++        model: str = "",
++        levels: int = 0,
++    ) -> None:
++        self.hidden_size = hidden_size
++        self.cfg = cfg
++        self.model = model
++        self.levels = int(levels)
++        size = int(cfg.memory_size)
++        self._keys = np.zeros((size, hidden_size), dtype=np.float32)
++        self._values = np.full(size, np.nan, dtype=np.float32)
++        self._sessions: list[str | None] = [None] * size
++        self._levels_used = np.zeros(size, dtype=np.int8)
++        self._by_session: dict[str, deque[int]] = {}
++        self._next = 0
++        self._n = 0
++        self._inserts = 0
++        self._since_flush = 0
++        self._queries = 0
++        self._hits = 0
++        self.per_session_cap = max(1, math.ceil(size / SESSION_CAP_DIVISOR))
++        self._est_digest = TDigest(compression=cfg.digest_compression)
++        self._novelty_digest = TDigest(compression=cfg.digest_compression)
++        self._spread_digest = TDigest(compression=cfg.digest_compression)
++
++    # ---------------------------------------------------------------- state
++
++    @property
++    def n_entries(self) -> int:
++        return self._n
++
++    @property
++    def n_valued(self) -> int:
++        return int(np.count_nonzero(~np.isnan(self._values[: self._n])))
++
++    @property
++    def hit_rate(self) -> float:
++        return self._hits / self._queries if self._queries else 0.0
++
++    @property
++    def ready(self) -> bool:
++        """The memory may decide an effort level."""
++        return self._n >= self.cfg.min_entries
++
++    # --------------------------------------------------------------- insert
++
++    def insert(
++        self,
++        vec: np.ndarray,
++        reasoning_tokens: int | None,
++        close_kind: str,
++        session_id: str | None = None,
++        level: int = 0,
++    ) -> None:
++        """Record one finished request.
++
++        Args:
++            vec: the pooled prefill state (any scale; stored L2-normalised).
++            reasoning_tokens: think tokens the request spent, or `None`.
++            close_kind: `natural` / `soft` / `forced`. Only a natural close
++                carries a value - the other two are right-censored, so they
++                enter as keys with no value.
++            session_id: conversation key for the per-session eviction cap.
++            level: effort level the prefill decision chose.
++        """
++        key = _unit(vec)
++        if key.shape[0] != self.hidden_size:
++            raise ValueError(
++                f"effort memory expects {self.hidden_size}-wide vectors, "
++                f"got {key.shape[0]}"
++            )
++        slot = self._claim_slot(session_id)
++        self._keys[slot] = key
++        valued = close_kind == CLOSE_NATURAL and reasoning_tokens is not None
++        self._values[slot] = (
++            math.log1p(max(int(reasoning_tokens or 0), 0)) if valued else np.nan
++        )
++        self._sessions[slot] = session_id
++        self._levels_used[slot] = np.int8(max(-128, min(127, level)))
++        if session_id is not None:
++            self._by_session.setdefault(session_id, deque()).append(slot)
++        self._inserts += 1
++        self._since_flush += 1
++        self.maybe_save()
++
++    def _claim_slot(self, session_id: str | None) -> int:
++        """FIFO ring, with a per-session cap that reuses the session's oldest."""
++        if session_id is not None:
++            slots = self._by_session.get(session_id)
++            if slots is not None and len(slots) >= self.per_session_cap:
++                return slots.popleft()
++        slot = self._next
++        self._next = (self._next + 1) % self._keys.shape[0]
++        victim = self._sessions[slot]
++        if victim is not None and self._n > slot:
++            queue = self._by_session.get(victim)
++            if queue is not None:
++                with contextlib.suppress(ValueError):
++                    queue.remove(slot)
++                if not queue:
++                    del self._by_session[victim]
++        if self._n < self._keys.shape[0]:
++            self._n += 1
++        return slot
++
++    # ---------------------------------------------------------------- query
++
++    def query(self, vec: np.ndarray) -> MemoryQuery | None:
++        """kNN against the ring; `None` while there is nothing to compare to.
++
++        The digests are fed here (not at insert), so the percentile ranks the
++        map cuts on are ranks over the *decisions the server has faced*. That
++        also warms them during the cold phase, where the result is computed and
++        discarded.
++        """
++        k = int(self.cfg.k)
++        if self._n < max(k, 1):
++            return None
++        key = _unit(vec)
++        sims = self._keys[: self._n] @ key
++        top = np.argpartition(-sims, k - 1)[:k] if self._n > k else np.arange(self._n)
++        top = top[np.argsort(-sims[top])]
++        best = float(sims[top[0]])
++        novelty = (1.0 - best) / 2.0
++        values = self._values[top]
++        valued = ~np.isnan(values)
++        estimate: float | None = None
++        spread: float | None = None
++        if valued.any():
++            # The softmax reference is the nearest *valued* neighbour, not the
++            # nearest entry: with censored keys in the top-k the global maximum
++            # can be arbitrarily far from every entry being averaged, and the
++            # weights would underflow to zero together.
++            valued_sims = sims[top][valued]
++            w = np.exp(
++                (valued_sims - valued_sims.max()) / max(self.cfg.temperature, 1e-6)
++            )
++            w = w / w.sum()
++            vals = values[valued].astype(np.float64)
++            mean = float((w * vals).sum())
++            estimate = mean
++            if valued.sum() >= 2:
++                spread = float(math.sqrt(max((w * (vals - mean) ** 2).sum(), 0.0)))
++        result = MemoryQuery(
++            estimate=estimate,
++            novelty=novelty,
++            spread=spread,
++            max_cos=best,
++            n_entries=self._n,
++            n_valued=int(valued.sum()),
++        )
++        self._queries += 1
++        if estimate is not None:
++            self._hits += 1
++        return result
++
++    def ranks(self, q: MemoryQuery) -> tuple[float | None, float | None, float | None]:
++        """Percentile ranks of the query's three statistics, then absorb them."""
++        est_rank = None if q.estimate is None else self._est_digest.rank(q.estimate)
++        nov_rank = self._novelty_digest.rank(q.novelty)
++        spread_rank = None if q.spread is None else self._spread_digest.rank(q.spread)
++        if q.estimate is not None:
++            self._est_digest.add(q.estimate)
++        self._novelty_digest.add(q.novelty)
++        if q.spread is not None:
++            self._spread_digest.add(q.spread)
++        return est_rank, nov_rank, spread_rank
++
++    # ----------------------------------------------------------- persistence
++
++    def state_dict(self) -> dict[str, Any]:
++        return {
++            "version": MEMORY_VERSION,
++            "model": self.model,
++            "hidden_size": self.hidden_size,
++            "levels": self.levels,
++            "memory_size": int(self._keys.shape[0]),
++            "n": self._n,
++            "next": self._next,
++            "inserts": self._inserts,
++            "sessions": self._sessions[: self._n],
++            "est_digest": self._est_digest.to_dict(),
++            "novelty_digest": self._novelty_digest.to_dict(),
++            "spread_digest": self._spread_digest.to_dict(),
++        }
++
++    def save(self) -> None:
++        path = self.cfg.memory_path
++        if not path:
++            return
++        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++        # mkstemp's suffix keeps np.savez from appending one of its own.
++        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".npz")
++        try:
++            with os.fdopen(fd, "wb") as handle:
++                np.savez(
++                    handle,
++                    meta=np.frombuffer(
++                        json.dumps(self.state_dict()).encode(), dtype=np.uint8
++                    ),
++                    keys=self._keys[: self._n].astype(np.float16),
++                    values=self._values[: self._n],
++                    levels_used=self._levels_used[: self._n],
++                )
++            os.replace(tmp, path)
++        except BaseException:
++            if os.path.exists(tmp):
++                os.unlink(tmp)
++            raise
++        self._since_flush = 0
++
++    def maybe_save(self) -> bool:
++        every = int(self.cfg.flush_every)
++        if not self.cfg.memory_path or every <= 0 or self._since_flush < every:
++            return False
++        self.save()
++        return True
++
++    def load(self) -> bool:
++        """Warm from `memory_path`; drop a file that no longer matches."""
++        path = self.cfg.memory_path
++        if not path or not os.path.exists(path):
++            return False
++        with np.load(path, allow_pickle=False) as data:
++            meta = json.loads(bytes(data["meta"]).decode())
++            if (
++                meta.get("version") != MEMORY_VERSION
++                or meta.get("hidden_size") != self.hidden_size
++                or (self.model and meta.get("model") not in ("", self.model))
++                or (self.levels and meta.get("levels") != self.levels)
++            ):
++                logger.warning(
++                    "dynamic_effort: dropping %s (model/dim/levels/version "
++                    "mismatch: %s)",
++                    path,
++                    {k: meta.get(k) for k in ("version", "model", "hidden_size")},
++                )
++                return False
++            keys = data["keys"].astype(np.float32)
++            n = min(keys.shape[0], self._keys.shape[0])
++            self._keys[:n] = keys[:n]
++            self._values[:n] = data["values"][:n]
++            self._levels_used[:n] = data["levels_used"][:n]
++        sessions = list(meta.get("sessions") or [])[:n]
++        sessions += [None] * (n - len(sessions))
++        self._sessions[:n] = sessions
++        self._by_session.clear()
++        for slot, sess in enumerate(sessions):
++            if sess is not None:
++                self._by_session.setdefault(sess, deque()).append(slot)
++        self._n = n
++        self._next = n % self._keys.shape[0]
++        self._inserts = int(meta.get("inserts", n))
++        self._est_digest = TDigest.from_dict(meta["est_digest"])
++        self._novelty_digest = TDigest.from_dict(meta["novelty_digest"])
++        self._spread_digest = TDigest.from_dict(meta["spread_digest"])
++        return True
++
++
++def decide_effort_level(
++    query: MemoryQuery | None,
++    ranks: tuple[float | None, float | None, float | None],
++    cfg: HiddenEffortConfig,
++    top_level: int,
++) -> LevelDecision:
++    """The asymmetric quantile map (§13.5).
++
++    Raise freely, lower only on confidence: one under-routed step can kill a
++    trajectory, over-routing only costs tokens. The two confidence gates guard
++    the *downward* band alone - `novelty` (nothing similar in the memory, so it
++    cannot be trusted to say "easy") and `spread` (the neighbours disagree).
++
++    Args:
++        query: the kNN result, or `None` when the memory could not answer.
++        ranks: `(estimate, novelty, spread)` percentile ranks.
++        cfg: hidden-effort settings.
++        top_level: highest effort level the request has.
++
++    Returns:
++        The effort level and why it was chosen.
++    """
++    safe = min(1, top_level)
++    est_rank, nov_rank, spread_rank = ranks
++    if query is None or est_rank is None:
++        return LevelDecision(safe, "no-estimate", est_rank, nov_rank, spread_rank)
++    if est_rank >= cfg.q_high:
++        return LevelDecision(
++            min(2, top_level), "q>=q_high", est_rank, nov_rank, spread_rank
++        )
++    if est_rank >= cfg.q_mid:
++        return LevelDecision(safe, "q>=q_mid", est_rank, nov_rank, spread_rank)
++    gates_pass = (
++        nov_rank is not None
++        and spread_rank is not None
++        and nov_rank <= cfg.novelty_gate_q
++        and spread_rank <= cfg.spread_gate_q
++    )
++    if gates_pass:
++        return LevelDecision(0, "low-band", est_rank, nov_rank, spread_rank)
++    return LevelDecision(safe, "gated", est_rank, nov_rank, spread_rank)
+diff --git a/vllm/v1/core/sched/effort_quantiles.py b/vllm/v1/core/sched/effort_quantiles.py
+new file mode 100644
+index 0000000000..f476d5f2ee
+--- /dev/null
++++ b/vllm/v1/core/sched/effort_quantiles.py
+@@ -0,0 +1,190 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Streaming t-digest for the dynamic-effort memory.
++
++The effort memory (``effort_memory.py``) keeps one digest each for its value
++estimate, novelty and spread, so the level cuts are *percentile ranks* of what
++this server has actually seen rather than absolute thresholds: "top 40 % of
++estimated reasoning length" means the same thing on any model, quantization
++or sampler setting. The digests are serialised with the memory.
++"""
++
++from __future__ import annotations
++
++import math
++from collections.abc import Iterable
++from typing import Any
++
++
++class TDigest:
++    """Small merging t-digest over ``(mean, weight)`` centroids.
++
++    Supports both directions the controller needs: ``rank(value)`` for a
++    percentile-rank feature and ``quantile(q)`` for resolving a policy
++    threshold into an absolute cutoff the worker can compare against.
++    """
++
++    def __init__(self, compression: float = 100.0, buffer_size: int = 256):
++        if compression < 10.0:
++            raise ValueError("t-digest compression must be >= 10")
++        self.compression = float(compression)
++        self.buffer_size = int(buffer_size)
++        self.means: list[float] = []
++        self.weights: list[float] = []
++        self.count: float = 0.0
++        self.min: float = math.inf
++        self.max: float = -math.inf
++        self._buffer: list[float] = []
++
++    # -- ingestion ---------------------------------------------------------
++
++    def add(self, value: float, weight: float = 1.0) -> None:
++        """Add one observation; non-finite values and weights are ignored."""
++        if not math.isfinite(value) or not math.isfinite(weight) or weight <= 0.0:
++            return
++        self.count += weight
++        if value < self.min:
++            self.min = value
++        if value > self.max:
++            self.max = value
++        if weight == 1.0:
++            self._buffer.append(value)
++            if len(self._buffer) >= self.buffer_size:
++                self.compress()
++        else:
++            self.means.append(value)
++            self.weights.append(weight)
++            self.compress()
++
++    def add_many(self, values: Iterable[float]) -> None:
++        for value in values:
++            self.add(value)
++
++    def compress(self) -> None:
++        """Merge the pending buffer into the centroid list."""
++        if not self._buffer and len(self.means) <= self._max_centroids():
++            return
++        pairs = list(zip(self.means, self.weights))
++        pairs.extend((v, 1.0) for v in self._buffer)
++        self._buffer.clear()
++        if not pairs:
++            return
++        pairs.sort(key=lambda p: p[0])
++        total = sum(w for _, w in pairs)
++        if total <= 0.0:
++            return
++        means: list[float] = []
++        weights: list[float] = []
++        cur_mean, cur_weight = pairs[0]
++        so_far = 0.0
++        q_limit = self._q_limit(self._k(so_far / total) + 1.0)
++        for mean, weight in pairs[1:]:
++            proposed = cur_weight + weight
++            if (so_far + proposed) / total <= q_limit:
++                cur_mean += (mean - cur_mean) * (weight / proposed)
++                cur_weight = proposed
++                continue
++            means.append(cur_mean)
++            weights.append(cur_weight)
++            so_far += cur_weight
++            q_limit = self._q_limit(self._k(so_far / total) + 1.0)
++            cur_mean, cur_weight = mean, weight
++        means.append(cur_mean)
++        weights.append(cur_weight)
++        self.means, self.weights = means, weights
++        self.count = total
++
++    def _max_centroids(self) -> int:
++        return int(math.ceil(self.compression * 2))
++
++    def _k(self, q: float) -> float:
++        """Scale function k1 (asin), which spends detail on the tails."""
++        q = min(max(q, 0.0), 1.0)
++        return self.compression * math.asin(2.0 * q - 1.0) / (2.0 * math.pi)
++
++    def _q_limit(self, k: float) -> float:
++        return (math.sin(2.0 * math.pi * k / self.compression) + 1.0) / 2.0
++
++    # -- queries -----------------------------------------------------------
++
++    def _sorted(self) -> tuple[list[float], list[float], float]:
++        if self._buffer:
++            self.compress()
++        return self.means, self.weights, self.count
++
++    def rank(self, value: float) -> float | None:
++        """Fraction of the observed mass below ``value``, in ``[0, 1]``."""
++        means, weights, total = self._sorted()
++        if not means or total <= 0.0 or not math.isfinite(value):
++            return None
++        if value <= self.min:
++            return 0.0
++        if value >= self.max:
++            return 1.0
++        below = 0.0
++        for mean, weight in zip(means, weights):
++            if value < mean:
++                # Linear interpolation inside the straddling centroid.
++                below += weight * 0.5
++                break
++            if value == mean:
++                below += weight * 0.5
++                break
++            below += weight
++        return min(max(below / total, 0.0), 1.0)
++
++    def quantile(self, q: float) -> float | None:
++        """Value at quantile ``q`` (``0 <= q <= 1``)."""
++        means, weights, total = self._sorted()
++        if not means or total <= 0.0:
++            return None
++        q = min(max(q, 0.0), 1.0)
++        if q == 0.0:
++            return self.min
++        if q == 1.0:
++            return self.max
++        target = q * total
++        seen = 0.0
++        for i, (mean, weight) in enumerate(zip(means, weights)):
++            centre = seen + weight * 0.5
++            if target <= centre:
++                if i == 0:
++                    lo_x, lo_c = self.min, 0.0
++                else:
++                    lo_x, lo_c = means[i - 1], seen - weights[i - 1] * 0.5
++                span = centre - lo_c
++                if span <= 0.0:
++                    return mean
++                return lo_x + (mean - lo_x) * (target - lo_c) / span
++            seen += weight
++        return self.max
++
++    # -- persistence -------------------------------------------------------
++
++    def to_dict(self) -> dict[str, Any]:
++        self.compress()
++        return {
++            "compression": self.compression,
++            "count": self.count,
++            "min": self.min if math.isfinite(self.min) else None,
++            "max": self.max if math.isfinite(self.max) else None,
++            "means": self.means,
++            "weights": self.weights,
++        }
++
++    @classmethod
++    def from_dict(cls, data: dict[str, Any]) -> TDigest:
++        digest = cls(compression=float(data.get("compression", 100.0)))
++        means = [float(x) for x in data.get("means", [])]
++        weights = [float(x) for x in data.get("weights", [])]
++        if len(means) != len(weights):
++            raise ValueError("t-digest means/weights length mismatch")
++        digest.means = means
++        digest.weights = weights
++        digest.count = float(data.get("count", sum(weights)))
++        lo, hi = data.get("min"), data.get("max")
++        digest.min = float(lo) if lo is not None else (means[0] if means else math.inf)
++        digest.max = (
++            float(hi) if hi is not None else (means[-1] if means else -math.inf)
++        )
++        return digest
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 8782061356..51416ff5d5 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from functools import cached_property
+ from typing import TYPE_CHECKING
+ 
+@@ -258,6 +258,11 @@ class SchedulerOutput:
+     # CoW copies to apply after zeroing new blocks and before forward.
+     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+ 
++    # Requests whose dynamic-effort *body* prefill completes in this step, so
++    # the worker returns the last prefill row for the level decision
++    # (docs/dynamic-reasoning.claude.md §13.3).
++    effort_prefill_capture: list[str] = field(default_factory=list)
++
+     # Producer partial-tail offload hand-off for external KV connectors:
+     # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
+     # the durable boundary block of a producer's last-prompt-boundary partial
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 992400f4e6..f7093b144e 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -8,8 +8,12 @@ from collections.abc import Iterable
+ from dataclasses import replace
+ from typing import Any
+ 
++import numpy as np
++
++import vllm.envs as envs
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.config import KVEventsConfig, VllmConfig
++from vllm.config.reasoning import DynamicEffortConfig, ReasoningConfig
+ from vllm.distributed.ec_transfer.ec_connector.base import (
+     ECConnectorBase,
+     ECConnectorMetadata,
+@@ -39,6 +43,18 @@ from vllm.v1.core.encoder_cache_manager import (
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import KVCacheBlock
++from vllm.v1.core.sched.effort_controller import (
++    CLOSE_CLIENT_LIMIT,
++    EffortEvent,
++    EffortState,
++    finish_effort,
++    new_effort_state,
++    step_effort,
++)
++from vllm.v1.core.sched.effort_memory import (
++    EffortMemory,
++    decide_effort_level,
++)
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+ from vllm.v1.core.sched.output import (
+     CachedRequestData,
+@@ -52,13 +68,17 @@ from vllm.v1.core.sched.request_queue import (
+     SchedulingPolicy,
+     create_request_queue,
+ )
+-from vllm.v1.core.sched.utils import check_stop, remove_all
++from vllm.v1.core.sched.utils import (
++    check_stop,
++    remove_all,
++)
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
++from vllm.v1.sample.effort_signals import EffortTelemetrySink
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
+@@ -66,6 +86,12 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+ 
++MAX_EFFORT_DECISION_SKIPS = 16
++"""Scheduler steps a request awaiting its effort decision may be held for
++before it gives up and runs at the default level. Purely a liveness bound: the
++request is simply not scheduled while it waits, and the vector normally arrives
++on the first step after the body prefill."""
++
+ 
+ def adaptive_num_spec_tokens(
+     emas: list[float | None],
+@@ -288,6 +314,30 @@ class Scheduler(SchedulerInterface):
+             and self.num_spec_tokens > 1
+         )
+         self._accepted_ema: dict[str, float] = {}
++        # Dynamic reasoning effort: per-request controller state, pending
++        # (unacked) budget updates, and relaxed repetition params.
++        self._effort: dict[str, EffortState] = {}
++        self._effort_cfg: DynamicEffortConfig | None = None
++        self._effort_start_ids: list[int] = []
++        self._effort_end_ids: list[int] = []
++        # Dynamic effort v3: the online memory of pooled prefill states and the
++        # per-step capture list (docs/dynamic-reasoning.claude.md §13).
++        self._effort_memory: EffortMemory | None = None
++        self._effort_vectors: dict[str, np.ndarray] = {}
++        self._effort_level_total: dict[int, int] = {}
++        self._effort_held_timeouts = 0
++        self._effort_default_reason: dict[str, int] = {}
++        # First few decisions are logged at INFO so a deployment can see the
++        # split arm and the vector arrive without turning on debug logging.
++        self._effort_trace_budget = 5
++        reasoning_config = vllm_config.reasoning_config
++        if reasoning_config is not None and reasoning_config.dynamic_effort:
++            self._init_effort_controller(reasoning_config)
++        # Optional JSONL sink for per-step effort signals (VLLM_EFFORT_TELEMETRY).
++        self.effort_sink = EffortTelemetrySink.from_env(
++            reasoning_config.reasoning_start_token_ids if reasoning_config else None,
++            reasoning_config.reasoning_end_token_ids if reasoning_config else None,
++        )
+         if speculative_config is not None:
+             if speculative_config.num_speculative_tokens_per_batch_size:
+                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+@@ -582,6 +632,25 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            if (
++                request.effort_hold_prefill
++                and request.num_computed_tokens >= request.effort_body_len
++            ):
++                # v3: the body is prefilled and the level is not chosen
++                # yet, so the tail must not prefill (it would commit the default level).
++                # The vector arrives with this step's output; the counter is the
++                # liveness guarantee if it never does.
++                request.effort_decision_skips += 1
++                if request.effort_decision_skips > MAX_EFFORT_DECISION_SKIPS:
++                    # Liveness only. The vector normally arrives with the very
++                    # next output, but the async batch queue and a busy step can
++                    # put several schedule() calls in between, and giving up too
++                    # early silently drops the decision.
++                    self._effort_held_timeouts += 1
++                    self._resolve_effort_decision(request, None)
++                req_index += 1
++                continue
++
+             if defer_prefills and request.is_prefill_chunk:
+                 # DP prefill balancing: defer this in-progress prefill chunk to a
+                 # cadence-aligned step; decodes still run to fill this step.
+@@ -593,6 +662,11 @@ class Scheduler(SchedulerInterface):
+                 + request.num_output_placeholders
+                 - request.num_computed_tokens
+             )
++            if request.effort_hold_prefill:
++                num_new_tokens = min(
++                    num_new_tokens,
++                    request.effort_body_len - request.num_computed_tokens,
++                )
+             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+             num_new_tokens = min(
+@@ -910,6 +984,29 @@ class Scheduler(SchedulerInterface):
+                         )
+                         connector_prefix_cache_hits = num_external_computed_tokens
+ 
++                    if (
++                        request.effort_hold_prefill
++                        and num_new_local_computed_tokens + num_external_computed_tokens
++                        >= request.effort_body_len
++                    ):
++                        # v3: the blocks past the body hold the *default-level* tail,
++                        # which the decision has not chosen yet. Keep the body's
++                        # full blocks and recompute the rest, so the last body
++                        # row is produced even for a 100%-cached prompt (§13.3).
++                        if self.connector is not None:
++                            self._resolve_effort_decision(request, None)
++                        else:
++                            keep = (
++                                (request.effort_body_len - 1) // self.block_size
++                            ) * self.block_size
++                            if num_new_local_computed_tokens > keep:
++                                new_computed_blocks = (
++                                    self.kv_cache_manager.truncate_computed_blocks(
++                                        new_computed_blocks, keep
++                                    )
++                                )
++                                num_new_local_computed_tokens = keep
++
+                     # Total computed tokens (local + external).
+                     num_computed_tokens = (
+                         num_new_local_computed_tokens + num_external_computed_tokens
+@@ -963,6 +1060,11 @@ class Scheduler(SchedulerInterface):
+                     # `request.num_prompt_tokens` to consider the resumed
+                     # requests, which have output tokens.
+                     num_new_tokens = request.num_tokens - num_computed_tokens
++                    if request.effort_hold_prefill:
++                        num_new_tokens = min(
++                            num_new_tokens,
++                            request.effort_body_len - num_computed_tokens,
++                        )
+ 
+                     # Pad new decode requests to uniform spec decoding size to
+                     # preserve full cudagraph for this step.
+@@ -971,6 +1073,7 @@ class Scheduler(SchedulerInterface):
+                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                         and self.num_sampled_tokens_per_step > 0
+                         and num_new_tokens == 1
++                        and not request.effort_hold_prefill
+                         and (scheduled_running_reqs and not prefill_scheduled)
+                     ):
+                         num_new_tokens = 1 + self.num_spec_tokens
+@@ -1435,6 +1538,12 @@ class Scheduler(SchedulerInterface):
+             request.is_prefill_chunk = request.num_computed_tokens < (
+                 request.num_tokens + request.num_output_placeholders
+             )
++            if (
++                request.effort_decision_pending
++                and request.num_computed_tokens >= request.effort_body_len
++            ):
++                # The body's last row is in this step's hidden states (§13.3).
++                scheduler_output.effort_prefill_capture.append(req_id)
+             scheduler_output.has_structured_output_requests |= (
+                 request.use_structured_output and not request.is_prefill_chunk
+             )
+@@ -1782,6 +1891,8 @@ class Scheduler(SchedulerInterface):
+         kv_connector_output = model_runner_output.kv_connector_output
+         ec_connector_output = model_runner_output.ec_connector_output
+         cudagraph_stats = model_runner_output.cudagraph_stats
++        effort_signals = model_runner_output.effort_signals
++        effort_sink = self.effort_sink if effort_signals else None
+ 
+         # Every GPU write enqueued by this and earlier steps has completed, so it is
+         # safe to return deferred-free blocks to the pool.
+@@ -1796,6 +1907,15 @@ class Scheduler(SchedulerInterface):
+         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+         spec_decoding_stats: SpecDecodingStats | None = None
+ 
++        effort_prefill_states = model_runner_output.effort_prefill_states
++        effort_requeued: set[Request] = set()
++        # Which requests' body rows *this* step computed. Async scheduling has
++        # already scheduled the step after a multi-chunk body - so the token
++        # counter is past the boundary - when the earlier chunk's vector-less
++        # output arrives, and resolving off that counter would spend the
++        # decision on it. Empty on almost every step.
++        effort_capture = scheduler_output.effort_prefill_capture
++
+         failed_kv_load_req_ids = None
+         if kv_connector_output and kv_connector_output.invalid_block_ids:
+             # These blocks contain externally computed tokens that failed to
+@@ -1860,6 +1980,16 @@ class Scheduler(SchedulerInterface):
+             if output_is_stale and request.drop_stale_output:
+                 continue
+ 
++            if request.effort_decision_pending and req_id in effort_capture:
++                # v3: the body's last prefill row came back with this step, so
++                # the level is decided here and the chosen tail replaces
++                # the default-level one (§13.3 step 4).
++                vector = (
++                    effort_prefill_states.get(req_id) if effort_prefill_states else None
++                )
++                if self._resolve_effort_decision(request, vector):
++                    effort_requeued.add(request)
++
+             req_index = model_runner_output.req_id_to_index[req_id]
+             generated_token_ids = (
+                 sampled_token_ids[req_index] if sampled_token_ids else []
+@@ -1868,6 +1998,8 @@ class Scheduler(SchedulerInterface):
+             scheduled_spec_token_ids = (
+                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+             )
++            effort_num_draft: int | None = None
++            effort_num_accepted: int | None = None
+             if scheduled_spec_token_ids and (
+                 generated_token_ids or self.num_sampled_tokens_per_step == 0
+             ):
+@@ -1875,6 +2007,7 @@ class Scheduler(SchedulerInterface):
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 num_rejected = num_draft_tokens - num_accepted
++                effort_num_draft, effort_num_accepted = num_draft_tokens, num_accepted
+                 if self.adaptive_draft:
+                     self._update_accepted_ema(req_id=req_id, num_accepted=num_accepted)
+                 # Rejections roll back num_computed_tokens (and, under async
+@@ -1930,6 +2063,27 @@ class Scheduler(SchedulerInterface):
+                 request.status = RequestStatus.FINISHED_STOPPED
+                 stopped = True
+ 
++            effort_state = self._effort.get(req_id) if self._effort else None
++            if effort_state is not None and new_token_ids:
++                assert self._effort_cfg is not None
++                step_effort(
++                    effort_state,
++                    self._effort_cfg,
++                    EffortEvent(new_token_ids=new_token_ids),
++                )
++            if effort_sink is not None:
++                effort_signal = effort_signals.get(req_id)
++                if effort_signal is not None:
++                    effort_sink.record(
++                        req_id,
++                        request.output_token_ids,
++                        effort_signal,
++                        effort_num_draft,
++                        effort_num_accepted,
++                        stopped,
++                        prompt_token_ids=request.prompt_token_ids,
++                    )
++
+             if new_token_ids and self.structured_output_manager.should_advance(
+                 request, new_token_ids=new_token_ids
+             ):
+@@ -2009,12 +2163,19 @@ class Scheduler(SchedulerInterface):
+                     )
+ 
+             finish_reason = None
++            effort_report = None
+             if stopped:
+                 # Capture finish_reason BEFORE _handle_stopped_request, which may
+                 # reset the status to WAITING for streaming requests that continue.
+                 finish_reason = request.get_finished_reason()
+                 finished = self._handle_stopped_request(request)
+                 if finished:
++                    if effort_state is not None:
++                        effort_report = finish_effort(effort_state)
++                    if self.effort_sink is not None:
++                        self._record_effort_finish(
++                            request, finish_reason, effort_report
++                        )
+                     kv_transfer_params, ec_transfer_params = self._free_request(request)
+ 
+                 if status_before_stop == RequestStatus.RUNNING:
+@@ -2061,12 +2222,20 @@ class Scheduler(SchedulerInterface):
+                         trace_headers=request.trace_headers,
+                         routed_experts=routed_experts,
+                         num_nans_in_logits=request.num_nans_in_logits,
++                        effort=effort_report,
+                     )
+                 )
+             else:
+                 # Invariant: EngineCore returns no partial prefill outputs.
+                 assert not prompt_logprobs_tensors
+ 
++        if effort_requeued:
++            # Re-admit as a new request so the worker picks up the new prompt
++            # (the same path a streaming-input chunk takes).
++            self.running = remove_all(self.running, effort_requeued)
++            for request in effort_requeued:
++                self.waiting.prepend_request(request)
++
+         # Remove the stopped requests from the running and waiting queues.
+         if stopped_running_reqs:
+             self.running = remove_all(self.running, stopped_running_reqs)
+@@ -2357,6 +2526,8 @@ class Scheduler(SchedulerInterface):
+                 request.streaming_queue = deque()
+             self._enqueue_waiting_request(request)
+             self.requests[request.request_id] = request
++            if self._effort_cfg is not None:
++                self._maybe_add_effort_state(request)
+             if self.connector is not None:
+                 self.connector.on_new_request(request)
+             if self.log_stats:
+@@ -2444,11 +2615,348 @@ class Scheduler(SchedulerInterface):
+             alpha=self.vllm_config.speculative_config.adaptive_draft_ema_alpha,
+         )
+ 
++    def _init_effort_controller(self, reasoning_config: ReasoningConfig) -> None:
++        """Resolve the token ids the dynamic-effort controller tracks."""
++        start_ids = reasoning_config.reasoning_start_token_ids
++        end_ids = reasoning_config.natural_reasoning_end_token_ids
++        if not start_ids or not end_ids:
++            logger.warning(
++                "dynamic_effort configured but reasoning token ids are not "
++                "initialized; the effort controller is disabled."
++            )
++            return
++        cfg = reasoning_config.dynamic_effort
++        assert cfg is not None
++        self._effort_cfg = cfg
++        self._effort_start_ids = list(start_ids)
++        self._effort_end_ids = list(end_ids)
++        logger.info(
++            "dynamic_effort: %d effort levels, chosen before thinking and "
++            "rendered at the prompt tail. Nothing caps, biases or watches the "
++            "think block on this path - the model ends its own reasoning, "
++            "bounded only by the client's max_tokens and timeouts.",
++            cfg.num_levels,
++        )
++        self._init_effort_memory(cfg)
++
++    def _init_effort_memory(self, cfg: DynamicEffortConfig) -> None:
++        """Build the v3 hidden-state memory (§13.4) and warm it from disk."""
++        hidden = cfg.hidden_effort
++        if not hidden.enabled:
++            return
++        if not envs.VLLM_USE_V2_MODEL_RUNNER:
++            logger.warning(
++                "dynamic_effort: hidden_effort needs the V2 model runner; "
++                "the level decision is disabled."
++            )
++            return
++        hidden_size = self.vllm_config.model_config.get_hidden_size()
++        memory = EffortMemory(
++            hidden_size,
++            hidden,
++            model=self.vllm_config.model_config.model,
++            levels=cfg.num_levels,
++        )
++        try:
++            warmed = memory.load()
++        except Exception as exc:  # noqa: BLE001
++            logger.warning(
++                "dynamic_effort: could not load %s (%s)", hidden.memory_path, exc
++            )
++            warmed = False
++        self._effort_memory = memory
++        logger.info(
++            "dynamic_effort: hidden-state level routing ON%s - memory %s (%d/%d "
++            "entries, min %d), k=%d, cuts q_mid=%.2f q_high=%.2f, downward "
++            "gates novelty<=%.2f spread<=%.2f",
++            " (shadow)" if hidden.shadow else "",
++            "warm" if warmed else "cold",
++            memory.n_entries,
++            hidden.memory_size,
++            hidden.min_entries,
++            hidden.k,
++            hidden.q_mid,
++            hidden.q_high,
++            hidden.novelty_gate_q,
++            hidden.spread_gate_q,
++        )
++
++    def _maybe_add_effort_state(self, request: Request) -> None:
++        params = request.sampling_params
++        if params is None or not params.extra_args:
++            return
++        overrides = params.extra_args.get("dynamic_effort")
++        if not isinstance(overrides, dict):
++            return
++        assert self._effort_cfg is not None
++        state = new_effort_state(
++            request.request_id,
++            self._effort_cfg,
++            self._effort_start_ids,
++            self._effort_end_ids,
++            request.prompt_token_ids,
++        )
++        state.level = int(overrides.get("default_level", 0))
++        self._effort[request.request_id] = state
++        if self._effort_memory is not None and "forced_level" not in overrides:
++            tails = overrides.get("tails")
++            body_len = overrides.get("body_len")
++            if (
++                isinstance(tails, list)
++                and len(tails) == state.num_levels
++                and isinstance(body_len, int)
++                and 0 < body_len < request.num_prompt_tokens
++            ):
++                boundary = self._effort_body_boundary(request, body_len)
++                if boundary and self._effort_split_worth_it(request, boundary):
++                    assert request.prompt_token_ids is not None
++                    # Tokens between the boundary and the frontend's seam are
++                    # the same in every variant, so they ride at the head of
++                    # every tail.
++                    middle = list(request.prompt_token_ids[boundary:body_len])
++                    request.effort_body_len = boundary
++                    request.effort_tail_variants = [middle + list(t) for t in tails]
++                    request.effort_hold_prefill = True
++                    request.effort_decision_pending = True
++                if self._effort_trace_budget > 0:
++                    logger.info(
++                        "dynamic_effort %s: seam at %d of %d prompt tokens, "
++                        "boundary %d, tails %s -> %s",
++                        request.request_id,
++                        body_len,
++                        request.num_prompt_tokens,
++                        boundary,
++                        [len(t) for t in tails],
++                        "two-phase" if request.effort_hold_prefill else "default level",
++                    )
++        if not request.effort_decision_pending:
++            self._effort_level_total[state.level] = (
++                self._effort_level_total.get(state.level, 0) + 1
++            )
++            self._effort_default_reason["no-seam"] = (
++                self._effort_default_reason.get("no-seam", 0) + 1
++            )
++
++    def _record_effort_finish(
++        self,
++        request: Request,
++        finish_reason: Any,
++        effort_report: dict[str, int] | None,
++    ) -> None:
++        assert self.effort_sink is not None
++        params = request.sampling_params
++        asked = (params.extra_args or {}).get("effort_request") if params else None
++        payload: dict[str, Any] = {
++            "requested_effort": (asked or {}).get("requested"),
++            "effective_effort": (asked or {}).get("effective"),
++            "num_output_tokens": len(request.output_token_ids),
++            "num_prompt_tokens": request.num_prompt_tokens,
++            "finish_reason": str(finish_reason) if finish_reason is not None else None,
++        }
++        if effort_report is not None:
++            payload["dynamic"] = effort_report
++        self.effort_sink.record_finish(request.request_id, payload)
++
++    def _resolve_effort_decision(
++        self, request: Request, vector: "np.ndarray | None"
++    ) -> bool:
++        """Choose the effort level from the body's pooled prefill state.
++
++        The prompt already carries the default level's tail, so every failure
++        mode - cold memory, a missing vector, a KV connector that already
++        committed to loading past the body - leaves it byte-identical and needs
++        no requeue. Nothing here sets a thinking budget: the level *is* the
++        actuator.
++
++        Args:
++            request: the request whose body prefill just finished.
++            vector: the last body row, or `None` when there is none.
++
++        Returns:
++            Whether the prompt changed and the request must be re-admitted.
++        """
++        if not request.effort_decision_pending:
++            return False
++        request.effort_decision_pending = False
++        request.effort_hold_prefill = False
++        request.effort_decision_skips = 0
++        memory = self._effort_memory
++        tails = request.effort_tail_variants
++        state = self._effort.get(request.request_id)
++        default_level = state.level if state is not None else 0
++        level = default_level
++        reason = "no-vector"
++        if self._effort_trace_budget > 0:
++            self._effort_trace_budget -= 1
++            logger.info(
++                "dynamic_effort %s: body prefilled (%d tokens), vector %s, "
++                "memory %d entries",
++                request.request_id,
++                request.effort_body_len,
++                "present" if vector is not None else "MISSING",
++                memory.n_entries if memory is not None else -1,
++            )
++        if memory is not None and vector is not None:
++            self._effort_vectors[request.request_id] = np.asarray(
++                vector, dtype=np.float32
++            )
++            query = memory.query(vector)
++            if query is None:
++                reason = "empty-memory"
++            else:
++                top = (len(tails) - 1) if tails else 0
++                decision = decide_effort_level(
++                    query, memory.ranks(query), memory.cfg, top
++                )
++                if state is not None:
++                    state.novelty = query.novelty
++                    state.spread = query.spread
++                    state.neighbours = query.n_valued
++                    state.memory_entries = query.n_entries
++                if not memory.ready:
++                    reason = f"cold/{decision.reason}"
++                elif memory.cfg.shadow:
++                    reason = f"shadow/{decision.reason}"
++                else:
++                    reason = decision.reason
++                    level = decision.level
++                    if state is not None:
++                        state.decided = True
++                logger.debug(
++                    "dynamic_effort %s: level %d (%s) q=%s novelty=%s spread=%s "
++                    "entries=%d",
++                    request.request_id,
++                    level,
++                    reason,
++                    decision.estimate_rank,
++                    decision.novelty_rank,
++                    decision.spread_rank,
++                    query.n_entries,
++                )
++        self._effort_level_total[level] = self._effort_level_total.get(level, 0) + 1
++        if level == default_level:
++            self._effort_default_reason[reason] = (
++                self._effort_default_reason.get(reason, 0) + 1
++            )
++        if state is not None:
++            state.level = level
++        if level == default_level or not tails:
++            return False
++        self._apply_effort_tail(request, tails[level])
++        return True
++
++    def _apply_effort_tail(self, request: Request, tail: list[int]) -> None:
++        """Replace the default-level tail with the chosen one, in place.
++
++        Only positions at or after `effort_body_len` change, and nothing at or
++        before that boundary has been cached yet, so the body's blocks and their
++        hashes stay valid; the hashes covering the tail are recomputed.
++        """
++        body_len = request.effort_body_len
++        prompt = request.prompt_token_ids
++        assert prompt is not None
++        del prompt[body_len:]
++        prompt.extend(tail)
++        del request._all_token_ids[body_len:]
++        request._all_token_ids.extend(tail)
++        request.num_prompt_tokens = len(prompt)
++        del request.block_hashes[body_len // self.hash_block_size :]
++        request.update_block_hashes()
++        request.max_tokens = min(
++            request.max_tokens, max(self.max_model_len - request.num_prompt_tokens, 1)
++        )
++        request.status = RequestStatus.WAITING
++
++    def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
++        """Record a finished request in the memory (§13.4).
++
++        A soft or forced close is right-censored - the length it *would* have
++        spent is unknown - so it enters as a key with no value.
++        """
++        memory = self._effort_memory
++        vector = self._effort_vectors.pop(request.request_id, None)
++        if memory is None or vector is None:
++            return
++        close_kind = state.close_kind
++        if request.status != RequestStatus.FINISHED_STOPPED:
++            # An abort or a max_tokens cap truncates the thinking, so the
++            # length the request would have spent is unknown.
++            close_kind = CLOSE_CLIENT_LIMIT
++        memory.insert(
++            vector,
++            state.reasoning_tokens,
++            close_kind,
++            session_id=request.session_id,
++            level=state.level,
++        )
++        if memory.n_entries and memory.n_entries % 64 == 0:
++            logger.info(
++                "dynamic_effort: memory %d/%d entries (%d valued), hit rate "
++                "%.2f, levels %s, default-level reasons %s, held timeouts %d",
++                memory.n_entries,
++                memory.cfg.memory_size,
++                memory.n_valued,
++                memory.hit_rate,
++                dict(sorted(self._effort_level_total.items())),
++                dict(sorted(self._effort_default_reason.items())),
++                self._effort_held_timeouts,
++            )
++
++    def _effort_split_worth_it(self, request: Request, boundary: int) -> int:
++        """Whether choosing the prompt tail beats reading the whole prompt.
++
++        The two-phase form buys the level's *sentence*, but only if the vector it
++        decides from is nearly the whole prompt. An agent turn that ends in a
++        tool result puts the last user message - where the effort sentence goes
++        - thousands of tokens from the end, and the body would then be a small
++        prefix of what the model actually reads. Below `split_min_fraction` of
++        the prompt the cap-only form is strictly better informed.
++        """
++        cfg = self._effort_cfg
++        assert cfg is not None
++        if request.num_prompt_tokens <= 0:
++            return False
++        return (
++            boundary / request.num_prompt_tokens >= cfg.hidden_effort.split_min_fraction
++        )
++
++    def _effort_body_boundary(self, request: Request, body_len: int) -> int:
++        """Where the body prefill may stop, or 0 when it may not stop at all.
++
++        The frontend's seam is the last token of the prompt body, but a Mamba
++        "align" deployment may only end a non-final prefill chunk on a block
++        boundary whose state is cacheable - so there the body stops at the last
++        such boundary at or before the seam, and the vector is the hidden state
++        of that token instead. A prompt with no usable boundary keeps today's
++        single-phase path.
++        """
++        if not self.need_mamba_block_aligned_split:
++            return body_len
++        # Any multiple of the block size up to the prompt's last full block is
++        # reachable: `_mamba_block_aligned_split` may stop an intermediate chunk
++        # earlier (at the eagle-pruned last cacheable position), but the next
++        # chunk starts block-aligned and runs on to the boundary.
++        block = self.block_size
++        limit = request.num_tokens - request.num_tokens % block
++        aligned = min(body_len, limit) // block * block
++        return aligned if aligned >= block else 0
++
+     def _free_request(
+         self, request: Request, delay_free_blocks: bool = False
+     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+         assert request.is_finished()
+         self._accepted_ema.pop(request.request_id, None)
++        if self._effort:
++            state = self._effort.get(request.request_id)
++            if state is not None:
++                if not state.finished:
++                    finish_effort(state)
++                self._insert_effort_memory(request, state)
++        self._effort_vectors.pop(request.request_id, None)
++        if self._effort:
++            self._effort.pop(request.request_id, None)
++        if self.effort_sink is not None:
++            self.effort_sink.forget(request.request_id)
+ 
+         self._inflight_prefills.discard(request)
+         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+index d70778eb51..c853a73a69 100644
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -222,6 +222,11 @@ class EngineCoreOutput(
+ 
+     new_sampling_mask: SamplingMaskLists | None = None
+ 
++    # Dynamic reasoning effort report, set on the finishing output only:
++    # {"level", "decided", "reasoning_tokens", "close_kind", "memory_entries",
++    #  "neighbours"}.
++    effort: dict[str, Any] | None = None
++
+     @property
+     def finished(self) -> bool:
+         return self.finish_reason is not None
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 99f60d5d5d..09a3a42ec0 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -175,6 +175,7 @@ class RequestState:
+         self.queue = queue
+         self.num_cached_tokens = 0
+         self.num_cache_creation_tokens = 0
++        self.effort: dict[str, int] | None = None
+ 
+         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+ 
+@@ -386,6 +387,7 @@ class RequestState:
+             num_cached_tokens=self.num_cached_tokens,
+             num_cache_creation_tokens=self.num_cache_creation_tokens,
+             metrics=self.stats,
++            effort=self.effort,
+         )
+ 
+     def _new_completion_output(
+@@ -643,6 +645,8 @@ class OutputProcessor:
+             stop_reason = engine_core_output.stop_reason
+             kv_transfer_params = engine_core_output.kv_transfer_params
+             ec_transfer_params = engine_core_output.ec_transfer_params
++            if engine_core_output.effort is not None:
++                req_state.effort = engine_core_output.effort
+             if engine_core_output.routed_experts is not None:
+                 req_state.routed_experts_chunks.append(
+                     engine_core_output.routed_experts
+@@ -841,6 +845,7 @@ class OutputProcessor:
+             max_tokens_param=req_state.max_tokens_param,
+             req_stats=req_state.stats,
+             num_cached_tokens=req_state.num_cached_tokens,
++            effort=req_state.effort,
+         )
+         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
+ 
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 692106cf39..821cbff26e 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -5,6 +5,7 @@ import logging
+ import time
+ from abc import ABC, abstractmethod
+ from collections.abc import Callable
++from typing import Any
+ 
+ from prometheus_client import Counter, Gauge, Histogram
+ 
+@@ -17,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+ )
+ from vllm.logger import init_logger
+ from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
++from vllm.v1.core.sched.effort_controller import CLOSE_CLIENT_LIMIT, CLOSE_NATURAL
+ from vllm.v1.engine import FinishReason
+ from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
+ from vllm.v1.metrics.prometheus import unregister_vllm_metrics
+@@ -790,6 +792,57 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+             histogram_max_tokens_request, per_engine_labelvalues
+         )
+ 
++        #
++        # Dynamic reasoning effort (labels are fixed enums).
++        #
++        histogram_effort_level = self._histogram_cls(
++            name="vllm:effort_level",
++            documentation=(
++                "Effort level a dynamic request ran at, chosen from its prompt's "
++                "pooled prefill hidden state before it thought."
++            ),
++            buckets=[0, 1, 2, 3],
++            labelnames=labelnames,
++        )
++        self.histogram_effort_level = create_metric_per_engine(
++            histogram_effort_level, per_engine_labelvalues
++        )
++        histogram_reasoning_tokens = self._histogram_cls(
++            name="vllm:reasoning_tokens",
++            documentation="Reasoning tokens of dynamic-effort requests.",
++            buckets=build_1_2_5_buckets(65536),
++            labelnames=labelnames,
++        )
++        self.histogram_reasoning_tokens = create_metric_per_engine(
++            histogram_reasoning_tokens, per_engine_labelvalues
++        )
++        counter_effort_decided = self._counter_cls(
++            name="vllm:effort_decided",
++            documentation=(
++                "Dynamic requests whose level came from the hidden-state memory "
++                "rather than the server default."
++            ),
++            labelnames=labelnames,
++        )
++        self.counter_effort_decided = create_metric_per_engine(
++            counter_effort_decided, per_engine_labelvalues
++        )
++        counter_effort_close_kind = self._counter_cls(
++            name="vllm:effort_close",
++            documentation=(
++                "How dynamic-effort think blocks ended: natural (the model "
++                "closed it) or client-limit (max_tokens or an abort did)."
++            ),
++            labelnames=labelnames + ["kind"],
++        )
++        self.counter_effort_close_kind = {
++            idx: {
++                kind: counter_effort_close_kind.labels(model_name, str(idx), kind)
++                for kind in (CLOSE_NATURAL, CLOSE_CLIENT_LIMIT)
++            }
++            for idx in engine_indexes
++        }
++
+         #
+         # Histogram of timing intervals
+         #
+@@ -1257,6 +1310,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+                 self.histogram_max_tokens_request[engine_idx].observe(
+                     finished_request.max_tokens_param
+                 )
++            if finished_request.effort is not None:
++                self._record_effort(engine_idx, finished_request.effort)
++
++    def _record_effort(self, engine_idx: int, effort: dict[str, Any]) -> None:
++        self.histogram_effort_level[engine_idx].observe(effort.get("level", 0))
++        self.histogram_reasoning_tokens[engine_idx].observe(
++            effort.get("reasoning_tokens", 0)
++        )
++        if effort.get("decided"):
++            self.counter_effort_decided[engine_idx].inc()
++        close_kind = effort.get("close_kind")
++        counters = self.counter_effort_close_kind[engine_idx]
++        if close_kind in counters:
++            counters[close_kind].inc()
+ 
+     def record_sleep_state(self, sleep: int = 0, level: int = 0):
+         awake = 1
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index 3956f7e441..592d1c7fcf 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -253,6 +253,10 @@ class FinishedRequestStats:
+     mean_time_per_output_token: float = 0.0
+     is_corrupted: bool = False
+     num_cached_tokens: int = 0
++    effort: dict[str, Any] | None = None
++    """Dynamic reasoning-effort report (level, decided, reasoning_tokens,
++    close_kind, memory_entries, neighbours) for `reasoning_effort: "dynamic"`
++    requests."""
+ 
+ 
+ @dataclass
+@@ -457,6 +461,7 @@ class IterationStats:
+         max_tokens_param: int | None,
+         req_stats: RequestStateStats,
+         num_cached_tokens: int = 0,
++        effort: dict[str, int] | None = None,
+     ):
+         e2e_latency = self._time_since(req_stats.arrival_time)
+ 
+@@ -496,6 +501,7 @@ class IterationStats:
+             mean_time_per_output_token=mean_time_per_output_token,
+             is_corrupted=req_stats.is_corrupted,
+             num_cached_tokens=num_cached_tokens,
++            effort=effort,
+         )
+         self.finished_requests.append(finished_req)
+ 
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 0bbee76675..e96d47a1af 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -256,6 +256,11 @@ class SamplerOutput:
+     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
+     sampled_token_ids: torch.Tensor
+     logprobs_tensors: LogprobsTensors | None
++    # [num_reqs, 4] fp32 (mean entropy, mean margin, mean p(end), n committed
++    # rows), only when a request in the batch opted into effort telemetry.
++    effort_signals: torch.Tensor | None = None
++    # [num_reqs] bool host mask of the opted-in requests.
++    effort_flags: np.ndarray | None = None
+ 
+ 
+ @dataclass
+@@ -349,6 +354,17 @@ class ModelRunnerOutput:
+     # ``None`` when ``return_sampling_mask`` is off.
+     sampling_masks: SamplingMaskLists | None = None
+ 
++    # req_id -> (mean normalised entropy, mean top1-top2 margin, mean
++    # p(reasoning end), n committed rows) for requests that opted into effort
++    # telemetry this step.
++    effort_signals: dict[str, tuple[float, float, float, int]] | None = None
++
++    # req_id -> the last prefill row of that request's dynamic-effort *body*
++    # (fp16 ``[hidden_size]`` numpy), for the requests the scheduler asked to
++    # capture this step. ``None`` unless ``hidden_effort`` is on and a request
++    # is awaiting its level decision.
++    effort_prefill_states: dict[str, np.ndarray] | None = None
++
+     @staticmethod
+     def with_kv_conn_output_only(
+         kv_connector_output: KVConnectorOutput | None,
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 0b969c991d..baa3c2157f 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -189,6 +189,24 @@ class Request:
+         # True if this request is scheduled as a non-final prefill chunk.
+         self.is_prefill_chunk = False
+ 
++        # Dynamic effort v3 (docs/dynamic-reasoning.claude.md §13.3): the
++        # prompt splits into a level-independent body and one tail per level.
++        # `prompt_token_ids` already carries the default-level tail, so a request whose
++        # decision never lands runs exactly as it did before v3.
++        self.effort_body_len = 0
++        self.effort_tail_variants: list[list[int]] | None = None
++        self.effort_decision_pending = False
++        # True only for the two-phase form: the prefill stops at
++        # `effort_body_len` and the request is held until the level is chosen.
++        # False means the decision rides on the natural end of the prefill and
++        # sets the starting *cap* alone, which is what a prompt whose effort
++        # sentence is not at its tail (an agent loop ending in a tool result)
++        # or a model whose KV block is wider than the seam falls back to.
++        self.effort_hold_prefill = False
++        # Steps the scheduler has held this request waiting for its vector; the
++        # decision falls back to the default level rather than stalling forever.
++        self.effort_decision_skips = 0
++
+         # Block-aligned token position of a proven shared prefix worth pinning
+         # in the (sparse) prefix cache; 0 means none. Set at admission for
+         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).
+diff --git a/vllm/v1/sample/effort_signals.py b/vllm/v1/sample/effort_signals.py
+new file mode 100644
+index 0000000000..4713a58b44
+--- /dev/null
++++ b/vllm/v1/sample/effort_signals.py
+@@ -0,0 +1,396 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Effort telemetry: canonical-stage entropy / top-2 margin per sampled row.
++
++Pure torch/numpy helpers shared by the V1 and V2 samplers, the model runners
++and the scheduler-side JSONL sink. Everything here runs on CPU tensors so the
++semantics are unit-testable without a GPU.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import os
++from collections.abc import Sequence
++from typing import IO, Any
++
++import numpy as np
++import torch
++
++from vllm.sampling_params import SamplingParams
++
++# Column layout of a per-row signal (``NUM_ROWS`` only exists after the
++# per-request reduction). The tuple order is frozen: entropy, margin, p_end,
++# n_rows.
++ENTROPY, MARGIN, P_END, NUM_ROWS = 0, 1, 2, 3
++NUM_ROW_SIGNALS = 3
++
++# ``SamplingParams.extra_args`` keys that opt a request into the telemetry.
++_OPT_IN_KEYS = ("effort_telemetry", "dynamic_effort")
++
++
++def wants_effort_signals(sampling_params: SamplingParams | None) -> bool:
++    """True when the request opted into effort telemetry via ``extra_args``."""
++    if sampling_params is None:
++        return False
++    extra_args = sampling_params.extra_args
++    if not extra_args:
++        return False
++    return any(bool(extra_args.get(key)) for key in _OPT_IN_KEYS)
++
++
++def effort_row_signals(
++    logits: torch.Tensor, end_token_id: int | None = None
++) -> torch.Tensor:
++    """Per-row normalised entropy, top1-top2 margin and p(reasoning end).
++
++    Args:
++        logits: ``[rows, vocab]`` canonical-stage logits (any float dtype).
++        end_token_id: first token of the reasoning end sequence; its softmax
++            probability becomes the third column. ``None`` yields zeros.
++
++    Returns:
++        ``[rows, 3]`` fp32: entropy / ``log(vocab)`` in ``[0, 1]``, the
++        top1-top2 margin in logit units, and p(end) in ``[0, 1]``.
++    """
++    z = logits.float()
++    vocab = z.shape[-1]
++    lse = torch.logsumexp(z, dim=-1)
++    probs = torch.softmax(z, dim=-1)
++    # ``0 * -inf`` is nan; masked entries carry zero mass and zero entropy.
++    pz = torch.where(probs > 0, probs * z, torch.zeros_like(z))
++    entropy = (lse - pz.sum(dim=-1)) / math.log(vocab)
++    top2 = z.topk(2, dim=-1).values
++    margin = top2[:, 0] - top2[:, 1]
++    if end_token_id is None or not 0 <= end_token_id < vocab:
++        p_end = torch.zeros_like(entropy)
++    else:
++        p_end = probs[:, end_token_id]
++    out = torch.stack((entropy, margin, p_end), dim=-1)
++    return torch.nan_to_num(out, nan=0.0)
++
++
++def effort_row_signals_scattered(
++    logits: torch.Tensor,
++    row_indices: torch.Tensor | None,
++    end_token_id: int | None = None,
++) -> torch.Tensor:
++    """Row signals for a subset of rows, zero elsewhere.
++
++    Args:
++        logits: ``[rows, vocab]`` logits.
++        row_indices: int64 row indices to compute, or ``None`` for all rows.
++        end_token_id: first token of the reasoning end sequence.
++
++    Returns:
++        ``[rows, 3]`` fp32 with computed rows filled and other rows zero.
++    """
++    if row_indices is None:
++        return effort_row_signals(logits, end_token_id)
++    out = torch.zeros(
++        (logits.shape[0], NUM_ROW_SIGNALS), dtype=torch.float32, device=logits.device
++    )
++    if row_indices.numel() == 0:
++        return out
++    row_indices = row_indices.to(device=logits.device)
++    out.index_copy_(
++        0, row_indices, effort_row_signals(logits[row_indices], end_token_id)
++    )
++    return out
++
++
++def reduce_committed(
++    row_signals: torch.Tensor,
++    cu_num_rows: torch.Tensor,
++    num_committed: torch.Tensor,
++    row_mask: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Per-request means over the committed prefix of each request's rows.
++
++    Rows of request ``i`` are ``cu_num_rows[i]:cu_num_rows[i+1]`` in commit
++    order; only the first ``num_committed[i]`` rows (bonus / accepted
++    positions) contribute. No host sync: all shapes come from
++    ``row_signals.shape[0]`` and ``cu_num_rows.shape[0]``.
++
++    Args:
++        row_signals: ``[rows, 3]`` per-row signals.
++        cu_num_rows: ``[num_reqs + 1]`` int cumulative row counts.
++        num_committed: ``[num_reqs]`` int committed row count per request.
++        row_mask: optional ``[rows]`` bool; rows with ``False`` are excluded.
++
++    Returns:
++        ``[num_reqs, 4]`` fp32: mean entropy, mean margin, mean p(end),
++        committed row count.
++    """
++    num_reqs = cu_num_rows.shape[0] - 1
++    num_rows = row_signals.shape[0]
++    device = row_signals.device
++    if num_reqs == 0 or num_rows == 0:
++        return torch.zeros(
++            (num_reqs, NUM_ROW_SIGNALS + 1), dtype=torch.float32, device=device
++        )
++    counts = (cu_num_rows[1:] - cu_num_rows[:-1]).long()
++    req_of_row = torch.repeat_interleave(
++        torch.arange(num_reqs, device=device), counts, output_size=num_rows
++    )
++    local_pos = torch.arange(num_rows, device=device) - cu_num_rows[req_of_row].long()
++    committed = local_pos < num_committed.long()[req_of_row]
++    if row_mask is not None:
++        committed = committed & row_mask
++    weight = committed.to(torch.float32)
++    sums = torch.zeros((num_reqs, NUM_ROW_SIGNALS), dtype=torch.float32, device=device)
++    sums.index_add_(0, req_of_row, row_signals.float() * weight[:, None])
++    n_rows = torch.zeros(num_reqs, dtype=torch.float32, device=device)
++    n_rows.index_add_(0, req_of_row, weight)
++    means = sums / n_rows.clamp(min=1.0)[:, None]
++    return torch.cat((means, n_rows[:, None]), dim=-1)
++
++
++def commit_order_permutation(num_draft_tokens: Sequence[int]) -> np.ndarray:
++    """Row permutation from ``[target rows..., bonus rows...]`` to commit order.
++
++    V1 spec decode keeps target rows (all requests' draft positions) and bonus
++    rows (one per request) in two blocks. Commit order per request is its draft
++    positions followed by its bonus row.
++
++    Args:
++        num_draft_tokens: per-request draft counts.
++
++    Returns:
++        int64 index array of length ``sum(num_draft_tokens) + len(...)``.
++    """
++    d = np.asarray(num_draft_tokens, dtype=np.int64)
++    num_reqs = d.shape[0]
++    total_draft = int(d.sum())
++    cu = np.zeros(num_reqs + 1, dtype=np.int64)
++    np.cumsum(d, out=cu[1:])
++    perm = np.empty(total_draft + num_reqs, dtype=np.int64)
++    out_start = cu + np.arange(num_reqs + 1, dtype=np.int64)
++    for i in range(num_reqs):
++        perm[out_start[i] : out_start[i] + d[i]] = np.arange(cu[i], cu[i + 1])
++        perm[out_start[i] + d[i]] = total_draft + i
++    return perm
++
++
++def flagged_row_indices(
++    flags: np.ndarray, num_rows_per_req: np.ndarray | None = None
++) -> np.ndarray:
++    """Row indices belonging to flagged requests.
++
++    Args:
++        flags: ``[num_reqs]`` bool.
++        num_rows_per_req: rows per request in row order; ``None`` means one.
++
++    Returns:
++        int64 row indices (empty when nothing is flagged).
++    """
++    if num_rows_per_req is None:
++        return np.flatnonzero(flags).astype(np.int64)
++    return np.flatnonzero(np.repeat(flags, num_rows_per_req)).astype(np.int64)
++
++
++def signals_to_dict(
++    req_ids: Sequence[str],
++    signals: np.ndarray,
++    flags: np.ndarray | None,
++) -> dict[str, tuple[float, float, float, int]]:
++    """Build ``ModelRunnerOutput.effort_signals`` for flagged requests only.
++
++    Args:
++        req_ids: batch-ordered request ids.
++        signals: ``[num_reqs, 4]`` host array (entropy, margin, p_end, n_rows).
++        flags: ``[num_reqs]`` bool opt-in mask; ``None`` means all flagged.
++
++    Returns:
++        req_id -> (mean entropy, mean margin, mean p(end), n committed rows).
++    """
++    out: dict[str, tuple[float, float, float, int]] = {}
++    for i, req_id in enumerate(req_ids):
++        if flags is not None and not flags[i]:
++            continue
++        row = signals[i]
++        out[req_id] = (
++            float(row[ENTROPY]),
++            float(row[MARGIN]),
++            float(row[P_END]),
++            int(row[NUM_ROWS]),
++        )
++    return out
++
++
++class ThinkTracker:
++    """Incremental "inside a think block" detector over a growing token list.
++
++    Same rule as ``ThinkingBudgetStateHolder``: the last start sequence after
++    the last end sequence means thinking. Missing start/end ids -> unknown.
++    """
++
++    def __init__(
++        self,
++        start_ids: Sequence[int] | None,
++        end_ids: Sequence[int] | None,
++    ):
++        self.start_ids = list(start_ids or [])
++        self.end_ids = list(end_ids or [])
++        self.enabled = bool(self.start_ids and self.end_ids)
++        self._overlap = max(len(self.start_ids), len(self.end_ids)) - 1
++        self._scanned = 0
++        self._last_start = -1
++        self._last_end = -1
++        self._prompt_in_think = False
++
++    @staticmethod
++    def _last_index(tokens: Sequence[int], pattern: list[int], base: int) -> int:
++        n = len(pattern)
++        for i in range(len(tokens) - n, -1, -1):
++            if list(tokens[i : i + n]) == pattern:
++                return base + i
++        return -1
++
++    def seed_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
++        """Start in think mode when the prompt's tail opens a think block."""
++        if not self.enabled:
++            return
++        tail = list(prompt_token_ids[-max(64, self._overlap + 1) :])
++        s = self._last_index(tail, self.start_ids, 0)
++        e = self._last_index(tail, self.end_ids, 0)
++        if s > e:
++            self._prompt_in_think = True
++
++    def update(self, token_ids: Sequence[int]) -> bool | None:
++        """Scan tokens appended since the last call; return in-think state."""
++        if not self.enabled:
++            return None
++        n = len(token_ids)
++        if n < self._scanned:
++            self._scanned, self._last_start, self._last_end = 0, -1, -1
++        base = max(0, self._scanned - self._overlap)
++        window = token_ids[base:]
++        s = self._last_index(window, self.start_ids, base)
++        e = self._last_index(window, self.end_ids, base)
++        if s > self._last_start:
++            self._last_start = s
++        if e > self._last_end:
++            self._last_end = e
++        self._scanned = n
++        if self._last_start == -1 and self._last_end == -1:
++            return self._prompt_in_think
++        return self._last_start > self._last_end
++
++
++def format_sink_record(
++    req_id: str,
++    step: int,
++    num_output_tokens: int,
++    signal: tuple[float, float, float, int],
++    num_draft_tokens: int | None,
++    num_accepted: int | None,
++    in_think: bool | None,
++) -> str:
++    """One JSONL line for the effort telemetry sink."""
++    rec: dict[str, Any] = {
++        "req_id": req_id,
++        "step": step,
++        "num_output_tokens": num_output_tokens,
++        "entropy": signal[ENTROPY],
++        "margin": signal[MARGIN],
++        "p_end": signal[P_END],
++        "n_rows": signal[NUM_ROWS],
++        "num_draft_tokens": num_draft_tokens,
++        "num_accepted": num_accepted,
++        "in_think": in_think,
++    }
++    return json.dumps(rec, separators=(",", ":"))
++
++
++class EffortTelemetrySink:
++    """Buffered JSONL writer keyed by request; flushes every N lines."""
++
++    FLUSH_EVERY = 256
++
++    def __init__(
++        self,
++        path: str,
++        start_ids: Sequence[int] | None,
++        end_ids: Sequence[int] | None,
++        stream: IO[str] | None = None,
++    ):
++        self.path = path
++        self._start_ids = start_ids
++        self._end_ids = end_ids
++        self._file = stream if stream is not None else open(path, "a")  # noqa: SIM115
++        self._buffer: list[str] = []
++        self._steps: dict[str, int] = {}
++        self._trackers: dict[str, ThinkTracker] = {}
++
++    @classmethod
++    def from_env(
++        cls,
++        start_ids: Sequence[int] | None,
++        end_ids: Sequence[int] | None,
++    ) -> EffortTelemetrySink | None:
++        path = os.environ.get("VLLM_EFFORT_TELEMETRY")
++        if not path:
++            return None
++        return cls(path, start_ids, end_ids)
++
++    def record(
++        self,
++        req_id: str,
++        output_token_ids: Sequence[int],
++        signal: tuple[float, float, float, int],
++        num_draft_tokens: int | None,
++        num_accepted: int | None,
++        finished: bool,
++        prompt_token_ids: Sequence[int] | None = None,
++    ) -> None:
++        tracker = self._trackers.get(req_id)
++        if tracker is None:
++            tracker = ThinkTracker(self._start_ids, self._end_ids)
++            if prompt_token_ids:
++                # Chat templates open the think block in the prompt
++                # (e.g. "<think>\n"), so seed the state from the prompt tail.
++                tracker.seed_from_prompt(prompt_token_ids)
++            self._trackers[req_id] = tracker
++        step = self._steps.get(req_id, 0) + 1
++        self._steps[req_id] = step
++        self._buffer.append(
++            format_sink_record(
++                req_id,
++                step,
++                len(output_token_ids),
++                signal,
++                num_draft_tokens,
++                num_accepted,
++                tracker.update(output_token_ids),
++            )
++        )
++        if finished:
++            self.forget(req_id)
++            self.flush()
++        elif len(self._buffer) >= self.FLUSH_EVERY:
++            self.flush()
++
++    def record_finish(self, req_id: str, payload: dict[str, Any]) -> None:
++        """One `event: finish` line per request: what the client asked for,
++        what was served, and the controller's closing report."""
++        self._buffer.append(
++            json.dumps({"req_id": req_id, "event": "finish", **payload})
++        )
++        self.flush()
++
++    def forget(self, req_id: str) -> None:
++        self._steps.pop(req_id, None)
++        self._trackers.pop(req_id, None)
++
++    def flush(self) -> None:
++        if not self._buffer:
++            return
++        self._file.write("\n".join(self._buffer) + "\n")
++        self._file.flush()
++        self._buffer.clear()
++
++    def close(self) -> None:
++        self.flush()
++        self._file.close()
+diff --git a/vllm/v1/sample/metadata.py b/vllm/v1/sample/metadata.py
+index fa4ceac8e7..7fa9fea43f 100644
+--- a/vllm/v1/sample/metadata.py
++++ b/vllm/v1/sample/metadata.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ 
++import numpy as np
+ import torch
+ 
+ from vllm.v1.sample.logits_processor import LogitsProcessors
+@@ -53,3 +54,9 @@ class SamplingMetadata:
+     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
+     # thinking-token-budget logits (holder may exist with an empty tracking set).
+     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
++    # [num_reqs] host bool mask of requests that opted into effort telemetry;
++    # ``None`` when no request in the batch did (no extra sampler work).
++    effort_mask: np.ndarray | None = None
++    # First token of the reasoning end sequence; its softmax probability is the
++    # ``p_end`` effort signal. ``None`` disables that column.
++    effort_end_token_id: int | None = None
+diff --git a/vllm/v1/sample/rejection_sampler.py b/vllm/v1/sample/rejection_sampler.py
+index a1baf0a808..f192274632 100644
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -13,7 +13,15 @@ import torch.nn as nn
+ from vllm.config.model import PROCESSED_LOGPROBS_MODES
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
++from vllm.v1.sample.effort_signals import (
++    NUM_ROW_SIGNALS,
++    commit_order_permutation,
++    effort_row_signals_scattered,
++    flagged_row_indices,
++    reduce_committed,
++)
+ from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+ from vllm.v1.sample.metadata import SamplingMetadata
+ from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
+@@ -73,6 +81,9 @@ class RejectionSampler(nn.Module):
+             "raw_logits",
+             "processed_logits",
+         )
++        # [num_draft_total, 3] target-row effort signals of the last
++        # ``apply_logits_processors`` call; None when no request opted in.
++        self._effort_target_rows: torch.Tensor | None = None
+ 
+         self.synthetic_conditional_rates: torch.Tensor | None = None
+         if (
+@@ -161,6 +172,7 @@ class RejectionSampler(nn.Module):
+         target_logits = self.apply_logits_processors(
+             target_logits, sampling_metadata, metadata
+         )
++        effort_target_rows, self._effort_target_rows = self._effort_target_rows, None
+         # [num_tokens, vocab_size]
+         # NOTE(woosuk): `target_logits` can be updated in place inside the
+         # `apply_sampling_constraints` function.
+@@ -195,11 +207,52 @@ class RejectionSampler(nn.Module):
+                 output_token_ids,
+             )
+ 
++        effort_signals = None
++        if effort_target_rows is not None:
++            assert bonus_sampler_output.effort_signals is not None
++            effort_signals = self._reduce_effort_signals(
++                effort_target_rows,
++                bonus_sampler_output.effort_signals[:, :NUM_ROW_SIGNALS],
++                metadata.num_draft_tokens,
++                output_token_ids,
++            )
++
+         return SamplerOutput(
+             sampled_token_ids=output_token_ids,
+             logprobs_tensors=logprobs_tensors,
++            effort_signals=effort_signals,
++            effort_flags=sampling_metadata.effort_mask,
+         )
+ 
++    @staticmethod
++    def _reduce_effort_signals(
++        target_rows: torch.Tensor,
++        bonus_rows: torch.Tensor,
++        num_draft_tokens: list[int],
++        output_token_ids: torch.Tensor,
++    ) -> torch.Tensor:
++        """Per-request means over committed rows (accepted drafts + bonus).
++
++        Args:
++            target_rows: ``[num_draft_total, 3]`` target-row signals.
++            bonus_rows: ``[num_reqs, 3]`` bonus-row signals.
++            num_draft_tokens: per-request draft counts.
++            output_token_ids: ``[num_reqs, max_spec_len + 1]`` sampled ids;
++                rejected positions hold ``PLACEHOLDER_TOKEN_ID``.
++
++        Returns:
++            ``[num_reqs, 4]`` (mean entropy, mean margin, mean p(end), n rows).
++        """
++        device = target_rows.device
++        perm = async_tensor_h2d(commit_order_permutation(num_draft_tokens), device)
++        rows = torch.cat((target_rows, bonus_rows), dim=0)[perm]
++        counts = torch.tensor(num_draft_tokens, dtype=torch.int64) + 1
++        cu_num_rows = torch.zeros(len(num_draft_tokens) + 1, dtype=torch.int64)
++        torch.cumsum(counts, dim=0, out=cu_num_rows[1:])
++        cu_num_rows = async_tensor_h2d(cu_num_rows, device)
++        num_committed = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum(dim=-1)
++        return reduce_committed(rows, cu_num_rows, num_committed)
++
+     def _get_logprobs_tensors(
+         self,
+         max_num_logprobs: int,
+@@ -336,6 +389,17 @@ class RejectionSampler(nn.Module):
+                 logits = processor.apply_with_spec_decode(
+                     logits, metadata.num_draft_tokens
+                 )
++        # Canonical effort-telemetry stage for the target rows: after penalties
++        # and bad words, before the thinking-budget force and temperature.
++        effort_mask = sampling_metadata.effort_mask
++        self._effort_target_rows = None
++        if effort_mask is not None:
++            rows = flagged_row_indices(effort_mask, metadata.num_draft_tokens)
++            self._effort_target_rows = effort_row_signals_scattered(
++                logits,
++                async_tensor_h2d(rows, device=logits.device),
++                sampling_metadata.effort_end_token_id,
++            )
+         holder = sampling_metadata.thinking_budget_state_holder
+         if holder is not None and holder.has_tracked_requests():
+             logits = holder.apply_to_logits(
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 3efaf33d98..948f284429 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -7,8 +7,12 @@ import torch.nn as nn
+ 
+ from vllm.config.model import LogprobsMode
+ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+-from vllm.utils.torch_utils import PIN_MEMORY
++from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
+ from vllm.v1.outputs import LogprobsTensors, SamplerOutput
++from vllm.v1.sample.effort_signals import (
++    effort_row_signals_scattered,
++    flagged_row_indices,
++)
+ from vllm.v1.sample.metadata import SamplingMetadata
+ from vllm.v1.sample.ops.bad_words import apply_bad_words
+ from vllm.v1.sample.ops.logprobs import batched_count_greater_than
+@@ -69,6 +73,9 @@ class Sampler(nn.Module):
+         self.pin_memory = PIN_MEMORY
+         self.logprobs_mode = logprobs_mode
+         self.use_fp64_gumbel = use_fp64_gumbel
++        # [num_reqs, 3] canonical-stage effort signals of the last
++        # ``apply_logits_processors`` call; None when no request opted in.
++        self._effort_rows: torch.Tensor | None = None
+ 
+     def forward(
+         self,
+@@ -99,6 +106,7 @@ class Sampler(nn.Module):
+         logits = self.apply_logits_processors(
+             logits, sampling_metadata, predict_bonus_token
+         )
++        effort_rows, self._effort_rows = self._effort_rows, None
+         # Sample the next token.
+         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
+         if processed_logprobs is not None:
+@@ -139,6 +147,15 @@ class Sampler(nn.Module):
+         # Use int32 to reduce the tensor size.
+         sampled = sampled.to(torch.int32)
+ 
++        effort_signals = None
++        if effort_rows is not None:
++            # One committed row per request; flagged rows count 1, others 0.
++            n_rows = async_tensor_h2d(
++                sampling_metadata.effort_mask.astype("float32"),
++                device=effort_rows.device,
++            )
++            effort_signals = torch.cat((effort_rows, n_rows[:, None]), dim=-1)
++
+         # These are GPU tensors.
+         sampler_output = SamplerOutput(
+             # The sampled tokens are expanded to 2D tensor with shape
+@@ -146,6 +163,8 @@ class Sampler(nn.Module):
+             # token per request.
+             sampled_token_ids=sampled.unsqueeze(-1),
+             logprobs_tensors=logprobs_tensors,
++            effort_signals=effort_signals,
++            effort_flags=sampling_metadata.effort_mask,
+         )
+         return sampler_output
+ 
+@@ -403,6 +422,17 @@ class Sampler(nn.Module):
+ 
+         # Apply penalties (e.g., freq_penalties).
+         logits = self.apply_penalties(logits, sampling_metadata, output_token_ids)
++        # Canonical effort-telemetry stage: after penalties, before the
++        # thinking-budget force and temperature (one row per request here).
++        effort_mask = sampling_metadata.effort_mask
++        self._effort_rows = None
++        if effort_mask is not None:
++            rows = flagged_row_indices(effort_mask)
++            self._effort_rows = effort_row_signals_scattered(
++                logits,
++                async_tensor_h2d(rows, device=logits.device),
++                sampling_metadata.effort_end_token_id,
++            )
+         holder = sampling_metadata.thinking_budget_state_holder
+         if holder is not None and holder.has_tracked_requests():
+             # Committed outputs only; spec drafts live in ``spec_token_ids``.
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index ba0a66d2bc..182d16c251 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -17,6 +17,7 @@ from vllm.v1.outputs import (
+     PoolerOutput,
+     RoutedExpertsTensors,
+ )
++from vllm.v1.sample.effort_signals import signals_to_dict
+ from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
+ from vllm.v1.worker.utils import raise_if_nan_logits
+ 
+@@ -122,6 +123,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         copy_stream: torch.cuda.Stream,
+         check_ep_fault: bool = False,
+         routed_experts: RoutedExpertsTensors | None = None,
++        effort_prefill_states: tuple[list[str], torch.Tensor] | None = None,
+     ):
+         # NOTE(woosuk): We must retain references to the GPU tensors,
+         # as the copy operations are performed on a different CUDA stream than
+@@ -130,6 +132,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         self.sampler_output = sampler_output
+         self.num_sampled_tokens = num_sampled_tokens
+         self.routed_experts = routed_experts
++        self.effort_prefill_states = effort_prefill_states
+         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
+         self.copy_event = torch.cuda.Event(blocking=True)
+         self._has_fault: torch.Tensor | None = None
+@@ -147,6 +150,14 @@ class AsyncOutput(AsyncModelRunnerOutput):
+             if sampler_output.num_nans is not None:
+                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
+             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
++            self.effort_signals_np: np.ndarray | None = None
++            if sampler_output.effort_signals is not None:
++                self.effort_signals_np = async_copy_to_np(sampler_output.effort_signals)
++            self.effort_prefill_states_np: np.ndarray | None = None
++            if effort_prefill_states is not None:
++                self.effort_prefill_states_np = async_copy_to_np(
++                    effort_prefill_states[1]
++                )
+             self.sampling_mask_tensors: SamplingMaskTensors | None = None
+             if sampler_output.sampling_mask_tensors is not None:
+                 self.sampling_mask_tensors = (
+@@ -189,6 +200,19 @@ class AsyncOutput(AsyncModelRunnerOutput):
+             if envs.VLLM_RAISE_ON_LOGIT_NANS:
+                 raise_if_nan_logits(self.model_runner_output.num_nans_in_logits)
+ 
++        if self.effort_signals_np is not None:
++            self.model_runner_output.effort_signals = signals_to_dict(
++                self.model_runner_output.req_ids,
++                self.effort_signals_np,
++                self.sampler_output.effort_flags,
++            )
++
++        if self.effort_prefill_states_np is not None:
++            assert self.effort_prefill_states is not None
++            self.model_runner_output.effort_prefill_states = dict(
++                zip(self.effort_prefill_states[0], self.effort_prefill_states_np)
++            )
++
+         if self.logprobs_tensors is not None:
+             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
+         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
+diff --git a/vllm/v1/worker/gpu/effort_hidden.py b/vllm/v1/worker/gpu/effort_hidden.py
+new file mode 100644
+index 0000000000..ec63bf4de7
+--- /dev/null
++++ b/vllm/v1/worker/gpu/effort_hidden.py
+@@ -0,0 +1,60 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The free half of the v3 effort signal: the body's last prefill row.
++
++`hidden_states` in `GPUModelRunner.sample_tokens` is `[num_tokens, hidden]` -
++the tensor `compute_logits` feeds to `lm_head`, already full width on every TP
++rank because the final row-parallel all-reduce has happened. The row the
++scheduler wants is the last row of the request's query window on the step its
++*body* prefill completes (docs/dynamic-reasoning.claude.md §13.3).
++
++Taking the last scheduled row rather than counting prompt tokens is what makes
++this correct for a fully prefix-cached body: such a request schedules a single
++token, which is exactly the last body token, and the naive prefill accounting
++produces no record at all.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import torch
++
++if TYPE_CHECKING:
++    from vllm.v1.worker.gpu.input_batch import InputBatch
++
++
++def gather_prefill_states(
++    hidden_states: torch.Tensor,
++    input_batch: InputBatch,
++    capture_req_ids: list[str] | None,
++) -> tuple[list[str], torch.Tensor] | None:
++    """Last-row hidden state of each request the scheduler asked to capture.
++
++    Args:
++        hidden_states: `[num_tokens, hidden]` final-layer states of this step.
++        input_batch: the step's batch; `query_start_loc_np` locates each
++            request's rows.
++        capture_req_ids: request ids whose body prefill ends this step.
++
++    Returns:
++        `(req_ids, [n, hidden] fp16 device tensor)`, or `None` when nothing was
++        asked for or none of the ids are in this batch.
++    """
++    if not capture_req_ids or hidden_states is None:
++        return None
++    wanted = set(capture_req_ids)
++    qsl = input_batch.query_start_loc_np
++    req_ids: list[str] = []
++    rows: list[int] = []
++    for i, req_id in enumerate(input_batch.req_ids):
++        if req_id not in wanted:
++            continue
++        row = int(qsl[i + 1]) - 1
++        if 0 <= row < hidden_states.shape[0]:
++            req_ids.append(req_id)
++            rows.append(row)
++    if not req_ids:
++        return None
++    index = torch.tensor(rows, dtype=torch.long, device=hidden_states.device)
++    return req_ids, hidden_states.index_select(0, index).to(torch.float16)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b412d4682d..77a65a8da3 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -95,6 +95,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
+ )
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.ec_connector import get_ec_connector
++from vllm.v1.worker.gpu.effort_hidden import gather_prefill_states
+ from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
+ from vllm.v1.worker.gpu.input_batch import (
+     InputBatch,
+@@ -1674,6 +1675,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             finished_req_ids=finished_req_ids,
+             routed_experts=routed_experts,
+             num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
++            effort_prefill_capture=scheduler_output.effort_prefill_capture or None,
+         )
+ 
+         if not self.is_last_pp_rank:
+@@ -1700,6 +1702,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_spec_tokens_to_schedule = (
+             self.execute_model_state.num_spec_tokens_to_schedule
+         )
++        effort_prefill_capture = self.execute_model_state.effort_prefill_capture
+         self.execute_model_state = None
+ 
+         if not self.is_last_pp_rank:
+@@ -1725,6 +1728,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.pcp_manager, hidden_states, input_batch
+         )
+ 
++        effort_prefill_states = gather_prefill_states(
++            hidden_states, input_batch, effort_prefill_capture
++        )
++
+         sampler_output, num_sampled, num_rejected = self.sample(
+             hidden_states, input_batch, grammar_output
+         )
+@@ -1765,6 +1772,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             main_stream=self.main_stream,
+             copy_stream=self.output_copy_stream,
+             check_ep_fault=self.check_ep_fault,
++            effort_prefill_states=effort_prefill_states,
+             routed_experts=routed_experts,
+         )
+ 
+@@ -1973,6 +1981,8 @@ class ExecuteModelState(NamedTuple):
+     routed_experts: RoutedExpertsTensors | None
+     # Draft tokens the scheduler will verify next step (dynamic/adaptive SD).
+     num_spec_tokens_to_schedule: int = 0
++    # Requests whose dynamic-effort body prefill ends this step (§13.3).
++    effort_prefill_capture: list[str] | None = None
+ 
+ 
+ class BatchReqState(NamedTuple):
+diff --git a/vllm/v1/worker/gpu/sample/effort.py b/vllm/v1/worker/gpu/sample/effort.py
+new file mode 100644
+index 0000000000..184e5ccf80
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/effort.py
+@@ -0,0 +1,134 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Model Runner V2 state for per-request effort telemetry (entropy / margin)."""
++
++from typing import TYPE_CHECKING
++
++import numpy as np
++import torch
++
++from vllm.sampling_params import SamplingParams
++from vllm.utils.torch_utils import async_tensor_h2d
++from vllm.v1.sample.effort_signals import (
++    NUM_ROW_SIGNALS,
++    effort_row_signals,
++    effort_row_signals_scattered,
++    flagged_row_indices,
++    reduce_committed,
++    wants_effort_signals,
++)
++from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
++
++if TYPE_CHECKING:
++    from vllm.config.reasoning import ReasoningConfig
++
++
++class EffortState:
++    """Opt-in flags plus the per-step row-signal accumulator.
++
++    ``begin`` arms the state for a batch, ``compute`` is called once per logits
++    chunk at the canonical stage (after penalties / bad words, before the
++    thinking-budget force and temperature) and ``finish`` reduces the rows to
++    per-request means over the committed prefix once ``num_sampled`` is known.
++    """
++
++    def __init__(
++        self,
++        max_num_reqs: int,
++        device: torch.device,
++        reasoning_config: "ReasoningConfig | None" = None,
++    ):
++        self.max_num_reqs = max_num_reqs
++        self.device = device
++        natural_end = (
++            None
++            if reasoning_config is None
++            else reasoning_config.natural_reasoning_end_token_ids
++        )
++        self.end_token_id: int | None = natural_end[0] if natural_end else None
++        self.use_effort = np.zeros(max_num_reqs, dtype=bool)
++        # req_state_idx -> 1 when flagged; read on GPU for expanded rows.
++        self.flags = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
++        self._flags_dirty = False
++        self._active = False
++        self._pending: list[torch.Tensor] = []
++        self._pending_mask: list[torch.Tensor] = []
++
++    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
++        flagged = wants_effort_signals(sampling_params)
++        self.use_effort[req_idx] = flagged
++        if bool(self.flags.np[req_idx]) != flagged:
++            self.flags.np[req_idx] = int(flagged)
++            self._flags_dirty = True
++
++    def apply_staged_writes(self) -> None:
++        if self._flags_dirty:
++            self.flags.copy_to_uva()
++            self._flags_dirty = False
++
++    def batch_flags(self, idx_mapping_np: np.ndarray) -> np.ndarray:
++        return self.use_effort[idx_mapping_np]
++
++    def begin(self, idx_mapping_np: np.ndarray) -> bool:
++        """Arm for a batch; returns whether any request in it opted in."""
++        self._pending.clear()
++        self._pending_mask.clear()
++        self._active = bool(np.any(self.use_effort[idx_mapping_np]))
++        return self._active
++
++    def compute(
++        self,
++        logits: torch.Tensor,
++        expanded_idx_mapping: torch.Tensor,
++        idx_mapping_np: np.ndarray,
++    ) -> None:
++        """Append canonical-stage row signals for one logits chunk."""
++        if not self._active:
++            return
++        num_rows = logits.shape[0]
++        device = logits.device
++        chunk_flags = self.use_effort[idx_mapping_np]
++        if not np.any(chunk_flags):
++            sig = torch.zeros(
++                (num_rows, NUM_ROW_SIGNALS), dtype=torch.float32, device=device
++            )
++            row_flags = torch.zeros(num_rows, dtype=torch.bool, device=device)
++        elif num_rows == idx_mapping_np.shape[0]:
++            # One row per request: exact host-side row selection.
++            rows = flagged_row_indices(chunk_flags)
++            sig = effort_row_signals_scattered(
++                logits, async_tensor_h2d(rows, device=device), self.end_token_id
++            )
++            row_flags = async_tensor_h2d(chunk_flags, device=device)
++        else:
++            # Spec-decode rows: the exact per-request layout only exists on
++            # the GPU (adaptive verification compacts drafts), so compute the
++            # chunk and zero the rows of requests that did not opt in.
++            row_flags = self.flags.gpu[expanded_idx_mapping] != 0
++            sig = (
++                effort_row_signals(logits, self.end_token_id)
++                * row_flags.to(torch.float32)[:, None]
++            )
++        self._pending.append(sig)
++        self._pending_mask.append(row_flags)
++
++    def finish(
++        self,
++        cu_num_logits: torch.Tensor,
++        num_sampled: torch.Tensor,
++    ) -> torch.Tensor | None:
++        """Reduce the accumulated rows to ``[num_reqs, 4]`` per-request means."""
++        if not self._active:
++            return None
++        self._active = False
++        if not self._pending:
++            return None
++        rows = self._pending[0] if len(self._pending) == 1 else torch.cat(self._pending)
++        mask = (
++            self._pending_mask[0]
++            if len(self._pending_mask) == 1
++            else torch.cat(self._pending_mask)
++        )
++        self._pending.clear()
++        self._pending_mask.clear()
++        return reduce_committed(rows, cu_num_logits, num_sampled, row_mask=mask)
+diff --git a/vllm/v1/worker/gpu/sample/output.py b/vllm/v1/worker/gpu/sample/output.py
+index 02e86cc657..5bc477a791 100644
+--- a/vllm/v1/worker/gpu/sample/output.py
++++ b/vllm/v1/worker/gpu/sample/output.py
+@@ -20,6 +20,11 @@ class SamplerOutput:
+     num_sampled: torch.Tensor | None
+     num_rejected: torch.Tensor | None = None
+     sampling_mask_tensors: SamplingMaskTensors | None = None
++    # [num_reqs, 4] fp32 (mean entropy, mean margin, mean p(end), n committed
++    # rows), only when a request in the batch opted into effort telemetry.
++    effort_signals: torch.Tensor | None = None
++    # [num_reqs] bool host mask of the opted-in requests.
++    effort_flags: np.ndarray | None = None
+ 
+ 
+ @triton.jit
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index bb7dc40b02..e3c699f6f3 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -16,6 +16,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
+ from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
+ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+ from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
++from vllm.v1.worker.gpu.sample.effort import EffortState
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+ from vllm.v1.worker.gpu.sample.logprob import (
+@@ -53,6 +54,7 @@ class Sampler:
+         self.bad_words_state = BadWordsState(req_states)
+         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
+         self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
++        self.effort_state = EffortState(max_num_reqs, device, reasoning_config)
+         self.num_speculative_tokens = num_speculative_tokens
+         self.return_sampling_mask = return_sampling_mask
+         self.use_flashinfer = (
+@@ -68,6 +70,7 @@ class Sampler:
+         self.bad_words_state.add_request(req_idx, sampling_params)
+         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
+         self.thinking_budget_state.add_request(req_idx, sampling_params)
++        self.effort_state.add_request(req_idx, sampling_params)
+ 
+     def apply_staged_writes(self) -> None:
+         self.sampling_states.apply_staged_writes()
+@@ -76,6 +79,7 @@ class Sampler:
+         self.bad_words_state.apply_staged_writes()
+         self.logprob_token_ids_state.apply_staged_writes()
+         self.thinking_budget_state.apply_staged_writes()
++        self.effort_state.apply_staged_writes()
+ 
+     def __call__(
+         self,
+@@ -100,6 +104,7 @@ class Sampler:
+         )
+         return_logprobs = max_num_logprobs != NO_LOGPROBS or max_per_req_token_ids > 0
+ 
++        self.effort_state.begin(idx_mapping_np)
+         sampled, processed_logits = self.sample(
+             logits,
+             expanded_idx_mapping,
+@@ -147,6 +152,15 @@ class Sampler:
+                 processed_logits, num_sampled
+             )
+ 
++        effort_signals = self.effort_state.finish(
++            input_batch.cu_num_logits, num_sampled
++        )
++        effort_flags = (
++            self.effort_state.batch_flags(idx_mapping_np)
++            if effort_signals is not None
++            else None
++        )
++
+         # These are GPU tensors.
+         sampler_output = SamplerOutput(
+             # The sampled tokens are expanded to 2D tensor with shape
+@@ -158,6 +172,8 @@ class Sampler:
+             num_sampled=num_sampled,
+             num_rejected=num_rejected,
+             sampling_mask_tensors=sampling_mask_tensors,
++            effort_signals=effort_signals,
++            effort_flags=effort_flags,
+         )
+         return sampler_output
+ 
+@@ -173,6 +189,8 @@ class Sampler:
+         skip_top_k_top_p: bool = False,
+     ) -> torch.Tensor:
+         if not self._requires_logits_processing(idx_mapping_np):
++            # Nothing modifies the logits: they are already canonical-stage.
++            self.effort_state.compute(logits, expanded_idx_mapping, idx_mapping_np)
+             return logits
+ 
+         # Copy logits to a new FP32 tensor.
+@@ -201,6 +219,10 @@ class Sampler:
+             expanded_local_pos,
+         )
+ 
++        # Canonical effort-telemetry stage: after penalties and bad words,
++        # before the thinking-budget force and temperature.
++        self.effort_state.compute(logits, expanded_idx_mapping, idx_mapping_np)
++
+         # Force the reasoning end marker once a request's thinking budget is
+         # reached; applied before temperature so the forced token is always kept.
+         self.thinking_budget_state.apply(
+@@ -235,6 +257,8 @@ class Sampler:
+             return True
+         if np.any(self.bad_words_state.num_bad_words.np[idx_mapping_np] > 0):
+             return True
++        if self.thinking_budget_state.requires_logits_processing(idx_mapping_np):
++            return True
+ 
+         states = self.sampling_states
+         temperatures = states.temperature.np[idx_mapping_np]
+diff --git a/vllm/v1/worker/gpu/sample/thinking_budget.py b/vllm/v1/worker/gpu/sample/thinking_budget.py
+index eca7929860..08e782d377 100644
+--- a/vllm/v1/worker/gpu/sample/thinking_budget.py
++++ b/vllm/v1/worker/gpu/sample/thinking_budget.py
+@@ -1,5 +1,22 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-request thinking token budgets for Model Runner V2.
++
++State per batch slot: the budget plus a cache of the last
++reasoning start/end marker positions in the committed token history. Each
++step, ``apply`` forces the reasoning end sequence on every target logits row
++whose effective prefix (committed tokens plus the draft tokens before that
++row) is inside a think block that has reached the budget. The rules match the
++V1 ``ThinkingBudgetStateHolder``: the first over-budget row forces the first
++end token, later rows in the same draft window force the next end tokens
++while the drafts follow the sequence, and a rejected draft simply re-forces
++next step because the decision is recomputed from committed tokens.
++
++``apply_thinking_budget`` dispatches to Triton kernels on CUDA and to a pure
++torch reference (``apply_thinking_budget_torch``) on other devices; the
++reference is the CPU-testable specification of the semantics.
++"""
++
+ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+@@ -46,6 +63,7 @@ class ThinkingBudgetState:
+             else reasoning_config.natural_reasoning_end_token_ids or []
+         )
+         self.enabled = bool(start_ids and end_ids and natural_end_ids)
++        self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
+         if not self.enabled:
+             return
+ 
+@@ -54,7 +72,6 @@ class ThinkingBudgetState:
+         )
+         self.thinking_token_budget.np.fill(-1)
+         self.thinking_token_budget.copy_to_uva()
+-        self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
+ 
+         self.cached_last_start = torch.full(
+             (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
+@@ -107,6 +124,9 @@ class ThinkingBudgetState:
+             self.thinking_token_budget.copy_to_uva()
+             self._budget_dirty = False
+ 
++    def requires_logits_processing(self, idx_mapping_np: np.ndarray) -> bool:
++        return self.enabled and bool(np.any(self.use_thinking_budget[idx_mapping_np]))
++
+     def apply(
+         self,
+         logits: torch.Tensor,
+@@ -116,7 +136,7 @@ class ThinkingBudgetState:
+         input_ids: torch.Tensor,
+         expanded_local_pos: torch.Tensor,
+     ) -> None:
+-        if not self.enabled or not np.any(self.use_thinking_budget[idx_mapping_np]):
++        if not self.requires_logits_processing(idx_mapping_np):
+             return
+ 
+         apply_thinking_budget(
+@@ -369,6 +389,216 @@ def _thinking_budget_kernel(
+     tl.store(logits_ptr + token_idx * logits_stride + force_token_id, 1.0e9)
+ 
+ 
++def find_last_marker(tokens: torch.Tensor, marker: torch.Tensor, lo: int = 0) -> int:
++    """Largest ``i >= lo`` with ``tokens[i:i+len(marker)] == marker``, else -1."""
++    n = marker.numel()
++    if n == 0 or tokens.numel() - lo < n:
++        return -1
++    hits = (tokens[lo:].unfold(0, n, 1) == marker).all(dim=1)
++    if not bool(hits.any()):
++        return -1
++    return lo + int(hits.nonzero()[-1].item())
++
++
++def update_marker_cache_torch(
++    req_ids: torch.Tensor,
++    thinking_token_budget: torch.Tensor,
++    all_token_ids: torch.Tensor,
++    total_len: torch.Tensor,
++    cached_last_start: torch.Tensor,
++    cached_last_end: torch.Tensor,
++    cached_scan_pos: torch.Tensor,
++    reasoning_start_token_ids: torch.Tensor,
++    natural_reasoning_end_token_ids: torch.Tensor,
++) -> None:
++    """Torch reference of ``_update_committed_marker_cache_kernel``.
++
++    Refreshes the cached last start / natural-end marker positions of each
++    budgeted request from its committed tokens, scanning only what the
++    previous scan could not have covered.
++    """
++    max_len = max(
++        reasoning_start_token_ids.numel(), natural_reasoning_end_token_ids.numel()
++    )
++    for req_idx in req_ids.tolist():
++        if int(thinking_token_budget[req_idx]) < 0:
++            continue
++        seq_len = int(total_len[req_idx])
++        scan_pos = int(cached_scan_pos[req_idx])
++        last_start = int(cached_last_start[req_idx])
++        last_end = int(cached_last_end[req_idx])
++        if scan_pos > seq_len:
++            scan_pos, last_start, last_end = 0, -1, -1
++        lo = 0 if (scan_pos == 0 and last_start < 0 and last_end < 0) else scan_pos
++        tokens = all_token_ids[req_idx, :seq_len]
++        last_start = max(
++            last_start, find_last_marker(tokens, reasoning_start_token_ids, lo)
++        )
++        last_end = max(
++            last_end, find_last_marker(tokens, natural_reasoning_end_token_ids, lo)
++        )
++        cached_last_start[req_idx] = last_start
++        cached_last_end[req_idx] = last_end
++        cached_scan_pos[req_idx] = max(0, seq_len - (max_len - 1))
++
++
++def _over_budget_rows(
++    expanded_idx_mapping: torch.Tensor,
++    thinking_token_budget: torch.Tensor,
++    all_token_ids: torch.Tensor,
++    total_len: torch.Tensor,
++    input_ids: torch.Tensor,
++    expanded_local_pos: torch.Tensor,
++    cached_last_start: torch.Tensor,
++    cached_last_end: torch.Tensor,
++    reasoning_start_token_ids: torch.Tensor,
++    natural_reasoning_end_token_ids: torch.Tensor,
++    reasoning_end_token_ids: torch.Tensor,
++):
++    """Yield ``(row, tokens_over_budget, end_prefix_len)`` per in-think row.
++
++    Row ``t`` of request ``r`` at local position ``p`` sees the effective
++    prefix = committed tokens plus ``input_ids[t-p+1 : t+1]`` (the drafts
++    before it). A row is yielded when that prefix is inside a think block
++    holding at least ``budget`` tokens; ``tokens_over_budget`` is how far past
++    the budget it sits and ``end_prefix_len`` the longest end-sequence prefix
++    the effective prefix already ends with.
++    """
++    start_len = reasoning_start_token_ids.numel()
++    natural_end_len = natural_reasoning_end_token_ids.numel()
++    end_len = reasoning_end_token_ids.numel()
++    for row, (req_idx, local_pos) in enumerate(
++        zip(expanded_idx_mapping.tolist(), expanded_local_pos.tolist())
++    ):
++        budget = int(thinking_token_budget[req_idx])
++        if budget < 0:
++            continue
++        seq_len = int(total_len[req_idx])
++        first_row = row - local_pos
++        effective = torch.cat(
++            [
++                all_token_ids[req_idx, :seq_len].to(torch.int64),
++                input_ids[first_row + 1 : first_row + local_pos + 1].to(torch.int64),
++            ]
++        )
++        effective_len = seq_len + local_pos
++        last_start = max(
++            int(cached_last_start[req_idx]),
++            find_last_marker(
++                effective, reasoning_start_token_ids, max(0, seq_len - start_len + 1)
++            ),
++        )
++        last_end = max(
++            int(cached_last_end[req_idx]),
++            find_last_marker(
++                effective,
++                natural_reasoning_end_token_ids,
++                max(0, seq_len - natural_end_len + 1),
++            ),
++        )
++        if last_start < 0 or last_start <= last_end:
++            continue
++        num_reasoning_tokens = effective_len - (last_start + start_len)
++        if num_reasoning_tokens < budget:
++            continue
++        end_prefix_len = 0
++        for prefix_len in range(1, min(end_len - 1, effective_len) + 1):
++            if torch.equal(
++                effective[effective_len - prefix_len :],
++                reasoning_end_token_ids[:prefix_len].to(torch.int64),
++            ):
++                end_prefix_len = prefix_len
++        yield row, num_reasoning_tokens - budget, end_prefix_len
++
++
++def forced_end_tokens_torch(
++    expanded_idx_mapping: torch.Tensor,
++    thinking_token_budget: torch.Tensor,
++    all_token_ids: torch.Tensor,
++    total_len: torch.Tensor,
++    input_ids: torch.Tensor,
++    expanded_local_pos: torch.Tensor,
++    cached_last_start: torch.Tensor,
++    cached_last_end: torch.Tensor,
++    reasoning_start_token_ids: torch.Tensor,
++    natural_reasoning_end_token_ids: torch.Tensor,
++    reasoning_end_token_ids: torch.Tensor,
++) -> tuple[list[int], list[int]]:
++    """Torch reference of ``_thinking_budget_kernel``'s force decision.
++
++    Returns the ``(row, token_id)`` pairs to force: the end-sequence token
++    following the longest end-sequence prefix the row's effective prefix
++    already ends with.
++    """
++    rows: list[int] = []
++    force_tokens: list[int] = []
++    for row, _, end_prefix_len in _over_budget_rows(
++        expanded_idx_mapping,
++        thinking_token_budget,
++        all_token_ids,
++        total_len,
++        input_ids,
++        expanded_local_pos,
++        cached_last_start,
++        cached_last_end,
++        reasoning_start_token_ids,
++        natural_reasoning_end_token_ids,
++        reasoning_end_token_ids,
++    ):
++        rows.append(row)
++        force_tokens.append(int(reasoning_end_token_ids[end_prefix_len]))
++    return rows, force_tokens
++
++
++def apply_thinking_budget_torch(
++    logits: torch.Tensor,
++    req_ids: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    thinking_token_budget: torch.Tensor,
++    all_token_ids: torch.Tensor,
++    total_len: torch.Tensor,
++    input_ids: torch.Tensor,
++    expanded_local_pos: torch.Tensor,
++    cached_last_start: torch.Tensor,
++    cached_last_end: torch.Tensor,
++    cached_scan_pos: torch.Tensor,
++    reasoning_start_token_ids: torch.Tensor,
++    natural_reasoning_end_token_ids: torch.Tensor,
++    reasoning_end_token_ids: torch.Tensor,
++) -> None:
++    """Torch reference of ``apply_thinking_budget`` (runs on CPU tensors)."""
++    update_marker_cache_torch(
++        req_ids,
++        thinking_token_budget,
++        all_token_ids,
++        total_len,
++        cached_last_start,
++        cached_last_end,
++        cached_scan_pos,
++        reasoning_start_token_ids,
++        natural_reasoning_end_token_ids,
++    )
++    walk = (
++        expanded_idx_mapping,
++        thinking_token_budget,
++        all_token_ids,
++        total_len,
++        input_ids,
++        expanded_local_pos,
++        cached_last_start,
++        cached_last_end,
++        reasoning_start_token_ids,
++        natural_reasoning_end_token_ids,
++        reasoning_end_token_ids,
++    )
++    rows, force_tokens = forced_end_tokens_torch(*walk)
++    if rows:
++        logits[
++            torch.tensor(rows, dtype=torch.int64, device=logits.device),
++            torch.tensor(force_tokens, dtype=torch.int64, device=logits.device),
++        ] = 1.0e9
++
++
+ def apply_thinking_budget(
+     logits: torch.Tensor,
+     req_ids: torch.Tensor,
+@@ -385,6 +615,25 @@ def apply_thinking_budget(
+     natural_reasoning_end_token_ids: torch.Tensor,
+     reasoning_end_token_ids: torch.Tensor,
+ ) -> None:
++    if logits.device.type != "cuda":
++        apply_thinking_budget_torch(
++            logits,
++            req_ids,
++            expanded_idx_mapping,
++            thinking_token_budget,
++            all_token_ids,
++            total_len,
++            input_ids,
++            expanded_local_pos,
++            cached_last_start,
++            cached_last_end,
++            cached_scan_pos,
++            reasoning_start_token_ids,
++            natural_reasoning_end_token_ids,
++            reasoning_end_token_ids,
++        )
++        return
++
+     num_tokens = logits.shape[0]
+     start_len = reasoning_start_token_ids.shape[0]
+     natural_end_len = natural_reasoning_end_token_ids.shape[0]
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 8410b6ce87..9e0e837479 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -263,6 +263,8 @@ class RejectionSampler:
+             input_batch.idx_mapping_np
+         )
+         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
++        effort_state = self.sampler.effort_state
++        effort_state.begin(input_batch.idx_mapping_np)
+         sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+             logits,
+             input_batch,
+@@ -281,10 +283,18 @@ class RejectionSampler:
+             self.sampler.req_states.prefill_len.gpu,
+         )
+ 
++        effort_signals = effort_state.finish(input_batch.cu_num_logits, num_sampled)
++        effort_flags = (
++            effort_state.batch_flags(input_batch.idx_mapping_np)
++            if effort_signals is not None
++            else None
++        )
+         return SamplerOutput(
+             sampled_token_ids=sampled,
+             logprobs_tensors=logprobs_tensors,
+             num_nans=num_nans,
+             num_sampled=num_sampled,
+             num_rejected=num_rejected,
++            effort_signals=effort_signals,
++            effort_flags=effort_flags,
+         )
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index 0b805fca76..73c8b5ade5 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -18,6 +18,7 @@ from vllm.utils.collection_utils import swap_dict_values
+ from vllm.utils.torch_utils import PIN_MEMORY
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
++from vllm.v1.sample.effort_signals import wants_effort_signals
+ from vllm.v1.sample.logits_processor import (
+     BatchUpdateBuilder,
+     LogitsProcessors,
+@@ -117,6 +118,14 @@ class InputBatch:
+             PIN_MEMORY,
+         )
+         self.thinking_token_budget_reqs: set[str] = set()
++        # Requests that opted into effort telemetry (entropy / margin).
++        self.effort_telemetry_reqs: set[str] = set()
++        natural_end = (
++            None
++            if reasoning_config is None
++            else reasoning_config.natural_reasoning_end_token_ids
++        )
++        self.effort_end_token_id: int | None = natural_end[0] if natural_end else None
+         self.is_pooling_model = is_pooling_model
+         self.max_num_reqs = max_num_reqs
+         self.max_model_len = max_model_len
+@@ -470,6 +479,9 @@ class InputBatch:
+                 self.bad_words_token_ids[req_index] = (
+                     sampling_params.bad_words_token_ids
+                 )
++
++            if wants_effort_signals(sampling_params):
++                self.effort_telemetry_reqs.add(req_id)
+         elif pooling_params := request.pooling_params:
+             pooling_states = request.pooling_states
+             assert pooling_states is not None
+@@ -581,6 +593,7 @@ class InputBatch:
+             self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
+         self.bad_words_token_ids.pop(req_index, None)
+         self.thinking_token_budget_reqs.discard(req_id)
++        self.effort_telemetry_reqs.discard(req_id)
+         return req_index
+ 
+     def swap_states(self, i1: int, i2: int) -> None:
+@@ -940,6 +953,17 @@ class InputBatch:
+                     req_index = self.req_id_to_index[req_id]
+                     logprob_token_ids_by_index[req_index] = token_ids
+ 
++        effort_mask: np.ndarray | None = None
++        if self.effort_telemetry_reqs:
++            effort_mask = np.fromiter(
++                (
++                    req_id in self.effort_telemetry_reqs
++                    for req_id in self.req_ids[:num_reqs]
++                ),
++                dtype=bool,
++                count=num_reqs,
++            )
++
+         return SamplingMetadata(
+             temperature=temperature,
+             all_greedy=self.all_greedy,
+@@ -960,6 +984,8 @@ class InputBatch:
+             bad_words_token_ids=self.bad_words_token_ids,
+             logitsprocs=self.logitsprocs,
+             thinking_budget_state_holder=self.thinking_budget_state_holder,
++            effort_mask=effort_mask,
++            effort_end_token_id=self.effort_end_token_id,
+         )
+ 
+     def get_pooling_params(self) -> list[PoolingParams]:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index f42310f27a..afd715d14e 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -187,6 +187,7 @@ from vllm.v1.outputs import (
+ )
+ from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
+ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
++from vllm.v1.sample.effort_signals import NUM_ROW_SIGNALS, signals_to_dict
+ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
+ from vllm.v1.sample.metadata import SamplingMetadata
+@@ -301,6 +302,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+         routed_experts: RoutedExpertsTensors | None = None,
+         check_ep_fault: bool = False,
+         num_nans: torch.Tensor | None = None,
++        effort_signals: torch.Tensor | None = None,
++        effort_flags: np.ndarray | None = None,
+     ):
+         self._model_runner_output = model_runner_output
+         self._invalid_req_indices = invalid_req_indices
+@@ -316,6 +319,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+         self._logprobs_tensors = logprobs_tensors
+         self._routed_experts = routed_experts
+         self._num_nans = num_nans
++        self._effort_signals = effort_signals
++        self._effort_flags = effort_flags
+         self._has_fault: torch.Tensor | None = None
+ 
+         # Initiate the copy on a separate stream, but do not synchronize it.
+@@ -340,6 +345,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+                 if self._num_nans is not None
+                 else None
+             )
++            self._effort_signals_cpu = (
++                self._effort_signals.to("cpu", non_blocking=True)
++                if self._effort_signals is not None
++                else None
++            )
+             if check_ep_fault:
+                 has_fault = get_ep_all2all_manager().query_fault()
+                 self._has_fault = has_fault.to("cpu", non_blocking=True)
+@@ -387,6 +397,12 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+                 raise_if_nan_logits(output.num_nans_in_logits)
+         del self._num_nans
+ 
++        if self._effort_signals_cpu is not None:
++            output.effort_signals = signals_to_dict(
++                output.req_ids, self._effort_signals_cpu.numpy(), self._effort_flags
++            )
++        del self._effort_signals
++
+         if self._has_fault is not None and self._has_fault.item():
+             mask = get_ep_all2all_manager().query_active_mask()
+             raise RuntimeError(
+@@ -952,6 +968,13 @@ class GPUModelRunner(
+             device="cpu",
+             pin_memory=PIN_MEMORY,
+         )
++        # Sync-scheduling D2H target for per-request effort signals.
++        self.effort_signals_pinned_cpu = torch.empty(
++            (self.max_num_reqs, NUM_ROW_SIGNALS + 1),
++            dtype=torch.float32,
++            device="cpu",
++            pin_memory=PIN_MEMORY,
++        )
+ 
+         # Pre-allocated tensor for copying valid sampled token counts to CPU,
+         # with dedicated stream for overlapping and event for coordination.
+@@ -3805,6 +3828,7 @@ class GPUModelRunner(
+         list[str],
+         dict[str, int],
+         list[int],
++        dict[str, tuple[float, float, int]] | None,
+     ]:
+         num_nans: torch.Tensor | None = None
+         num_nans_in_logits: dict[str, int] = {}
+@@ -3833,6 +3857,8 @@ class GPUModelRunner(
+         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
+         sampled_token_ids = sampler_output.sampled_token_ids
+         logprobs_tensors = sampler_output.logprobs_tensors
++        effort_signals_gpu = sampler_output.effort_signals
++        effort_signals: dict[str, tuple[float, float, float, int]] | None = None
+         invalid_req_indices = []
+         logprobs_lists = None
+         if not self.use_async_scheduling:
+@@ -3850,6 +3876,12 @@ class GPUModelRunner(
+                     self.routed_experts_slot_mapping_device[:total],
+                     non_blocking=True,
+                 )
++            if effort_signals_gpu is not None:
++                # Same coverage as the routed-experts D2H above: ``_to_list``
++                # synchronizes the transfer event after this enqueue.
++                self.effort_signals_pinned_cpu[:num_reqs].copy_(
++                    effort_signals_gpu, non_blocking=True
++                )
+             with gpu_sync_allowed():
+                 # Get the valid generated tokens.
+                 max_gen_len = sampled_token_ids.shape[-1]
+@@ -3872,6 +3904,12 @@ class GPUModelRunner(
+                             logprobs_tensors=logprobs_tensors,
+                         )
+                     )
++                if effort_signals_gpu is not None:
++                    effort_signals = signals_to_dict(
++                        req_ids_output_copy,
++                        self.effort_signals_pinned_cpu[:num_reqs].numpy(),
++                        sampler_output.effort_flags,
++                    )
+         else:
+             valid_sampled_token_ids = []
+             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+@@ -3938,6 +3976,7 @@ class GPUModelRunner(
+             req_ids_output_copy,
+             req_id_to_index_output_copy,
+             invalid_req_indices,
++            effort_signals,
+         )
+ 
+     @contextmanager
+@@ -4850,6 +4889,7 @@ class GPUModelRunner(
+                 req_ids_output_copy,
+                 req_id_to_index_output_copy,
+                 invalid_req_indices,
++                effort_signals,
+             ) = self._bookkeeping_sync(
+                 scheduler_output,
+                 sampler_output,
+@@ -4905,6 +4945,7 @@ class GPUModelRunner(
+                 num_nans_in_logits=num_nans_in_logits,
+                 cudagraph_stats=cudagraph_stats,
+                 routed_experts=None,
++                effort_signals=effort_signals,
+             )
+ 
+         if not self.use_async_scheduling:
+@@ -4947,6 +4988,8 @@ class GPUModelRunner(
+                 routed_experts=routed_experts_snapshot,
+                 check_ep_fault=self.check_ep_fault,
+                 num_nans=num_nans_device,
++                effort_signals=sampler_output.effort_signals,
++                effort_flags=sampler_output.effort_flags,
+             )
+         with record_function_or_nullcontext(
+             "gpu_model_runner: set_async_sampled_token_ids"

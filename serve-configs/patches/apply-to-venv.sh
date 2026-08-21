@@ -7,7 +7,8 @@ set -e
 VENV="${1:-/shared/vllm/.venv-qwen38}"
 SP=$(ls -d "$VENV"/lib/python3.*/site-packages)
 cd "$SP"
-# 0*.patch, not 000*: the glob has to keep matching past 0009.
+# 0001-0008 are incremental; 0009 (dynamic effort v3 + telemetry) is one
+# consolidated diff against a tree that already has 0001-0008.
 for p in "$(dirname "$0")"/0*.patch; do
   echo "== $(basename "$p")"
   patch -p1 -N -r - < "$p" || true

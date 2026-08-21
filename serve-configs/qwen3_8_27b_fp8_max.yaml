@@ -64,11 +64,15 @@ attention-backend: TRITON_ATTN
 enable-dbo: true
 dbo-decode-token-threshold: 1000000
 reasoning-parser: qwen3
-# Dynamic reasoning effort (venv patches 0009-0012 + 0014; full description in
+# Dynamic reasoning effort v3 (venv patch 0009; full description in
 # qwen3_8_27b_fp8_mtp_latency.yaml): hidden-state level routing with an online
 # memory, no thinking cap, omitted reasoning_effort -> dynamic. Same design as
 # the latency profile; separate memory file because the pooled states differ by
-# runner. Takes effect on the next restart of vllm-qwen38-throughput.
+# runner. NOTE: the body-row capture needs the V2 model runner; on this V1
+# profile the scheduler logs "hidden_effort needs the V2 model runner" and
+# every dynamic request renders default_level (low) with no cap - the memory
+# does not fill here. Takes effect on the next restart of
+# vllm-qwen38-throughput.
 reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-throughput.npz"}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder

@@ -793,8 +793,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         #
-        # Dynamic reasoning effort (labels are fixed enums; rung indices are
-        # bounded by the configured ladder length).
+        # Dynamic reasoning effort (labels are fixed enums).
         #
         histogram_effort_level = self._histogram_cls(
             name="vllm:effort_level",

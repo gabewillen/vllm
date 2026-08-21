@@ -17,7 +17,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejec
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.effort import EffortState
-from vllm.v1.worker.gpu.sample.effort_escalation import EffortEscalationState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logprob import (
@@ -56,7 +55,6 @@ class Sampler:
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
         self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
         self.effort_state = EffortState(max_num_reqs, device, reasoning_config)
-        self.effort_escalation = EffortEscalationState(max_num_reqs, device)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -73,7 +71,6 @@ class Sampler:
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         self.thinking_budget_state.add_request(req_idx, sampling_params)
         self.effort_state.add_request(req_idx, sampling_params)
-        self.effort_escalation.add_request(req_idx, sampling_params)
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -83,7 +80,6 @@ class Sampler:
         self.logprob_token_ids_state.apply_staged_writes()
         self.thinking_budget_state.apply_staged_writes()
         self.effort_state.apply_staged_writes()
-        self.effort_escalation.apply_staged_writes()
 
     def __call__(
         self,
@@ -109,7 +105,6 @@ class Sampler:
         return_logprobs = max_num_logprobs != NO_LOGPROBS or max_per_req_token_ids > 0
 
         self.effort_state.begin(idx_mapping_np)
-        self.effort_escalation.begin()
         sampled, processed_logits = self.sample(
             logits,
             expanded_idx_mapping,
@@ -165,14 +160,6 @@ class Sampler:
             if effort_signals is not None
             else None
         )
-        self.effort_escalation.record_signals(
-            effort_signals, idx_mapping, num_sampled, num_rejected
-        )
-        effort_reports = (
-            self.effort_escalation.reports(idx_mapping)
-            if self.effort_escalation.any_enabled
-            else None
-        )
 
         # These are GPU tensors.
         sampler_output = SamplerOutput(
@@ -187,7 +174,6 @@ class Sampler:
             sampling_mask_tensors=sampling_mask_tensors,
             effort_signals=effort_signals,
             effort_flags=effort_flags,
-            effort_reports=effort_reports,
         )
         return sampler_output
 
@@ -239,9 +225,6 @@ class Sampler:
 
         # Force the reasoning end marker once a request's thinking budget is
         # reached; applied before temperature so the forced token is always kept.
-        # The escalation rule is evaluated here, immediately before the force,
-        # so a raised cap can never arrive late.
-        budget_override = self._evaluate_effort_escalation(idx_mapping, idx_mapping_np)
         self.thinking_budget_state.apply(
             logits,
             expanded_idx_mapping,
@@ -249,7 +232,6 @@ class Sampler:
             idx_mapping_np,
             input_ids,
             expanded_local_pos,
-            budget_override=budget_override,
         )
 
         # Apply temperature in place.
@@ -267,25 +249,6 @@ class Sampler:
         return self.sampling_states.apply_top_k_top_p(
             logits, expanded_idx_mapping, idx_mapping_np
         )
-
-    def _evaluate_effort_escalation(
-        self, idx_mapping: torch.Tensor, idx_mapping_np: np.ndarray
-    ) -> torch.Tensor | None:
-        """Run the worker-side escalation rule and return the cap to enforce."""
-        escalation = self.effort_escalation
-        budget_state = self.thinking_budget_state
-        if not budget_state.enabled or not escalation.any_enabled:
-            return None
-        budget_state.refresh_marker_cache(idx_mapping)
-        escalation.evaluate(
-            idx_mapping,
-            idx_mapping_np,
-            self.req_states.total_len.gpu,
-            budget_state.cached_last_start,
-            budget_state.cached_last_end,
-            budget_state.reasoning_start_token_ids.numel(),
-        )
-        return escalation.effective_budget(budget_state.thinking_token_budget.gpu)
 
     def _requires_logits_processing(self, idx_mapping_np: np.ndarray) -> bool:
         if np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np]):

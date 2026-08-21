@@ -4,7 +4,7 @@
 These run a real `Scheduler` on the served model's own config (no GPU, no
 weights): the prompt is split at the effort-sentence seam, the body prefills
 alone, the last body row comes back as a pooled hidden state, and the chosen
-rung's tail replaces the rung-0 one before generation starts.
+level's tail replaces the default-level one before generation starts.
 
 Every failure mode has to land on today's behaviour with a byte-identical
 prompt, because that is what makes the split safe to ship.
@@ -62,7 +62,7 @@ def _fill_memory(scheduler, n=8, tokens=100):
     """Fill the memory and warm its digests, as a cold-phase server would.
 
     The digests only see the decisions the server actually faced, so the very
-    first query of a fresh memory has no rank and falls back to the safe rung.
+    first query of a fresh memory has no rank and falls back to the safe level.
     """
     memory = scheduler._effort_memory
     rng = np.random.default_rng(0)
@@ -143,13 +143,13 @@ def test_split_body_and_tails_keeps_the_lookahead_token_shared():
     variants = [shared + [90, 91], shared + [80], shared + [70, 71, 72]]
     body_len, tails = split_body_and_tails(variants)
     # One token back from the divergence, so the token an eagle drafter reads
-    # ahead at the body boundary is the same whichever rung is chosen.
+    # ahead at the body boundary is the same whichever level is chosen.
     assert body_len == len(shared) - 1
     assert {t[0] for t in tails} == {shared[-1]}
     for variant, tail in zip(variants, tails):
         assert variant[:body_len] + tail == variant
-    # Identical variants still split: the tails match, but the *cap* the rung
-    # picks is an actuator of its own.
+    # Identical variants still split: the tails match, but the level's sentence
+    # is an actuator of its own.
     assert split_body_and_tails([shared, shared]) == (4, [[5], [5]])
     # A body of fewer than two tokens has no usable seam.
     assert split_body_and_tails([[1, 2], [1, 3]]) is None
@@ -182,7 +182,7 @@ def test_a_held_request_is_not_scheduled_before_its_level_is_chosen():
     _add(scheduler, "a")
     scheduler.schedule()  # body
     # No output processed yet: the tail must not prefill, or it would commit
-    # rung 0 before the decision.
+    # the default level before the decision.
     held = scheduler.schedule()
     assert "a" not in held.num_scheduled_tokens
     assert scheduler.requests["a"].effort_decision_skips == 1
@@ -212,7 +212,7 @@ def test_held_request_falls_back_rather_than_stalling():
 
 
 def test_tail_appended_and_no_budget_shipped():
-    scheduler = _scheduler(q_mid=0.0, q_high=0.0)  # everything routes to rung 2
+    scheduler = _scheduler(q_mid=0.0, q_high=0.0)  # everything routes to level 2
     _fill_memory(scheduler)
     request = _add(scheduler, "a")
     body = list(request.prompt_token_ids[:BODY])
@@ -226,13 +226,13 @@ def test_tail_appended_and_no_budget_shipped():
     assert list(request._all_token_ids) == body + TAILS[2]
     assert request.num_prompt_tokens == BODY + len(TAILS[2])
     assert scheduler._effort["a"].level == 2
-    # The cap the worker is told to use is the chosen rung's, at revision 1.
 
     # The tail prefills next, and only the tail: the body is already computed.
-    # No thinking budget is shipped - the level is the whole actuator.
+    # No thinking budget exists on this path - the level is the whole actuator.
     tail_step = scheduler.schedule()
     assert tail_step.num_scheduled_tokens["a"] == len(TAILS[2])
-    assert "a" not in tail_step.thinking_budget_updates
+    assert not hasattr(tail_step, "thinking_budget_updates")
+    assert request.sampling_params.thinking_token_budget is None
 
 
 def test_decision_unavailable_falls_back_to_the_default_level():
@@ -268,7 +268,7 @@ def test_fully_cached_body_still_yields_a_vector():
     scheduler.update_from_output(tail, _runner_output(tail, sampled={"a": [END]}))
     scheduler.finish_requests("a", RequestStatus.FINISHED_STOPPED)
 
-    # The same prompt again: the body (and the rung-0 tail) are in the prefix
+    # The same prompt again: the body (and the default-level tail) are in the prefix
     # cache, but the decision has not been made, so the last body row must
     # still be computed and captured.
     second = _add(scheduler, "b", seed=7)
@@ -293,7 +293,7 @@ def test_prefix_cache_body_shared_across_levels():
     scheduler.finish_requests("a", RequestStatus.FINISHED_STOPPED)
 
     # A second request with the same body: the body blocks are shared, whatever
-    # rung the first one ended up on.
+    # level the first one ended up on.
     second = _add(scheduler, "b", seed=7)
     out = scheduler.schedule()
     cached = second.num_computed_tokens - out.num_scheduled_tokens["b"]

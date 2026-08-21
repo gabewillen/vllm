@@ -233,13 +233,13 @@ class OpenAIServingChat(GenerateBaseServing):
         request: ChatCompletionRequest,
         engine_inputs: list[EngineInput],
     ) -> ErrorResponse | None:
-        """Render the other rungs and record the §13.3 body/tail seam.
+        """Render the other levels and record the §13.3 body/tail seam.
 
-        The prompt already submitted is the rung-0 variant. Rendering the rest
+        The prompt already submitted is the default-level variant. Rendering the rest
         costs one chat-template pass and one tokenization each; the engine only
-        ever prefills the body once, because the body is identical across rungs.
+        ever prefills the body once, because the body is identical across levels.
         Anything unexpected (multiple prompts, an empty seam) silently leaves
-        the request on today's single-rung path.
+        the request on today's single-level path.
         """
         variants = request._dynamic_effort_variant_messages
         request._dynamic_effort_variant_messages = None

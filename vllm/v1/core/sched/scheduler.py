@@ -636,8 +636,8 @@ class Scheduler(SchedulerInterface):
                 request.effort_hold_prefill
                 and request.num_computed_tokens >= request.effort_body_len
             ):
-                # v3: the body is prefilled and the starting rung is not chosen
-                # yet, so the tail must not prefill (it would commit rung 0).
+                # v3: the body is prefilled and the level is not chosen
+                # yet, so the tail must not prefill (it would commit the default level).
                 # The vector arrives with this step's output; the counter is the
                 # liveness guarantee if it never does.
                 request.effort_decision_skips += 1
@@ -989,7 +989,7 @@ class Scheduler(SchedulerInterface):
                         and num_new_local_computed_tokens + num_external_computed_tokens
                         >= request.effort_body_len
                     ):
-                        # v3: the blocks past the body hold the *rung-0* tail,
+                        # v3: the blocks past the body hold the *default-level* tail,
                         # which the decision has not chosen yet. Keep the body's
                         # full blocks and recompute the rest, so the last body
                         # row is produced even for a 100%-cached prompt (§13.3).
@@ -1429,7 +1429,6 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
-            thinking_budget_updates={},
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1983,8 +1982,8 @@ class Scheduler(SchedulerInterface):
 
             if request.effort_decision_pending and req_id in effort_capture:
                 # v3: the body's last prefill row came back with this step, so
-                # the starting rung is decided here and the chosen tail replaces
-                # the rung-0 one (§13.3 step 4).
+                # the level is decided here and the chosen tail replaces
+                # the default-level one (§13.3 step 4).
                 vector = (
                     effort_prefill_states.get(req_id) if effort_prefill_states else None
                 )
@@ -2648,7 +2647,7 @@ class Scheduler(SchedulerInterface):
         if not envs.VLLM_USE_V2_MODEL_RUNNER:
             logger.warning(
                 "dynamic_effort: hidden_effort needs the V2 model runner; "
-                "the starting-rung decision is disabled."
+                "the level decision is disabled."
             )
             return
         hidden_size = self.vllm_config.model_config.get_hidden_size()
@@ -2667,7 +2666,7 @@ class Scheduler(SchedulerInterface):
             warmed = False
         self._effort_memory = memory
         logger.info(
-            "dynamic_effort: hidden-state start rung ON%s - memory %s (%d/%d "
+            "dynamic_effort: hidden-state level routing ON%s - memory %s (%d/%d "
             "entries, min %d), k=%d, cuts q_mid=%.2f q_high=%.2f, downward "
             "gates novelty<=%.2f spread<=%.2f",
             " (shadow)" if hidden.shadow else "",
@@ -2847,7 +2846,7 @@ class Scheduler(SchedulerInterface):
         return True
 
     def _apply_effort_tail(self, request: Request, tail: list[int]) -> None:
-        """Replace the rung-0 tail with the chosen one, in place.
+        """Replace the default-level tail with the chosen one, in place.
 
         Only positions at or after `effort_body_len` change, and nothing at or
         before that boundary has been cached yet, so the body's blocks and their
@@ -2906,7 +2905,7 @@ class Scheduler(SchedulerInterface):
     def _effort_split_worth_it(self, request: Request, boundary: int) -> int:
         """Whether choosing the prompt tail beats reading the whole prompt.
 
-        The two-phase form buys the rung's *sentence*, but only if the vector it
+        The two-phase form buys the level's *sentence*, but only if the vector it
         decides from is nearly the whole prompt. An agent turn that ends in a
         tool result puts the last user message - where the effort sentence goes
         - thousands of tokens from the end, and the body would then be a small

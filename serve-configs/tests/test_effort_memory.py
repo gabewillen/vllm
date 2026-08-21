@@ -5,7 +5,7 @@ The memory is the whole v3 signal: a ring of pooled prefill states the server
 filled itself, queried by cosine and valued by the reasoning tokens each entry
 actually spent. Nothing here is trained, so what has to be pinned is the
 bookkeeping - who evicts whom, which entries may contribute a value, and that
-the asymmetric map can only lower a request's rung when both confidence gates
+the asymmetric map can only lower a request's level when both confidence gates
 agree.
 """
 
@@ -123,7 +123,7 @@ def test_cold_memory_returns_none():
     for i in range(4):
         memory.insert(_vec(i), 100, "natural", session_id=f"s{i}")
     # k entries answer the query - the digests warm during the cold phase - but
-    # the memory is not `ready`, so the caller keeps today's rung-0 path.
+    # the memory is not `ready`, so the caller keeps the default-level path.
     assert memory.query(_vec(0)) is not None
     assert not memory.ready
     for i in range(4, 8):
@@ -200,7 +200,7 @@ def test_asymmetric_map_never_lowers_without_both_gates():
     assert decide_effort_level(q, (0.35, 0.99, 0.99), cfg, top).level == 1
 
     # Downward band needs BOTH gates. Either one above its rank keeps the
-    # request at the safe rung.
+    # request at the safe level.
     assert decide_effort_level(q, (0.10, 0.10, 0.10), cfg, top).level == 0
     assert decide_effort_level(q, (0.10, 0.90, 0.10), cfg, top).level == 1
     assert decide_effort_level(q, (0.10, 0.10, 0.90), cfg, top).level == 1
@@ -215,7 +215,7 @@ def test_asymmetric_map_never_lowers_without_both_gates():
     assert decide_effort_level(q, (0.60, 0.10, 0.10), cfg, top).level == 2
 
 
-def test_map_falls_back_to_the_safe_rung_without_an_estimate():
+def test_map_falls_back_to_the_safe_level_without_an_estimate():
     cfg = _cfg()
     assert decide_effort_level(None, (None, None, None), cfg, 2).level == 1
     assert decide_effort_level(_query(), (None, 0.1, 0.1), cfg, 2).level == 1

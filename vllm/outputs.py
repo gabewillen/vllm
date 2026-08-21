@@ -122,9 +122,9 @@ class RequestOutput:
             prefix-cache writes for this request.
         kv_transfer_params: The params for remote K/V transfer.
         ec_transfer_params: The params for remote encoder-cache transfer.
-        effort: Dynamic reasoning-effort report (rung, escalations,
-            reasoning_tokens, late, stall_clamps, grace_tokens, close_kind),
-            set on the final output.
+        effort: Dynamic reasoning-effort report (level, decided,
+            reasoning_tokens, close_kind, memory_entries, neighbours), set on
+            the final output.
     """
 
     def __init__(

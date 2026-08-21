@@ -294,8 +294,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "result in faster responses and fewer tokens used on reasoning in "
             "a response. Note that 'max' is specific to the DeepSeek V4 series "
             "and is not part of the standard OpenAI API specification. "
-            "'dynamic' is vLLM-specific: the engine starts at the lowest "
-            "thinking budget and escalates from live signals (requires "
+            "'dynamic' is vLLM-specific: the engine picks an effort level per "
+            "request from the prompt's prefill hidden state (requires "
             "--reasoning-config with dynamic_effort)."
         ),
     )
@@ -613,7 +613,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     _dynamic_effort: dict[str, Any] | None = PrivateAttr(default=None)
     """Validated dynamic-effort overrides; set only by `apply_dynamic_effort`."""
     _dynamic_effort_variant_messages: list[Any] | None = PrivateAttr(default=None)
-    """One message list per rung, each carrying that rung's tail sentence; set
+    """One message list per level, each carrying that level's tail sentence; set
     by `apply_dynamic_effort` when `hidden_effort` is on. The serving layer
     renders each of them to find the shared body (§13.3)."""
     _effort_request: dict[str, Any] | None = PrivateAttr(default=None)

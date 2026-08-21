@@ -359,18 +359,10 @@ class ModelRunnerOutput:
     # telemetry this step.
     effort_signals: dict[str, tuple[float, float, float, int]] | None = None
 
-    # req_id -> revision of the thinking budget update applied this step.
-    thinking_budget_acks: dict[str, int] | None = None
-
-    # req_id -> (rung, escalations, grace tokens, late) reported by the
-    # worker-side escalation rule. ``late`` is 0 by construction: the rule is
-    # evaluated where the cap is applied.
-    effort_reports: dict[str, tuple[int, int, int, int]] | None = None
-
     # req_id -> the last prefill row of that request's dynamic-effort *body*
     # (fp16 ``[hidden_size]`` numpy), for the requests the scheduler asked to
     # capture this step. ``None`` unless ``hidden_effort`` is on and a request
-    # is awaiting its starting-rung decision.
+    # is awaiting its level decision.
     effort_prefill_states: dict[str, np.ndarray] | None = None
 
     @staticmethod

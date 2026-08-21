@@ -265,7 +265,6 @@ class RejectionSampler:
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
         effort_state = self.sampler.effort_state
         effort_state.begin(input_batch.idx_mapping_np)
-        self.sampler.effort_escalation.begin()
         sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
             logits,
             input_batch,
@@ -290,16 +289,6 @@ class RejectionSampler:
             if effort_signals is not None
             else None
         )
-        escalation = self.sampler.effort_escalation
-        escalation.record_signals(
-            effort_signals, input_batch.idx_mapping, num_sampled, num_rejected
-        )
-        effort_reports = (
-            escalation.reports(input_batch.idx_mapping)
-            if escalation.any_enabled
-            else None
-        )
-
         return SamplerOutput(
             sampled_token_ids=sampled,
             logprobs_tensors=logprobs_tensors,
@@ -308,5 +297,4 @@ class RejectionSampler:
             num_rejected=num_rejected,
             effort_signals=effort_signals,
             effort_flags=effort_flags,
-            effort_reports=effort_reports,
         )
