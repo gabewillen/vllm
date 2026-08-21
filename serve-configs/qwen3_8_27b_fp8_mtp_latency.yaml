@@ -109,17 +109,37 @@ compilation-config: '{"max_cudagraph_capture_size": 96}'
 speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 8, 7], [9, 32, 2], [33, 96, 0]]}'
 kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
 reasoning-parser: qwen3
-# Dynamic reasoning effort (venv patch 0009, docs/dynamic-reasoning.claude.md):
-# reasoning_effort "dynamic" starts every request at a 1k thinking cap rendered as
-# template medium + the Qwen "low" sentence on the last user turn (block 0 stays
-# effort-free), and the scheduler raises the cap 1k -> 4k -> 16k -> 64k only
-# when live entropy/margin/MTP signals say more thinking pays. Defaults from
-# DynamicEffortConfig; non-dynamic requests are untouched. Calibration =
-# per-token entropy (/log V) and top1-top2 margin measured on this model over
-# 13.6k decode steps (8 prompts x xhigh/low, 2026-08-18, VLLM_EFFORT_TELEMETRY
-# sink): entropy mean 0.043 sd 0.046, margin mean 5.9 sd 4.5. Escalation score
-# z(H) - z(margin) + trend + MTP term >= theta [0, 0.5, 1.0] per rung.
-reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "calibration": {"entropy": [0.043, 0.046], "margin": [5.9, 4.5]}}}'
+# Dynamic reasoning effort (venv patches 0009-0012,
+# docs/dynamic-reasoning.claude.md §13; results in
+# docs/dynamic-reasoning-v3-results.md).
+#
+# `reasoning_effort: "dynamic"` gives a request one effort LEVEL before it
+# thinks and renders that level's sentence at the TRUE TAIL of the prompt (a
+# trailing user message, after the last turn - measured on this box: with the
+# sentence on the last *user* message of an agent turn the xhigh wording moves
+# reasoning length 1.14x, at the tail 1.23x up and 0.78x down, because a tool
+# result otherwise sits between it and the generation point). The level comes
+# from the prompt body's own last prefill row - the vector lm_head consumes,
+# computed anyway - matched by cosine against an online memory this server
+# fills from its own finished requests: key = pooled state, value = the
+# reasoning tokens that request spent at a natural close. An asymmetric
+# quantile map over running digests picks the level: it raises freely and
+# lowers only when both confidence gates agree (novelty: nothing similar in the
+# memory; spread: the neighbours disagree), because one under-thought step can
+# kill a trajectory while over-thinking only costs tokens.
+#
+# There is NO thinking cap on this path: no rung ladder, no mid-generation
+# escalation, no soft-limit ramp. The model closes its own think block, and the
+# only thing that can cut it short is the loop-stall guard (n-gram + rolling
+# hash + the request's own repetition_detection), which reports
+# close_kind=stall. Nothing is trained and there is no offline corpus: a cold
+# memory, a missing vector or a prompt with no usable seam all render the
+# default level with a byte-identical prompt.
+# default_effort: a request that OMITS reasoning_effort is routed instead of
+# falling through to the chat template's own default, which for Qwen3.8 is
+# xhigh - the most expensive level there is. An explicit level (including
+# "none") is never overridden. The throughput profile uses the same setup with its own memory file.
+reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B

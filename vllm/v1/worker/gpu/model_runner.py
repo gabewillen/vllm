@@ -95,6 +95,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
+from vllm.v1.worker.gpu.effort_hidden import gather_prefill_states
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
@@ -1003,6 +1004,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state.apply_staged_writes()
         if self.sampler is not None:
             self.update_thinking_budgets(scheduler_output)
+            self.update_effort_policy(scheduler_output)
             self.sampler.apply_staged_writes()
 
     def update_thinking_budgets(self, scheduler_output: SchedulerOutput) -> None:
@@ -1014,6 +1016,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             updates, self.req_states.req_id_to_index
         )
         self.pending_thinking_budget_acks.update(acks)
+        self.sampler.effort_escalation.absorb_budget_updates(
+            updates, self.req_states.req_id_to_index
+        )
+
+    def update_effort_policy(self, scheduler_output: SchedulerOutput) -> None:
+        """Install this step's dynamic-effort policy and loop/churn vetoes."""
+        assert self.sampler is not None
+        escalation = self.sampler.effort_escalation
+        if not escalation.any_enabled and scheduler_output.effort_policy is None:
+            return
+        cfg = self.vllm_config.reasoning_config
+        dynamic = None if cfg is None else cfg.dynamic_effort
+        escalation.set_policy(
+            scheduler_output.effort_policy,
+            0.3 if dynamic is None else dynamic.ema_fast_alpha,
+            0.05 if dynamic is None else dynamic.ema_slow_alpha,
+        )
+        escalation.set_vetoes(
+            scheduler_output.effort_vetoes, self.req_states.req_id_to_index
+        )
 
     def take_thinking_budget_acks(self) -> dict[str, int] | None:
         if not self.pending_thinking_budget_acks:
@@ -1695,6 +1717,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
             routed_experts=routed_experts,
             num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+            effort_prefill_capture=scheduler_output.effort_prefill_capture or None,
         )
 
         if not self.is_last_pp_rank:
@@ -1721,6 +1744,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_spec_tokens_to_schedule = (
             self.execute_model_state.num_spec_tokens_to_schedule
         )
+        effort_prefill_capture = self.execute_model_state.effort_prefill_capture
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1744,6 +1768,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Last rank: sample tokens
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
             self.pcp_manager, hidden_states, input_batch
+        )
+
+        effort_prefill_states = gather_prefill_states(
+            hidden_states, input_batch, effort_prefill_capture
         )
 
         sampler_output, num_sampled, num_rejected = self.sample(
@@ -1787,6 +1815,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
+            effort_prefill_states=effort_prefill_states,
             routed_experts=routed_experts,
         )
 
@@ -1995,6 +2024,8 @@ class ExecuteModelState(NamedTuple):
     routed_experts: RoutedExpertsTensors | None
     # Draft tokens the scheduler will verify next step (dynamic/adaptive SD).
     num_spec_tokens_to_schedule: int = 0
+    # Requests whose dynamic-effort body prefill ends this step (§13.3).
+    effort_prefill_capture: list[str] | None = None
 
 
 class BatchReqState(NamedTuple):

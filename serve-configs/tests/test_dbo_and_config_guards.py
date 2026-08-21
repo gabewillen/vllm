@@ -2,6 +2,7 @@
 """Contract tests for the DP>1 adaptive guard (0005) and dense-DBO gate (0006)."""
 
 import torch
+
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import (

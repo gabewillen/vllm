@@ -120,6 +120,12 @@ class InputBatch:
         self.thinking_token_budget_reqs: set[str] = set()
         # Requests that opted into effort telemetry (entropy / margin).
         self.effort_telemetry_reqs: set[str] = set()
+        natural_end = (
+            None
+            if reasoning_config is None
+            else reasoning_config.natural_reasoning_end_token_ids
+        )
+        self.effort_end_token_id: int | None = natural_end[0] if natural_end else None
         self.is_pooling_model = is_pooling_model
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
@@ -979,6 +985,7 @@ class InputBatch:
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
             effort_mask=effort_mask,
+            effort_end_token_id=self.effort_end_token_id,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

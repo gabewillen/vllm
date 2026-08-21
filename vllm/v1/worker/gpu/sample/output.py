@@ -20,11 +20,14 @@ class SamplerOutput:
     num_sampled: torch.Tensor | None
     num_rejected: torch.Tensor | None = None
     sampling_mask_tensors: SamplingMaskTensors | None = None
-    # [num_reqs, 3] fp32 (mean entropy, mean margin, n committed rows), only
-    # when a request in the batch opted into effort telemetry.
+    # [num_reqs, 4] fp32 (mean entropy, mean margin, mean p(end), n committed
+    # rows), only when a request in the batch opted into effort telemetry.
     effort_signals: torch.Tensor | None = None
     # [num_reqs] bool host mask of the opted-in requests.
     effort_flags: np.ndarray | None = None
+    # [num_reqs, 4] int32 (rung, escalations, grace tokens, late) from the
+    # worker-side escalation rule; None when no request is worker-evaluated.
+    effort_reports: torch.Tensor | None = None
 
 
 @triton.jit

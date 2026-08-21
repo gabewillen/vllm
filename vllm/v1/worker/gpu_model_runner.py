@@ -187,7 +187,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
-from vllm.v1.sample.effort_signals import signals_to_dict
+from vllm.v1.sample.effort_signals import NUM_ROW_SIGNALS, signals_to_dict
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -972,7 +972,7 @@ class GPUModelRunner(
         )
         # Sync-scheduling D2H target for per-request effort signals.
         self.effort_signals_pinned_cpu = torch.empty(
-            (self.max_num_reqs, 3),
+            (self.max_num_reqs, NUM_ROW_SIGNALS + 1),
             dtype=torch.float32,
             device="cpu",
             pin_memory=PIN_MEMORY,
@@ -3873,7 +3873,7 @@ class GPUModelRunner(
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
         effort_signals_gpu = sampler_output.effort_signals
-        effort_signals: dict[str, tuple[float, float, int]] | None = None
+        effort_signals: dict[str, tuple[float, float, float, int]] | None = None
         invalid_req_indices = []
         logprobs_lists = None
         if not self.use_async_scheduling:

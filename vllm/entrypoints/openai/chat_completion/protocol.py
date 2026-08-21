@@ -51,6 +51,7 @@ from vllm.sampling_params import (
     ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
+from vllm.v1.core.sched.effort_controller import CLOSE_CLIENT_LIMIT, CLOSE_NATURAL
 
 logger = init_logger(__name__)
 
@@ -127,20 +128,36 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
 class EffortInfo(OpenAIBaseModel):
     """Dynamic reasoning-effort outcome (`reasoning_effort: "dynamic"` only)."""
 
-    rung: int
-    escalations: int
+    level: int
+    """Effort level the request ran at: an index into the server's level
+    sentences, lowest first."""
+    decided: bool = False
+    """The level came from the prompt's pooled prefill hidden state rather than
+    the server default (a cold memory or a prompt with no usable seam)."""
     reasoning_tokens: int
-    late: bool = False
+    close_kind: Literal["natural", "client-limit"] = "natural"
+    """How the think block ended: `natural` (the model closed it - nothing on
+    this path caps or forces the close) or `client-limit` (the request ran out
+    of `max_tokens` or was aborted while still thinking)."""
+    memory_entries: int = 0
+    """Entries the decision memory held when this request was decided."""
+    neighbours: int = 0
+    """Valued neighbours the kNN estimate averaged over."""
 
     @classmethod
-    def from_report(cls, report: dict[str, int] | None) -> "EffortInfo | None":
+    def from_report(cls, report: dict[str, Any] | None) -> "EffortInfo | None":
         if report is None:
             return None
+        close_kind = report.get("close_kind", CLOSE_NATURAL)
+        if close_kind not in (CLOSE_NATURAL, CLOSE_CLIENT_LIMIT):
+            close_kind = CLOSE_NATURAL
         return cls(
-            rung=report.get("rung", 0),
-            escalations=report.get("escalations", 0),
+            level=report.get("level", 0),
+            decided=bool(report.get("decided", 0)),
             reasoning_tokens=report.get("reasoning_tokens", 0),
-            late=bool(report.get("late", 0)),
+            close_kind=close_kind,
+            memory_entries=report.get("memory_entries", 0),
+            neighbours=report.get("neighbours", 0),
         )
 
 
@@ -595,6 +612,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
     _dynamic_effort: dict[str, Any] | None = PrivateAttr(default=None)
     """Validated dynamic-effort overrides; set only by `apply_dynamic_effort`."""
+    _dynamic_effort_variant_messages: list[Any] | None = PrivateAttr(default=None)
+    """One message list per rung, each carrying that rung's tail sentence; set
+    by `apply_dynamic_effort` when `hidden_effort` is on. The serving layer
+    renders each of them to find the shared body (§13.3)."""
     _effort_request: dict[str, Any] | None = PrivateAttr(default=None)
     """`{"requested": <as sent, None if omitted>, "effective": <served>}` for
     the effort telemetry finish record."""

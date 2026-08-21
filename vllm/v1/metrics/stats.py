@@ -253,9 +253,10 @@ class FinishedRequestStats:
     mean_time_per_output_token: float = 0.0
     is_corrupted: bool = False
     num_cached_tokens: int = 0
-    effort: dict[str, int] | None = None
+    effort: dict[str, Any] | None = None
     """Dynamic reasoning-effort report (rung, escalations, reasoning_tokens,
-    late, stall_clamps) for `reasoning_effort: "dynamic"` requests."""
+    late, stall_clamps, grace_tokens, close_kind) for
+    `reasoning_effort: "dynamic"` requests."""
 
 
 @dataclass

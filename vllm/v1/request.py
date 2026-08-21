@@ -189,6 +189,24 @@ class Request:
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
 
+        # Dynamic effort v3 (docs/dynamic-reasoning.claude.md §13.3): the
+        # prompt splits into a rung-independent body and one tail per rung.
+        # `prompt_token_ids` already carries the rung-0 tail, so a request whose
+        # decision never lands runs exactly as it did before v3.
+        self.effort_body_len = 0
+        self.effort_tail_variants: list[list[int]] | None = None
+        self.effort_decision_pending = False
+        # True only for the two-phase form: the prefill stops at
+        # `effort_body_len` and the request is held until the rung is chosen.
+        # False means the decision rides on the natural end of the prefill and
+        # sets the starting *cap* alone, which is what a prompt whose effort
+        # sentence is not at its tail (an agent loop ending in a tool result)
+        # or a model whose KV block is wider than the seam falls back to.
+        self.effort_hold_prefill = False
+        # Steps the scheduler has held this request waiting for its vector; the
+        # decision falls back to rung 0 rather than stalling forever.
+        self.effort_decision_skips = 0
+
         # Block-aligned token position of a proven shared prefix worth pinning
         # in the (sparse) prefix cache; 0 means none. Set at admission for
         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).

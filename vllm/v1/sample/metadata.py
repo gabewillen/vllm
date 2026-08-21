@@ -57,3 +57,6 @@ class SamplingMetadata:
     # [num_reqs] host bool mask of requests that opted into effort telemetry;
     # ``None`` when no request in the batch did (no extra sampler work).
     effort_mask: np.ndarray | None = None
+    # First token of the reasoning end sequence; its softmax probability is the
+    # ``p_end`` effort signal. ``None`` disables that column.
+    effort_end_token_id: int | None = None

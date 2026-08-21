@@ -7,7 +7,8 @@ set -e
 VENV="${1:-/shared/vllm/.venv-qwen38}"
 SP=$(ls -d "$VENV"/lib/python3.*/site-packages)
 cd "$SP"
-for p in "$(dirname "$0")"/000*.patch; do
+# 0*.patch, not 000*: the glob has to keep matching past 0009.
+for p in "$(dirname "$0")"/0*.patch; do
   echo "== $(basename "$p")"
   patch -p1 -N -r - < "$p" || true
 done

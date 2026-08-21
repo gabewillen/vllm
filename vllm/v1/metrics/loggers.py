@@ -5,6 +5,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -17,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
+from vllm.v1.core.sched.effort_controller import CLOSE_CLIENT_LIMIT, CLOSE_NATURAL
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
@@ -794,57 +796,53 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # Dynamic reasoning effort (labels are fixed enums; rung indices are
         # bounded by the configured ladder length).
         #
-        histogram_effort_final_rung = self._histogram_cls(
-            name="vllm:effort_final_rung",
-            documentation="Final ladder rung of dynamic-effort requests.",
-            buckets=[0, 1, 2, 3, 4, 5, 6, 7],
+        histogram_effort_level = self._histogram_cls(
+            name="vllm:effort_level",
+            documentation=(
+                "Effort level a dynamic request ran at, chosen from its prompt's "
+                "pooled prefill hidden state before it thought."
+            ),
+            buckets=[0, 1, 2, 3],
             labelnames=labelnames,
         )
-        self.histogram_effort_final_rung = create_metric_per_engine(
-            histogram_effort_final_rung, per_engine_labelvalues
+        self.histogram_effort_level = create_metric_per_engine(
+            histogram_effort_level, per_engine_labelvalues
         )
         histogram_reasoning_tokens = self._histogram_cls(
             name="vllm:reasoning_tokens",
             documentation="Reasoning tokens of dynamic-effort requests.",
-            buckets=build_1_2_5_buckets(max_model_len),
+            buckets=build_1_2_5_buckets(65536),
             labelnames=labelnames,
         )
         self.histogram_reasoning_tokens = create_metric_per_engine(
             histogram_reasoning_tokens, per_engine_labelvalues
         )
-        counter_effort_escalations = self._counter_cls(
-            name="vllm:effort_escalations",
-            documentation="Dynamic-effort rung escalations by transition.",
-            labelnames=labelnames + ["from", "to"],
-        )
-        self.counter_effort_escalations = {
-            idx: {
-                r: counter_effort_escalations.labels(
-                    model_name, str(idx), str(r), str(r + 1)
-                )
-                for r in range(8)
-            }
-            for idx in engine_indexes
-        }
-        counter_effort_stall_clamps = self._counter_cls(
-            name="vllm:effort_stall_clamps",
-            documentation="Dynamic-effort requests clamped by the stall guard.",
-            labelnames=labelnames,
-        )
-        self.counter_effort_stall_clamps = create_metric_per_engine(
-            counter_effort_stall_clamps, per_engine_labelvalues
-        )
-        counter_effort_late = self._counter_cls(
-            name="vllm:effort_late",
+        counter_effort_decided = self._counter_cls(
+            name="vllm:effort_decided",
             documentation=(
-                "Dynamic-effort requests whose budget update was not applied "
-                "before the think block closed."
+                "Dynamic requests whose level came from the hidden-state memory "
+                "rather than the server default."
             ),
             labelnames=labelnames,
         )
-        self.counter_effort_late = create_metric_per_engine(
-            counter_effort_late, per_engine_labelvalues
+        self.counter_effort_decided = create_metric_per_engine(
+            counter_effort_decided, per_engine_labelvalues
         )
+        counter_effort_close_kind = self._counter_cls(
+            name="vllm:effort_close",
+            documentation=(
+                "How dynamic-effort think blocks ended: natural (the model "
+                "closed it) or client-limit (max_tokens or an abort did)."
+            ),
+            labelnames=labelnames + ["kind"],
+        )
+        self.counter_effort_close_kind = {
+            idx: {
+                kind: counter_effort_close_kind.labels(model_name, str(idx), kind)
+                for kind in (CLOSE_NATURAL, CLOSE_CLIENT_LIMIT)
+            }
+            for idx in engine_indexes
+        }
 
         #
         # Histogram of timing intervals
@@ -1316,22 +1314,17 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             if finished_request.effort is not None:
                 self._record_effort(engine_idx, finished_request.effort)
 
-    def _record_effort(self, engine_idx: int, effort: dict[str, int]) -> None:
-        rung = effort.get("rung", 0)
-        self.histogram_effort_final_rung[engine_idx].observe(rung)
+    def _record_effort(self, engine_idx: int, effort: dict[str, Any]) -> None:
+        self.histogram_effort_level[engine_idx].observe(effort.get("level", 0))
         self.histogram_reasoning_tokens[engine_idx].observe(
             effort.get("reasoning_tokens", 0)
         )
-        # Escalations climb one rung at a time, so the transitions are exactly
-        # (r, r + 1) for the last `escalations` rungs below the final one.
-        transitions = self.counter_effort_escalations[engine_idx]
-        for r in range(max(rung - effort.get("escalations", 0), 0), rung):
-            if r in transitions:
-                transitions[r].inc()
-        if effort.get("stall_clamps"):
-            self.counter_effort_stall_clamps[engine_idx].inc()
-        if effort.get("late"):
-            self.counter_effort_late[engine_idx].inc()
+        if effort.get("decided"):
+            self.counter_effort_decided[engine_idx].inc()
+        close_kind = effort.get("close_kind")
+        counters = self.counter_effort_close_kind[engine_idx]
+        if close_kind in counters:
+            counters[close_kind].inc()
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1

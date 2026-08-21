@@ -256,8 +256,8 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
-    # [num_reqs, 3] fp32 (mean entropy, mean margin, n committed rows), only
-    # when a request in the batch opted into effort telemetry.
+    # [num_reqs, 4] fp32 (mean entropy, mean margin, mean p(end), n committed
+    # rows), only when a request in the batch opted into effort telemetry.
     effort_signals: torch.Tensor | None = None
     # [num_reqs] bool host mask of the opted-in requests.
     effort_flags: np.ndarray | None = None
@@ -354,12 +354,24 @@ class ModelRunnerOutput:
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 
-    # req_id -> (mean normalised entropy, mean top1-top2 margin, n committed
-    # rows) for requests that opted into effort telemetry this step.
-    effort_signals: dict[str, tuple[float, float, int]] | None = None
+    # req_id -> (mean normalised entropy, mean top1-top2 margin, mean
+    # p(reasoning end), n committed rows) for requests that opted into effort
+    # telemetry this step.
+    effort_signals: dict[str, tuple[float, float, float, int]] | None = None
 
     # req_id -> revision of the thinking budget update applied this step.
     thinking_budget_acks: dict[str, int] | None = None
+
+    # req_id -> (rung, escalations, grace tokens, late) reported by the
+    # worker-side escalation rule. ``late`` is 0 by construction: the rule is
+    # evaluated where the cap is applied.
+    effort_reports: dict[str, tuple[int, int, int, int]] | None = None
+
+    # req_id -> the last prefill row of that request's dynamic-effort *body*
+    # (fp16 ``[hidden_size]`` numpy), for the requests the scheduler asked to
+    # capture this step. ``None`` unless ``hidden_effort`` is on and a request
+    # is awaiting its starting-rung decision.
+    effort_prefill_states: dict[str, np.ndarray] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

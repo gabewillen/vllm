@@ -2,6 +2,7 @@
 """Contract tests for the adaptive draft-length patch (0005), CPU only."""
 
 import pytest
+
 from vllm.config.speculative import SpeculativeConfig
 from vllm.v1.core.sched.scheduler import adaptive_num_spec_tokens, update_accepted_ema
 from vllm.v1.worker.gpu.cudagraph_utils import (

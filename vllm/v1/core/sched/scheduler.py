@@ -8,6 +8,9 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
+
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.config.reasoning import DynamicEffortConfig, ReasoningConfig
@@ -33,7 +36,6 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
-from vllm.sampling_params import RepetitionDetectionParams
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -42,12 +44,16 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.effort_controller import (
+    CLOSE_CLIENT_LIMIT,
     EffortEvent,
     EffortState,
     finish_effort,
     new_effort_state,
-    resolve_marker_sequences,
     step_effort,
+)
+from vllm.v1.core.sched.effort_memory import (
+    EffortMemory,
+    decide_effort_level,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
@@ -63,7 +69,6 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import (
-    check_sequence_repetition,
     check_stop,
     remove_all,
 )
@@ -80,6 +85,12 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+MAX_EFFORT_DECISION_SKIPS = 16
+"""Scheduler steps a request awaiting its effort decision may be held for
+before it gives up and runs at the default level. Purely a liveness bound: the
+request is simply not scheduled while it waits, and the vector normally arrives
+on the first step after the body prefill."""
 
 
 def adaptive_num_spec_tokens(
@@ -306,12 +317,19 @@ class Scheduler(SchedulerInterface):
         # Dynamic reasoning effort: per-request controller state, pending
         # (unacked) budget updates, and relaxed repetition params.
         self._effort: dict[str, EffortState] = {}
-        self._effort_pending: dict[str, tuple[int, int]] = {}
-        self._effort_rep_params: dict[str, RepetitionDetectionParams] = {}
         self._effort_cfg: DynamicEffortConfig | None = None
         self._effort_start_ids: list[int] = []
         self._effort_end_ids: list[int] = []
-        self._effort_marker_seqs: list[tuple[int, ...]] = []
+        # Dynamic effort v3: the online memory of pooled prefill states and the
+        # per-step capture list (docs/dynamic-reasoning.claude.md §13).
+        self._effort_memory: EffortMemory | None = None
+        self._effort_vectors: dict[str, np.ndarray] = {}
+        self._effort_level_total: dict[int, int] = {}
+        self._effort_held_timeouts = 0
+        self._effort_default_reason: dict[str, int] = {}
+        # First few decisions are logged at INFO so a deployment can see the
+        # split arm and the vector arrive without turning on debug logging.
+        self._effort_trace_budget = 5
         reasoning_config = vllm_config.reasoning_config
         if reasoning_config is not None and reasoning_config.dynamic_effort:
             self._init_effort_controller(reasoning_config)
@@ -614,6 +632,25 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                request.effort_hold_prefill
+                and request.num_computed_tokens >= request.effort_body_len
+            ):
+                # v3: the body is prefilled and the starting rung is not chosen
+                # yet, so the tail must not prefill (it would commit rung 0).
+                # The vector arrives with this step's output; the counter is the
+                # liveness guarantee if it never does.
+                request.effort_decision_skips += 1
+                if request.effort_decision_skips > MAX_EFFORT_DECISION_SKIPS:
+                    # Liveness only. The vector normally arrives with the very
+                    # next output, but the async batch queue and a busy step can
+                    # put several schedule() calls in between, and giving up too
+                    # early silently drops the decision.
+                    self._effort_held_timeouts += 1
+                    self._resolve_effort_decision(request, None)
+                req_index += 1
+                continue
+
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
@@ -625,6 +662,11 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if request.effort_hold_prefill:
+                num_new_tokens = min(
+                    num_new_tokens,
+                    request.effort_body_len - request.num_computed_tokens,
+                )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
@@ -942,6 +984,29 @@ class Scheduler(SchedulerInterface):
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
 
+                    if (
+                        request.effort_hold_prefill
+                        and num_new_local_computed_tokens + num_external_computed_tokens
+                        >= request.effort_body_len
+                    ):
+                        # v3: the blocks past the body hold the *rung-0* tail,
+                        # which the decision has not chosen yet. Keep the body's
+                        # full blocks and recompute the rest, so the last body
+                        # row is produced even for a 100%-cached prompt (§13.3).
+                        if self.connector is not None:
+                            self._resolve_effort_decision(request, None)
+                        else:
+                            keep = (
+                                (request.effort_body_len - 1) // self.block_size
+                            ) * self.block_size
+                            if num_new_local_computed_tokens > keep:
+                                new_computed_blocks = (
+                                    self.kv_cache_manager.truncate_computed_blocks(
+                                        new_computed_blocks, keep
+                                    )
+                                )
+                                num_new_local_computed_tokens = keep
+
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
@@ -995,6 +1060,11 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if request.effort_hold_prefill:
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            request.effort_body_len - num_computed_tokens,
+                        )
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1003,6 +1073,7 @@ class Scheduler(SchedulerInterface):
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
+                        and not request.effort_hold_prefill
                         and (scheduled_running_reqs and not prefill_scheduled)
                     ):
                         num_new_tokens = 1 + self.num_spec_tokens
@@ -1358,7 +1429,7 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
-            thinking_budget_updates=dict(self._effort_pending),
+            thinking_budget_updates={},
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1468,6 +1539,12 @@ class Scheduler(SchedulerInterface):
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
+            if (
+                request.effort_decision_pending
+                and request.num_computed_tokens >= request.effort_body_len
+            ):
+                # The body's last row is in this step's hidden states (§13.3).
+                scheduler_output.effort_prefill_capture.append(req_id)
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
@@ -1831,10 +1908,14 @@ class Scheduler(SchedulerInterface):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
-        effort_acks = model_runner_output.thinking_budget_acks
-        if effort_acks and self._effort:
-            self._ingest_effort_acks(effort_acks)
-        effort_now_ms: float | None = None
+        effort_prefill_states = model_runner_output.effort_prefill_states
+        effort_requeued: set[Request] = set()
+        # Which requests' body rows *this* step computed. Async scheduling has
+        # already scheduled the step after a multi-chunk body - so the token
+        # counter is past the boundary - when the earlier chunk's vector-less
+        # output arrives, and resolving off that counter would spend the
+        # decision on it. Empty on almost every step.
+        effort_capture = scheduler_output.effort_prefill_capture
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
@@ -1900,6 +1981,16 @@ class Scheduler(SchedulerInterface):
             if output_is_stale and request.drop_stale_output:
                 continue
 
+            if request.effort_decision_pending and req_id in effort_capture:
+                # v3: the body's last prefill row came back with this step, so
+                # the starting rung is decided here and the chosen tail replaces
+                # the rung-0 one (§13.3 step 4).
+                vector = (
+                    effort_prefill_states.get(req_id) if effort_prefill_states else None
+                )
+                if self._resolve_effort_decision(request, vector):
+                    effort_requeued.add(request)
+
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
@@ -1908,7 +1999,6 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
-            effort_draft = effort_accepted = 0
             effort_num_draft: int | None = None
             effort_num_accepted: int | None = None
             if scheduled_spec_token_ids and (
@@ -1918,7 +2008,6 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
-                effort_draft, effort_accepted = num_draft_tokens, num_accepted
                 effort_num_draft, effort_num_accepted = num_draft_tokens, num_accepted
                 if self.adaptive_draft:
                     self._update_accepted_ema(req_id=req_id, num_accepted=num_accepted)
@@ -1977,16 +2066,11 @@ class Scheduler(SchedulerInterface):
 
             effort_state = self._effort.get(req_id) if self._effort else None
             if effort_state is not None and new_token_ids:
-                if effort_state.deadline_ms is not None and effort_now_ms is None:
-                    effort_now_ms = time.monotonic() * 1000.0
-                self._step_effort(
-                    request,
+                assert self._effort_cfg is not None
+                step_effort(
                     effort_state,
-                    new_token_ids,
-                    effort_signals.get(req_id) if effort_signals else None,
-                    num_draft_tokens=effort_draft,
-                    num_accepted_tokens=effort_accepted,
-                    now_ms=effort_now_ms,
+                    self._effort_cfg,
+                    EffortEvent(new_token_ids=new_token_ids),
                 )
             if effort_sink is not None:
                 effort_signal = effort_signals.get(req_id)
@@ -2145,6 +2229,13 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        if effort_requeued:
+            # Re-admit as a new request so the worker picks up the new prompt
+            # (the same path a streaming-input chunk takes).
+            self.running = remove_all(self.running, effort_requeued)
+            for request in effort_requeued:
+                self.waiting.prepend_request(request)
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -2537,26 +2628,59 @@ class Scheduler(SchedulerInterface):
             return
         cfg = reasoning_config.dynamic_effort
         assert cfg is not None
-        marker_seqs: list[tuple[int, ...]] = []
-        if cfg.backtrack_markers:
-            try:
-                from vllm.tokenizers import cached_tokenizer_from_config
-
-                tokenizer = cached_tokenizer_from_config(self.vllm_config.model_config)
-                marker_seqs = resolve_marker_sequences(
-                    cfg.backtrack_markers,
-                    lambda text: tokenizer.encode(text, add_special_tokens=False),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "dynamic_effort: could not tokenize backtrack markers (%s); "
-                    "marker density is disabled.",
-                    exc,
-                )
         self._effort_cfg = cfg
         self._effort_start_ids = list(start_ids)
         self._effort_end_ids = list(end_ids)
-        self._effort_marker_seqs = marker_seqs
+        logger.info(
+            "dynamic_effort: %d effort levels, chosen before thinking and "
+            "rendered at the prompt tail. Nothing caps, biases or watches the "
+            "think block on this path - the model ends its own reasoning, "
+            "bounded only by the client's max_tokens and timeouts.",
+            cfg.num_levels,
+        )
+        self._init_effort_memory(cfg)
+
+    def _init_effort_memory(self, cfg: DynamicEffortConfig) -> None:
+        """Build the v3 hidden-state memory (§13.4) and warm it from disk."""
+        hidden = cfg.hidden_effort
+        if not hidden.enabled:
+            return
+        if not envs.VLLM_USE_V2_MODEL_RUNNER:
+            logger.warning(
+                "dynamic_effort: hidden_effort needs the V2 model runner; "
+                "the starting-rung decision is disabled."
+            )
+            return
+        hidden_size = self.vllm_config.model_config.get_hidden_size()
+        memory = EffortMemory(
+            hidden_size,
+            hidden,
+            model=self.vllm_config.model_config.model,
+            levels=cfg.num_levels,
+        )
+        try:
+            warmed = memory.load()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "dynamic_effort: could not load %s (%s)", hidden.memory_path, exc
+            )
+            warmed = False
+        self._effort_memory = memory
+        logger.info(
+            "dynamic_effort: hidden-state start rung ON%s - memory %s (%d/%d "
+            "entries, min %d), k=%d, cuts q_mid=%.2f q_high=%.2f, downward "
+            "gates novelty<=%.2f spread<=%.2f",
+            " (shadow)" if hidden.shadow else "",
+            "warm" if warmed else "cold",
+            memory.n_entries,
+            hidden.memory_size,
+            hidden.min_entries,
+            hidden.k,
+            hidden.q_mid,
+            hidden.q_high,
+            hidden.novelty_gate_q,
+            hidden.spread_gate_q,
+        )
 
     def _maybe_add_effort_state(self, request: Request) -> None:
         params = request.sampling_params
@@ -2566,42 +2690,53 @@ class Scheduler(SchedulerInterface):
         if not isinstance(overrides, dict):
             return
         assert self._effort_cfg is not None
-        now_ms = (
-            time.monotonic() * 1000.0
-            if overrides.get("deadline_ms") is not None
-            else None
-        )
-        self._effort[request.request_id] = new_effort_state(
+        state = new_effort_state(
             request.request_id,
             self._effort_cfg,
-            overrides,
             self._effort_start_ids,
             self._effort_end_ids,
-            self._effort_marker_seqs,
             request.prompt_token_ids,
-            request.max_tokens,
-            now_ms=now_ms,
         )
-        rep = params.repetition_detection
-        if rep is not None and rep.max_pattern_size > 0 and rep.min_count > 2:
-            # Read-only early evidence: the stop's own pattern at one repeat
-            # fewer. check_stop keeps the terminal decision.
-            self._effort_rep_params[request.request_id] = RepetitionDetectionParams(
-                max_pattern_size=rep.max_pattern_size,
-                min_pattern_size=rep.min_pattern_size,
-                min_count=rep.min_count - 1,
+        state.level = int(overrides.get("default_level", 0))
+        self._effort[request.request_id] = state
+        if self._effort_memory is not None and "forced_level" not in overrides:
+            tails = overrides.get("tails")
+            body_len = overrides.get("body_len")
+            if (
+                isinstance(tails, list)
+                and len(tails) == state.num_levels
+                and isinstance(body_len, int)
+                and 0 < body_len < request.num_prompt_tokens
+            ):
+                boundary = self._effort_body_boundary(request, body_len)
+                if boundary and self._effort_split_worth_it(request, boundary):
+                    assert request.prompt_token_ids is not None
+                    # Tokens between the boundary and the frontend's seam are
+                    # the same in every variant, so they ride at the head of
+                    # every tail.
+                    middle = list(request.prompt_token_ids[boundary:body_len])
+                    request.effort_body_len = boundary
+                    request.effort_tail_variants = [middle + list(t) for t in tails]
+                    request.effort_hold_prefill = True
+                    request.effort_decision_pending = True
+                if self._effort_trace_budget > 0:
+                    logger.info(
+                        "dynamic_effort %s: seam at %d of %d prompt tokens, "
+                        "boundary %d, tails %s -> %s",
+                        request.request_id,
+                        body_len,
+                        request.num_prompt_tokens,
+                        boundary,
+                        [len(t) for t in tails],
+                        "two-phase" if request.effort_hold_prefill else "default level",
+                    )
+        if not request.effort_decision_pending:
+            self._effort_level_total[state.level] = (
+                self._effort_level_total.get(state.level, 0) + 1
             )
-
-    def _ingest_effort_acks(self, acks: dict[str, int]) -> None:
-        for req_id, revision in acks.items():
-            state = self._effort.get(req_id)
-            if state is None:
-                continue
-            if revision > state.acked_revision:
-                state.acked_revision = revision
-            pending = self._effort_pending.get(req_id)
-            if pending is not None and pending[0] <= revision:
-                del self._effort_pending[req_id]
+            self._effort_default_reason["no-seam"] = (
+                self._effort_default_reason.get("no-seam", 0) + 1
+            )
 
     def _record_effort_finish(
         self,
@@ -2623,46 +2758,189 @@ class Scheduler(SchedulerInterface):
             payload["dynamic"] = effort_report
         self.effort_sink.record_finish(request.request_id, payload)
 
-    def _step_effort(
-        self,
-        request: Request,
-        state: EffortState,
-        new_token_ids: list[int],
-        signals: tuple[float, float, int] | None,
-        num_draft_tokens: int,
-        num_accepted_tokens: int,
-        now_ms: float | None,
-    ) -> None:
-        assert self._effort_cfg is not None
-        rep_params = self._effort_rep_params.get(request.request_id)
-        event = EffortEvent(
-            new_token_ids=new_token_ids,
-            entropy=signals[0] if signals is not None else None,
-            margin=signals[1] if signals is not None else None,
-            n_rows=signals[2] if signals is not None else 0,
-            num_draft_tokens=num_draft_tokens,
-            num_accepted_tokens=num_accepted_tokens,
-            batch_size=len(self.running),
-            max_tokens=request.max_tokens,
-            now_ms=now_ms,
-            repetition_evidence=(
-                rep_params is not None
-                and check_sequence_repetition(request.output_token_ids, rep_params)
-            ),
-        )
-        decision = step_effort(state, self._effort_cfg, event)
-        if decision.budget_update is not None:
-            self._effort_pending[request.request_id] = decision.budget_update
-        if decision.checked or decision.stall_clamp or decision.late:
-            logger.debug(
-                "dynamic_effort %s: escalation=%s stall=%s late=%s update=%s %s",
+    def _resolve_effort_decision(
+        self, request: Request, vector: "np.ndarray | None"
+    ) -> bool:
+        """Choose the effort level from the body's pooled prefill state.
+
+        The prompt already carries the default level's tail, so every failure
+        mode - cold memory, a missing vector, a KV connector that already
+        committed to loading past the body - leaves it byte-identical and needs
+        no requeue. Nothing here sets a thinking budget: the level *is* the
+        actuator.
+
+        Args:
+            request: the request whose body prefill just finished.
+            vector: the last body row, or `None` when there is none.
+
+        Returns:
+            Whether the prompt changed and the request must be re-admitted.
+        """
+        if not request.effort_decision_pending:
+            return False
+        request.effort_decision_pending = False
+        request.effort_hold_prefill = False
+        request.effort_decision_skips = 0
+        memory = self._effort_memory
+        tails = request.effort_tail_variants
+        state = self._effort.get(request.request_id)
+        default_level = state.level if state is not None else 0
+        level = default_level
+        reason = "no-vector"
+        if self._effort_trace_budget > 0:
+            self._effort_trace_budget -= 1
+            logger.info(
+                "dynamic_effort %s: body prefilled (%d tokens), vector %s, "
+                "memory %d entries",
                 request.request_id,
-                decision.escalation,
-                decision.stall_clamp,
-                decision.late,
-                decision.budget_update,
-                decision.vector,
+                request.effort_body_len,
+                "present" if vector is not None else "MISSING",
+                memory.n_entries if memory is not None else -1,
             )
+        if memory is not None and vector is not None:
+            self._effort_vectors[request.request_id] = np.asarray(
+                vector, dtype=np.float32
+            )
+            query = memory.query(vector)
+            if query is None:
+                reason = "empty-memory"
+            else:
+                top = (len(tails) - 1) if tails else 0
+                decision = decide_effort_level(
+                    query, memory.ranks(query), memory.cfg, top
+                )
+                if state is not None:
+                    state.novelty = query.novelty
+                    state.spread = query.spread
+                    state.neighbours = query.n_valued
+                    state.memory_entries = query.n_entries
+                if not memory.ready:
+                    reason = f"cold/{decision.reason}"
+                elif memory.cfg.shadow:
+                    reason = f"shadow/{decision.reason}"
+                else:
+                    reason = decision.reason
+                    level = decision.level
+                    if state is not None:
+                        state.decided = True
+                logger.debug(
+                    "dynamic_effort %s: level %d (%s) q=%s novelty=%s spread=%s "
+                    "entries=%d",
+                    request.request_id,
+                    level,
+                    reason,
+                    decision.estimate_rank,
+                    decision.novelty_rank,
+                    decision.spread_rank,
+                    query.n_entries,
+                )
+        self._effort_level_total[level] = self._effort_level_total.get(level, 0) + 1
+        if level == default_level:
+            self._effort_default_reason[reason] = (
+                self._effort_default_reason.get(reason, 0) + 1
+            )
+        if state is not None:
+            state.level = level
+        if level == default_level or not tails:
+            return False
+        self._apply_effort_tail(request, tails[level])
+        return True
+
+    def _apply_effort_tail(self, request: Request, tail: list[int]) -> None:
+        """Replace the rung-0 tail with the chosen one, in place.
+
+        Only positions at or after `effort_body_len` change, and nothing at or
+        before that boundary has been cached yet, so the body's blocks and their
+        hashes stay valid; the hashes covering the tail are recomputed.
+        """
+        body_len = request.effort_body_len
+        prompt = request.prompt_token_ids
+        assert prompt is not None
+        del prompt[body_len:]
+        prompt.extend(tail)
+        del request._all_token_ids[body_len:]
+        request._all_token_ids.extend(tail)
+        request.num_prompt_tokens = len(prompt)
+        del request.block_hashes[body_len // self.hash_block_size :]
+        request.update_block_hashes()
+        request.max_tokens = min(
+            request.max_tokens, max(self.max_model_len - request.num_prompt_tokens, 1)
+        )
+        request.status = RequestStatus.WAITING
+
+    def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
+        """Record a finished request in the memory (§13.4).
+
+        A soft or forced close is right-censored - the length it *would* have
+        spent is unknown - so it enters as a key with no value.
+        """
+        memory = self._effort_memory
+        vector = self._effort_vectors.pop(request.request_id, None)
+        if memory is None or vector is None:
+            return
+        close_kind = state.close_kind
+        if request.status != RequestStatus.FINISHED_STOPPED:
+            # An abort or a max_tokens cap truncates the thinking, so the
+            # length the request would have spent is unknown.
+            close_kind = CLOSE_CLIENT_LIMIT
+        memory.insert(
+            vector,
+            state.reasoning_tokens,
+            close_kind,
+            session_id=request.session_id,
+            level=state.level,
+        )
+        if memory.n_entries and memory.n_entries % 64 == 0:
+            logger.info(
+                "dynamic_effort: memory %d/%d entries (%d valued), hit rate "
+                "%.2f, levels %s, default-level reasons %s, held timeouts %d",
+                memory.n_entries,
+                memory.cfg.memory_size,
+                memory.n_valued,
+                memory.hit_rate,
+                dict(sorted(self._effort_level_total.items())),
+                dict(sorted(self._effort_default_reason.items())),
+                self._effort_held_timeouts,
+            )
+
+    def _effort_split_worth_it(self, request: Request, boundary: int) -> int:
+        """Whether choosing the prompt tail beats reading the whole prompt.
+
+        The two-phase form buys the rung's *sentence*, but only if the vector it
+        decides from is nearly the whole prompt. An agent turn that ends in a
+        tool result puts the last user message - where the effort sentence goes
+        - thousands of tokens from the end, and the body would then be a small
+        prefix of what the model actually reads. Below `split_min_fraction` of
+        the prompt the cap-only form is strictly better informed.
+        """
+        cfg = self._effort_cfg
+        assert cfg is not None
+        if request.num_prompt_tokens <= 0:
+            return False
+        return (
+            boundary / request.num_prompt_tokens >= cfg.hidden_effort.split_min_fraction
+        )
+
+    def _effort_body_boundary(self, request: Request, body_len: int) -> int:
+        """Where the body prefill may stop, or 0 when it may not stop at all.
+
+        The frontend's seam is the last token of the prompt body, but a Mamba
+        "align" deployment may only end a non-final prefill chunk on a block
+        boundary whose state is cacheable - so there the body stops at the last
+        such boundary at or before the seam, and the vector is the hidden state
+        of that token instead. A prompt with no usable boundary keeps today's
+        single-phase path.
+        """
+        if not self.need_mamba_block_aligned_split:
+            return body_len
+        # Any multiple of the block size up to the prompt's last full block is
+        # reachable: `_mamba_block_aligned_split` may stop an intermediate chunk
+        # earlier (at the eagle-pruned last cacheable position), but the next
+        # chunk starts block-aligned and runs on to the boundary.
+        block = self.block_size
+        limit = request.num_tokens - request.num_tokens % block
+        aligned = min(body_len, limit) // block * block
+        return aligned if aligned >= block else 0
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
@@ -2670,9 +2948,14 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self._accepted_ema.pop(request.request_id, None)
         if self._effort:
+            state = self._effort.get(request.request_id)
+            if state is not None:
+                if not state.finished:
+                    finish_effort(state)
+                self._insert_effort_memory(request, state)
+        self._effort_vectors.pop(request.request_id, None)
+        if self._effort:
             self._effort.pop(request.request_id, None)
-            self._effort_pending.pop(request.request_id, None)
-            self._effort_rep_params.pop(request.request_id, None)
         if self.effort_sink is not None:
             self.effort_sink.forget(request.request_id)
 
