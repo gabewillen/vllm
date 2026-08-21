@@ -164,6 +164,13 @@ reasoning-parser: qwen3
 # it (close_kind=client-limit, not valued in the memory). Nothing is trained and
 # there is no offline corpus: a cold memory, a missing vector or a prompt with
 # no usable seam all render the default level with a byte-identical prompt.
+# default_level 1 (medium) is the prior for every undecided request - cold
+# memory, no seam, novel prompt. With the prior at 0 (low), VulcanBench
+# flask (2026-08-21, two seeds) ran the whole task at low and missed the
+# aggregation test both times (693 / 143k reasoning tokens, max level 0)
+# where the v1 ladder had passed by escalating on 6 requests. The asymmetric
+# map lowers from the middle only when the neighbours agree; it should not
+# start at the bottom.
 # default_effort: a request that OMITS reasoning_effort is routed instead of
 # falling through to the chat template's own default, which for Qwen3.8 is
 # xhigh - the most expensive level there is. An explicit level (including
@@ -172,7 +179,7 @@ reasoning-parser: qwen3
 # effort-telemetry.conf): per-step entropy/margin rows plus one `event: finish`
 # record with requested vs effective effort and this report
 # (level, decided, reasoning_tokens, close_kind, memory_entries, neighbours).
-reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
+reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "default_level": 1, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
