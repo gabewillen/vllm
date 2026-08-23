@@ -1,0 +1,742 @@
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index 10e200c747..953b948652 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from dataclasses import field
++from typing import TYPE_CHECKING
+ 
+ from pydantic import Field
+ 
+@@ -10,6 +11,9 @@ from vllm.config.utils import config
+ from vllm.reasoning import ReasoningParserManager
+ from vllm.tokenizers import cached_tokenizer_from_config
+ 
++if TYPE_CHECKING:
++    from vllm.config.parallel import ParallelConfig
++
+ VALID_REASONING_EFFORTS = frozenset(
+     {"none", "minimal", "low", "medium", "high", "xhigh", "max", "dynamic"}
+ )
+@@ -21,9 +25,10 @@ QWEN_LOW_EFFORT_SENTENCE = (
+     "moving directly to the conclusion without unnecessary elaboration."
+ )
+ 
+-QWEN_HIGH_EFFORT_SENTENCE = (
+-    "Reasoning effort is set to high. Think this through carefully and "
+-    "completely before answering, checking your work as you go."
++QWEN_XHIGH_EFFORT_SENTENCE = (
++    "Reasoning effort is set to xhigh. Please think carefully through the task, "
++    "validate key assumptions, consider plausible alternatives, and prioritize "
++    "correctness, consistency, and clarity in the final answer."
+ )
+ 
+ 
+@@ -64,9 +69,6 @@ class HiddenEffortConfig:
+     above which the request leaves the resting low level for the middle."""
+     q_high: float = Field(default=0.60, ge=0.0, le=1.0)
+     """Neighbour difficulty at or above which it gets the top level."""
+-    novelty_gate_q: float = Field(default=0.60, ge=0.0, le=1.0)
+-    """Novelty rank above which the memory has nothing comparable and the
+-    request falls back to `default_level` instead of the map."""
+     spread_gate_q: float = Field(default=0.60, ge=0.0, le=1.0)
+     """Kept for telemetry; the spread rank is reported, not cut on."""
+     probe_every: int = Field(default=8, ge=0)
+@@ -91,7 +93,7 @@ class HiddenEffortConfig:
+     `default_level`, with a byte-identical prompt."""
+     effort_sentences: list[str] | None = None
+     """One prompt sentence per effort level, lowest first. `None` uses
+-    `[low, "", high]`: the model's own `low` and `xhigh` wording, with the
++    `[low, "", xhigh]`: the model's own `low` and `xhigh` wording, with the
+     middle level rendering no sentence at all - the chat template's `medium`.
+     The sentence is the *whole* actuator: it is placed at the true tail of the
+     prompt, after the last message, so the body before it is byte-identical
+@@ -114,7 +116,7 @@ class HiddenEffortConfig:
+         """The tail sentence of each effort level, lowest first."""
+         if self.effort_sentences is not None:
+             return list(self.effort_sentences)
+-        return [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_HIGH_EFFORT_SENTENCE]
++        return [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_XHIGH_EFFORT_SENTENCE]
+ 
+ 
+ @config
+@@ -181,7 +183,11 @@ class ReasoningConfig:
+     reasoning_end_str: str = ""
+     """String forced when the thinking budget is exhausted."""
+     dynamic_effort: DynamicEffortConfig | None = None
+-    """Server defaults for `reasoning_effort: "dynamic"`; `None` rejects it."""
++    """Server defaults for `reasoning_effort: "dynamic"`; `None` rejects it.
++
++    Dynamic effort requires data-parallel size one because its routing memory
++    and shutdown persistence have one process owner.
++    """
+ 
+     _reasoning_start_token_ids: list[int] | None = field(
+         default=None, init=False, repr=False
+@@ -280,3 +286,11 @@ class ReasoningConfig:
+                 "Ensure the strings are valid tokens in the model's vocabulary."
+             )
+         self._enabled = True
++
++    def verify_with_parallel_config(self, parallel_config: "ParallelConfig") -> None:
++        """Reject dynamic routing where each DP rank owns independent state."""
++        if self.dynamic_effort is not None and parallel_config.data_parallel_size > 1:
++            raise ValueError(
++                "dynamic effort is not supported with data parallelism; "
++                "use data_parallel_size=1"
++            )
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 694026d760..4f4a305e2e 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -247,8 +247,13 @@ class OpenAIServingChat(GenerateBaseServing):
+             return None
+         if len(engine_inputs) != 1:
+             return None
+-        rendered = [self._extract_prompt_components(engine_inputs[0]).token_ids]
+-        for messages in variants[1:]:
++        default_level = request._dynamic_effort["default_level"]
++        default_token_ids = self._extract_prompt_components(engine_inputs[0]).token_ids
++        rendered = []
++        for level, messages in enumerate(variants):
++            if level == default_level:
++                rendered.append(default_token_ids)
++                continue
+             variant_request = copy(request)
+             variant_request.messages = messages
+             result = await self.render_chat_request(variant_request)
+diff --git a/vllm/v1/core/sched/effort_controller.py b/vllm/v1/core/sched/effort_controller.py
+index 125418f0cd..8924ce1261 100644
+--- a/vllm/v1/core/sched/effort_controller.py
++++ b/vllm/v1/core/sched/effort_controller.py
+@@ -59,6 +59,9 @@ class EffortState:
+ 
+     # Decision provenance, for telemetry only.
+     novelty: float | None = None
++    novelty_rank: float | None = None
++    estimate: float | None = None
++    """Raw kNN estimate the decision saw; calibrates the memory at finish."""
+     spread: float | None = None
+     neighbours: int = 0
+     memory_entries: int = 0
+@@ -83,6 +86,8 @@ class EffortState:
+             "close_kind": self.close_kind,
+             "memory_entries": self.memory_entries,
+             "neighbours": self.neighbours,
++            "estimate": self.estimate,
++            "novelty_rank": self.novelty_rank,
+         }
+ 
+ 
+diff --git a/vllm/v1/core/sched/effort_memory.py b/vllm/v1/core/sched/effort_memory.py
+index 652ffb1d45..9a3cffe3a0 100644
+--- a/vllm/v1/core/sched/effort_memory.py
++++ b/vllm/v1/core/sched/effort_memory.py
+@@ -53,6 +53,60 @@ SESSION_CAP_DIVISOR = 64
+ """At most `memory_size / SESSION_CAP_DIVISOR` entries per session id, so one
+ long conversation cannot evict the memory."""
+ 
++CALIBRATION_BINS = 8
++"""Novelty-rank bins the estimate is calibrated in. Resolution, not a cut."""
++
++
++class _Calibration:
++    """Online least squares of realised difficulty on the kNN estimate.
++
++    One per novelty bin. `apply` maps an estimate to `a + b * estimate`; with
++    no predictive value in the neighbours `b` goes to 0 and every estimate
++    collapses to the mean realised difficulty, which for ranks is the middle.
++    """
++
++    __slots__ = ("n", "sx", "sy", "sxx", "sxy")
++
++    def __init__(self) -> None:
++        self.n = 0
++        self.sx = self.sy = self.sxx = self.sxy = 0.0
++
++    def add(self, x: float, y: float) -> None:
++        self.n += 1
++        self.sx += x
++        self.sy += y
++        self.sxx += x * x
++        self.sxy += x * y
++
++    def fit(self) -> tuple[float, float] | None:
++        if self.n < 2:
++            return None
++        mx, my = self.sx / self.n, self.sy / self.n
++        var = self.sxx / self.n - mx * mx
++        if var <= 1e-9:
++            return my, 0.0
++        slope = (self.sxy / self.n - mx * my) / var
++        slope = min(max(slope, 0.0), 2.0)
++        return my - slope * mx, slope
++
++    def apply(self, x: float) -> float:
++        fit = self.fit()
++        if fit is None:
++            return x
++        a, b = fit
++        return min(max(a + b * x, 0.0), 1.0)
++
++    def to_dict(self) -> dict[str, float]:
++        return {"n": self.n, "sx": self.sx, "sy": self.sy, "sxx": self.sxx, "sxy": self.sxy}
++
++    @classmethod
++    def from_dict(cls, d: dict[str, float]) -> "_Calibration":
++        c = cls()
++        c.n = int(d.get("n", 0))
++        c.sx, c.sy = float(d.get("sx", 0.0)), float(d.get("sy", 0.0))
++        c.sxx, c.sxy = float(d.get("sxx", 0.0)), float(d.get("sxy", 0.0))
++        return c
++
+ 
+ @dataclass(frozen=True)
+ class MemoryQuery:
+@@ -126,6 +180,8 @@ class EffortMemory:
+         self._spend_digest = TDigest(compression=cfg.digest_compression)
+         self._level_digests: dict[int, TDigest] = {}
+         self._probe_clock = 0
++        self._calibration = [_Calibration() for _ in range(CALIBRATION_BINS)]
++        self._calibration_all = _Calibration()
+ 
+     # ---------------------------------------------------------------- state
+ 
+@@ -155,6 +211,8 @@ class EffortMemory:
+         close_kind: str,
+         session_id: str | None = None,
+         level: int = 0,
++        estimate: float | None = None,
++        novelty_rank: float | None = None,
+     ) -> None:
+         """Record one finished request.
+ 
+@@ -166,6 +224,8 @@ class EffortMemory:
+                 enter as keys with no value.
+             session_id: conversation key for the per-session eviction cap.
+             level: effort level the prefill decision chose.
++            estimate: the raw kNN estimate the decision saw, if any.
++            novelty_rank: the novelty rank the decision saw, if any.
+         """
+         key = _unit(vec)
+         if key.shape[0] != self.hidden_size:
+@@ -182,7 +242,12 @@ class EffortMemory:
+         self._sessions[slot] = session_id
+         self._levels_used[slot] = np.int8(max(-128, min(127, level)))
+         if valued:
+-            self._absorb_spend(int(level), float(self._values[slot]))
++            log_spend = float(self._values[slot])
++            if estimate is not None and novelty_rank is not None:
++                realised = self._difficulty(int(level), log_spend)
++                self._calibration[self._bin(novelty_rank)].add(estimate, realised)
++                self._calibration_all.add(estimate, realised)
++            self._absorb_spend(int(level), log_spend)
+         if session_id is not None:
+             self._by_session.setdefault(session_id, deque()).append(slot)
+         self._inserts += 1
+@@ -216,6 +281,24 @@ class EffortMemory:
+         self._probe_clock = (self._probe_clock + 1) % every
+         return self._probe_clock == 0
+ 
++    @staticmethod
++    def _bin(novelty_rank: float) -> int:
++        return min(CALIBRATION_BINS - 1, max(0, int(novelty_rank * CALIBRATION_BINS)))
++
++    def calibrate(self, estimate: float, novelty_rank: float | None) -> float:
++        """Map a raw estimate through the calibration of its novelty bin.
++
++        The bin must hold `k` closes before it speaks; until then the pooled
++        fit stands in, and before that the estimate passes through."""
++        k = int(self.cfg.k)
++        if novelty_rank is not None:
++            cal = self._calibration[self._bin(novelty_rank)]
++            if cal.n >= k:
++                return cal.apply(estimate)
++        if self._calibration_all.n >= k:
++            return self._calibration_all.apply(estimate)
++        return estimate
++
+     def _claim_slot(self, session_id: str | None) -> int:
+         """FIFO ring, with a per-session cap that reuses the session's oldest."""
+         if session_id is not None:
+@@ -294,12 +377,15 @@ class EffortMemory:
+         return result
+ 
+     def ranks(self, q: MemoryQuery) -> tuple[float | None, float | None, float | None]:
+-        """`(estimate, novelty rank, spread rank)`, then absorb them.
++        """`(calibrated estimate, novelty rank, spread rank)`, then absorb.
+ 
+-        The estimate is already a difficulty percentile and is passed through;
+-        its digest is kept for reporting only."""
+-        est_rank = q.estimate
++        The estimate is a difficulty percentile; it is passed through the
++        calibration of its novelty bin, so neighbours that have not predicted
++        anything at that distance pull it to the mean instead of deciding."""
+         nov_rank = self._novelty_digest.rank(q.novelty)
++        est_rank = (
++            None if q.estimate is None else self.calibrate(q.estimate, nov_rank)
++        )
+         spread_rank = None if q.spread is None else self._spread_digest.rank(q.spread)
+         if q.estimate is not None:
+             self._est_digest.add(q.estimate)
+@@ -330,6 +416,8 @@ class EffortMemory:
+                 for level, digest in self._level_digests.items()
+             },
+             "probe_clock": self._probe_clock,
++            "calibration": [c.to_dict() for c in self._calibration],
++            "calibration_all": self._calibration_all.to_dict(),
+         }
+ 
+     def save(self) -> None:
+@@ -402,6 +490,12 @@ class EffortMemory:
+         self._novelty_digest = TDigest.from_dict(meta["novelty_digest"])
+         self._spread_digest = TDigest.from_dict(meta["spread_digest"])
+         self._probe_clock = int(meta.get("probe_clock", 0))
++        cal = meta.get("calibration")
++        if cal and len(cal) == CALIBRATION_BINS:
++            self._calibration = [_Calibration.from_dict(c) for c in cal]
++            self._calibration_all = _Calibration.from_dict(
++                meta.get("calibration_all", {})
++            )
+         if "level_digests" in meta:
+             self._est_digest = TDigest.from_dict(meta["est_digest"])
+             self._spend_digest = TDigest.from_dict(meta["spend_digest"])
+@@ -440,13 +534,14 @@ def decide_effort_level(
+     """The quantile map, low-resting (§13.5).
+ 
+     Low is the resting level; the memory has to earn anything above it. The
+-    estimate is the neighbours' within-level difficulty (0..1), so the cuts
+-    apply to it directly: at or above `q_high` the top level, at or above
+-    `q_mid` the middle one, otherwise low. A novel prompt - the nearest entry
+-    is farther than `novelty_gate_q` of what the server has seen - carries no
+-    evidence either way and gets `default_level`. A `probe` decision renders
+-    one level below the map's verdict, so every neighbourhood keeps receiving
+-    samples at the cheaper level and can be pulled down by them.
++    estimate is the neighbours' within-level difficulty (0..1), calibrated
++    against what requests at that novelty actually turned out to need, so the
++    cuts apply to it directly: at or above `q_high` the top level, at or
++    above `q_mid` the middle one, otherwise low. A prompt whose neighbours
++    have never predicted anything is pulled to the mean by the calibration,
++    not gated by a constant. A `probe` decision renders one level below the
++    map's verdict, so every neighbourhood keeps receiving samples at the
++    cheaper level and can be pulled down by them.
+ 
+     Args:
+         query: the kNN result, or `None` when the memory could not answer.
+@@ -462,8 +557,6 @@ def decide_effort_level(
+     estimate, nov_rank, spread_rank = ranks
+     if query is None or estimate is None:
+         return LevelDecision(default, "no-estimate", estimate, nov_rank, spread_rank)
+-    if nov_rank is not None and nov_rank > cfg.novelty_gate_q:
+-        return LevelDecision(default, "novel", estimate, nov_rank, spread_rank)
+     if estimate >= cfg.q_high:
+         level, reason = min(2, top_level), "q>=q_high"
+     elif estimate >= cfg.q_mid:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index f52f599e3d..9b6ad71a2d 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -72,7 +72,12 @@ from vllm.v1.core.sched.utils import (
+     check_stop,
+     remove_all,
+ )
+-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
++from vllm.v1.engine import (
++    EngineCoreEventType,
++    EngineCoreOutput,
++    EngineCoreOutputs,
++    RoutedPromptUpdate,
++)
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+@@ -2084,8 +2089,19 @@ class Scheduler(SchedulerInterface):
+                 vector = (
+                     effort_prefill_states.get(req_id) if effort_prefill_states else None
+                 )
+-                if self._resolve_effort_decision(request, vector):
++                routed_prompt_update = self._resolve_effort_decision(request, vector)
++                if routed_prompt_update is not None:
+                     effort_requeued.add(request)
++                    outputs[request.client_index].append(
++                        EngineCoreOutput(
++                            request_id=req_id,
++                            new_token_ids=[],
++                            routed_prompt_update=routed_prompt_update,
++                        )
++                    )
++                    # Anything this step sampled belongs to the rendering just
++                    # replaced (nothing, in the two-phase form).
++                    continue
+ 
+             req_index = model_runner_output.req_id_to_index[req_id]
+             generated_token_ids = (
+@@ -2777,8 +2793,8 @@ class Scheduler(SchedulerInterface):
+         self._effort_memory = memory
+         logger.info(
+             "dynamic_effort: hidden-state level routing ON%s - memory %s (%d/%d "
+-            "entries, min %d), k=%d, cuts q_mid=%.2f q_high=%.2f, downward "
+-            "gates novelty<=%.2f spread<=%.2f",
++            "entries, min %d), k=%d, cuts q_mid=%.2f q_high=%.2f, estimate "
++            "calibrated per novelty bin, probe every %d",
+             " (shadow)" if hidden.shadow else "",
+             "warm" if warmed else "cold",
+             memory.n_entries,
+@@ -2787,8 +2803,7 @@ class Scheduler(SchedulerInterface):
+             hidden.k,
+             hidden.q_mid,
+             hidden.q_high,
+-            hidden.novelty_gate_q,
+-            hidden.spread_gate_q,
++            hidden.probe_every,
+         )
+ 
+     def _maybe_add_effort_state(self, request: Request) -> None:
+@@ -2817,27 +2832,49 @@ class Scheduler(SchedulerInterface):
+                 and isinstance(body_len, int)
+                 and 0 < body_len < request.num_prompt_tokens
+             ):
+-                boundary = self._effort_body_boundary(request, body_len)
+-                if boundary and self._effort_split_worth_it(request, boundary):
+-                    assert request.prompt_token_ids is not None
+-                    # Tokens between the boundary and the frontend's seam are
+-                    # the same in every variant, so they ride at the head of
+-                    # every tail.
+-                    middle = list(request.prompt_token_ids[boundary:body_len])
++                if self.need_mamba_block_aligned_split:
++                    # Full-default form: a non-final chunk may only stop on a
++                    # cacheable block boundary here, which would put the vector
++                    # up to a block before the prompt's end - the newest message,
++                    # on an agent turn. So the whole default-level prompt
++                    # prefills as a final chunk, the vector is its true last
++                    # row, and a non-default decision resubmits the request
++                    # with the other tail; the prefix cache serves every full
++                    # block up to the seam.
++                    boundary = request.num_prompt_tokens
+                     request.effort_body_len = boundary
+-                    request.effort_tail_variants = [middle + list(t) for t in tails]
++                    request.effort_seam = body_len
++                    request.effort_tail_variants = [list(t) for t in tails]
+                     request.effort_hold_prefill = True
+                     request.effort_decision_pending = True
++                else:
++                    boundary = self._effort_body_boundary(request, body_len)
++                    if boundary and self._effort_split_worth_it(request, boundary):
++                        assert request.prompt_token_ids is not None
++                        # Tokens between the boundary and the frontend's seam
++                        # are the same in every variant, so they ride at the
++                        # head of every tail.
++                        middle = list(request.prompt_token_ids[boundary:body_len])
++                        request.effort_body_len = boundary
++                        request.effort_tail_variants = [
++                            middle + list(t) for t in tails
++                        ]
++                        request.effort_hold_prefill = True
++                        request.effort_decision_pending = True
+                 if self._effort_trace_budget > 0:
+                     logger.info(
+                         "dynamic_effort %s: seam at %d of %d prompt tokens, "
+-                        "boundary %d, tails %s -> %s",
++                        "body %d, tails %s -> %s",
+                         request.request_id,
+                         body_len,
+                         request.num_prompt_tokens,
+                         boundary,
+                         [len(t) for t in tails],
+-                        "two-phase" if request.effort_hold_prefill else "default level",
++                        "full-default"
++                        if request.effort_seam
++                        else "two-phase"
++                        if request.effort_hold_prefill
++                        else "default level",
+                     )
+         if not request.effort_decision_pending:
+             self._effort_level_total[state.level] = (
+@@ -2869,7 +2906,7 @@ class Scheduler(SchedulerInterface):
+ 
+     def _resolve_effort_decision(
+         self, request: Request, vector: "np.ndarray | None"
+-    ) -> bool:
++    ) -> RoutedPromptUpdate | None:
+         """Choose the effort level from the body's pooled prefill state.
+ 
+         The prompt already carries the default level's tail, so every failure
+@@ -2883,10 +2920,10 @@ class Scheduler(SchedulerInterface):
+             vector: the last body row, or `None` when there is none.
+ 
+         Returns:
+-            Whether the prompt changed and the request must be re-admitted.
++            A one-shot update when the prompt changed and must be re-admitted.
+         """
+         if not request.effort_decision_pending:
+-            return False
++            return None
+         request.effort_decision_pending = False
+         request.effort_hold_prefill = False
+         request.effort_decision_skips = 0
+@@ -2924,6 +2961,8 @@ class Scheduler(SchedulerInterface):
+                 )
+                 if state is not None:
+                     state.novelty = query.novelty
++                    state.novelty_rank = decision.novelty_rank
++                    state.estimate = query.estimate
+                     state.spread = query.spread
+                     state.neighbours = query.n_valued
+                     state.memory_entries = query.n_entries
+@@ -2955,11 +2994,57 @@ class Scheduler(SchedulerInterface):
+         if state is not None:
+             state.level = level
+         if level == default_level or not tails:
+-            return False
+-        self._apply_effort_tail(request, tails[level])
+-        return True
++            return None
++        if request.effort_seam:
++            return self._resubmit_effort_tail(request, tails[level])
++        return self._apply_effort_tail(
++            request=request,
++            tail=tails[level],
++        )
+ 
+-    def _apply_effort_tail(self, request: Request, tail: list[int]) -> None:
++    def _resubmit_effort_tail(
++        self, request: Request, tail: list[int]
++    ) -> RoutedPromptUpdate:
++        """Full-default form: splice the chosen tail at the seam and re-admit
++        the request as new.
++
++        The default-level prompt is fully prefilled and may already carry
++        this step's sampled token and drafts, all of which belong to the
++        default rendering and are dropped. The blocks are freed the way a
++        preemption frees them; the prefix cache hands back every full block
++        up to the seam, so only the sub-block tail is recomputed.
++        """
++        seam = request.effort_seam
++        prompt = request.prompt_token_ids
++        assert prompt is not None
++        del prompt[seam:]
++        prompt.extend(tail)
++        del request._all_token_ids[seam:]
++        request._all_token_ids.extend(tail)
++        request._output_token_ids.clear()
++        request.num_prompt_tokens = len(prompt)
++        del request.block_hashes[seam // self.hash_block_size :]
++        request.update_block_hashes()
++        request.max_tokens = min(
++            request.max_tokens, max(self.max_model_len - request.num_prompt_tokens, 1)
++        )
++        self._free_request_blocks(request)
++        self.encoder_cache_manager.free(request)
++        self._inflight_prefills.discard(request)
++        request.num_computed_tokens = 0
++        request.num_output_placeholders = 0
++        request.draft_stale = False
++        if request.spec_token_ids:
++            request.spec_token_ids = []
++        request.status = RequestStatus.WAITING
++        return RoutedPromptUpdate(
++            revision=1,
++            prompt_token_ids=list(prompt),
++        )
++
++    def _apply_effort_tail(
++        self, request: Request, tail: list[int]
++    ) -> RoutedPromptUpdate:
+         """Replace the default-level tail with the chosen one, in place.
+ 
+         Only positions at or after `effort_body_len` change, and nothing at or
+@@ -2980,6 +3065,10 @@ class Scheduler(SchedulerInterface):
+             request.max_tokens, max(self.max_model_len - request.num_prompt_tokens, 1)
+         )
+         request.status = RequestStatus.WAITING
++        return RoutedPromptUpdate(
++            revision=1,
++            prompt_token_ids=list(prompt),
++        )
+ 
+     def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
+         """Record a finished request in the memory (§13.4).
+@@ -3002,6 +3091,8 @@ class Scheduler(SchedulerInterface):
+             close_kind,
+             session_id=request.session_id,
+             level=state.level,
++            estimate=state.estimate if state.decided else None,
++            novelty_rank=state.novelty_rank,
+         )
+         if memory.n_entries and memory.n_entries % 64 == 0:
+             logger.info(
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+index c853a73a69..fcea5ec5ef 100644
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -186,6 +186,17 @@ class EngineCoreEvent(msgspec.Struct):
+         return cls(event_type, timestamp)
+ 
+ 
++class RoutedPromptUpdate(
++    msgspec.Struct,
++    array_like=True,  # type: ignore[call-arg]
++    gc=False,
++):  # type: ignore[call-arg]
++    """One-shot completion message for a core-routed prompt."""
++
++    revision: int
++    prompt_token_ids: list[int]
++
++
+ class EngineCoreOutput(
+     msgspec.Struct,
+     array_like=True,  # type: ignore[call-arg]
+@@ -227,6 +238,10 @@ class EngineCoreOutput(
+     #  "neighbours"}.
+     effort: dict[str, Any] | None = None
+ 
++    # A standalone core-side prompt-routing completion message. Appended last
++    # so `array_like` positional serialization stays backward compatible.
++    routed_prompt_update: RoutedPromptUpdate | None = None
++
+     @property
+     def finished(self) -> bool:
+         return self.finish_reason is not None
+@@ -289,6 +304,8 @@ class EngineCoreRequestType(enum.Enum):
+     EXECUTOR_FAILED = b"\x04"
+     # Sentinel to wake up input_queue.get() during shutdown.
+     WAKEUP = b"\x05"
++    # Typed internal event emitted by the signal boundary.
++    SHUTDOWN = b"\x06"
+ 
+ 
+ class ReconfigureDistributedRequest(msgspec.Struct):
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 09a3a42ec0..6d0f74d064 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -28,7 +28,12 @@ from vllm.tracing import (
+     instrument_manual,
+ )
+ from vllm.utils import length_from_prompt_token_ids_or_embeds
+-from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
++from vllm.v1.engine import (
++    EngineCoreOutput,
++    EngineCoreRequest,
++    FinishReason,
++    RoutedPromptUpdate,
++)
+ from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+ from vllm.v1.engine.logprobs import LogprobsProcessor
+ from vllm.v1.engine.parallel_sampling import ParentRequest
+@@ -172,6 +177,7 @@ class RequestState:
+         self.n = n
+         self.temperature = temperature
+         self.is_prefilling = True
++        self.routed_prompt_revision = 0
+         self.queue = queue
+         self.num_cached_tokens = 0
+         self.num_cache_creation_tokens = 0
+@@ -212,6 +218,37 @@ class RequestState:
+             self.stats.arrival_time = update.arrival_time
+         self.is_prefilling = True
+ 
++    def apply_routed_prompt(
++        self,
++        update: RoutedPromptUpdate,
++        tokenizer: TokenizerLike | None,
++    ) -> bool:
++        if update.revision == self.routed_prompt_revision:
++            if update.prompt_token_ids != self.prompt_token_ids:
++                raise ValueError(
++                    f"conflicting routed prompt revision {update.revision}"
++                )
++            return False
++        if update.revision != self.routed_prompt_revision + 1:
++            raise ValueError(
++                "routed prompt revisions must be contiguous: "
++                f"expected {self.routed_prompt_revision + 1}, "
++                f"got {update.revision}"
++            )
++        if not self.is_prefilling:
++            raise ValueError("routed prompt update arrived after prefill")
++        if self.detokenizer is not None and self.detokenizer.num_output_tokens() != 0:
++            raise ValueError("routed prompt update arrived after generation")
++
++        prompt_token_ids = update.prompt_token_ids
++        self.prompt_token_ids = list(prompt_token_ids)
++        self.prompt_len = len(prompt_token_ids)
++        self.prompt = None if tokenizer is None else tokenizer.decode(prompt_token_ids)
++        if self.detokenizer is not None:
++            self.detokenizer.update_prompt(prompt_token_ids)
++        self.routed_prompt_revision = update.revision
++        return True
++
+     @classmethod
+     def from_new_request(
+         cls,
+@@ -628,12 +665,22 @@ class OutputProcessor:
+         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
+         reqs_to_abort: list[str] = []
+         for engine_core_output in engine_core_outputs:
++            prompt_update = engine_core_output.routed_prompt_update
++            if prompt_update is not None:
++                self._validate_routed_prompt_output(engine_core_output)
+             req_id = engine_core_output.request_id
+             req_state = self.request_states.get(req_id)
+             if req_state is None:
+                 # Ignore output for already-aborted request.
+                 continue
+ 
++            if prompt_update is not None:
++                req_state.apply_routed_prompt(
++                    update=prompt_update,
++                    tokenizer=self.tokenizer,
++                )
++                continue
++
+             # 1) Compute stats for this iteration.
+             self._update_stats_from_output(
+                 req_state, engine_core_output, engine_core_timestamp, iteration_stats
+@@ -727,6 +774,29 @@ class OutputProcessor:
+             reqs_to_abort=reqs_to_abort,
+         )
+ 
++    @staticmethod
++    def _validate_routed_prompt_output(output: EngineCoreOutput) -> None:
++        ordinary_payload = (
++            bool(output.new_token_ids)
++            or output.new_logprobs is not None
++            or output.new_prompt_logprobs_tensors is not None
++            or output.pooling_output is not None
++            or output.finish_reason is not None
++            or output.stop_reason is not None
++            or output.events is not None
++            or output.kv_transfer_params is not None
++            or output.ec_transfer_params is not None
++            or output.trace_headers is not None
++            or output.prefill_stats is not None
++            or output.routed_experts is not None
++            or output.num_nans_in_logits != 0
++            or output.mm_cache_miss_hashes is not None
++            or output.new_sampling_mask is not None
++            or output.effort is not None
++        )
++        if ordinary_payload:
++            raise ValueError("routed prompt updates must be standalone outputs")
++
+     def _finish_request(self, req_state: RequestState) -> None:
+         req_id = req_state.request_id
+         self.request_states.pop(req_id)
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index a6755bbd91..934398753b 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -201,6 +201,9 @@ class Request:
+         # `prompt_token_ids` already carries the default-level tail, so a request whose
+         # decision never lands runs exactly as it did before v3.
+         self.effort_body_len = 0
++        # Full-default form: the whole default-level prompt is `effort_body_len`
++        # and the seam is where a non-default tail is spliced on resubmission.
++        self.effort_seam = 0
+         self.effort_tail_variants: list[list[int]] | None = None
+         self.effort_decision_pending = False
+         # True only for the two-phase form: the prefill stops at
