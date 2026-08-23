@@ -944,3 +944,111 @@ index 3f60f4f2c8..32ad61d84b 100644
  
      def _claim_slot(self, session_id: str | None) -> int:
          """FIFO ring, with a per-session cap that reuses the session's oldest."""
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index 51718748cf..101e0fb43b 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -59,9 +59,10 @@ class HiddenEffortConfig:
+     k: int = Field(default=16, ge=1)
+     """Neighbours the value estimate averages over."""
+     min_entries: int | None = Field(default=None, ge=1)
+-    """Entries the memory needs before it may decide. `None` means `k`: the
+-    memory decides as soon as it has a full neighbourhood to average, and the
+-    calibration pulls an unproven estimate toward the mean on its own. A cold
++    """Entries the memory needs before it may decide. `None` means 1: the
++    second request is already decided from the first, bluntly - small-lane
++    ranks are smoothed toward the middle and sharpen as the lanes fill - and
++    the calibration pulls an unproven estimate toward the mean. Only an empty
+     memory renders `default_level`."""
+     temperature: float = Field(default=0.05, gt=0.0)
+     """Softmax temperature on cosine similarity in the neighbour weights."""
+@@ -108,8 +109,6 @@ class HiddenEffortConfig:
+             raise ValueError("hidden_effort.q_high must be >= q_mid")
+         if self.k > self.memory_size:
+             raise ValueError("hidden_effort.k must not exceed memory_size")
+-        if self.min_entries is not None and self.min_entries < self.k:
+-            raise ValueError("hidden_effort.min_entries must be >= k")
+         if self.effort_sentences is not None and len(self.effort_sentences) < 2:
+             raise ValueError("hidden_effort.effort_sentences needs at least two levels")
+         if self.default_level >= len(self.sentences()):
+diff --git a/vllm/v1/core/sched/effort_memory.py b/vllm/v1/core/sched/effort_memory.py
+index 32ad61d84b..b989cc1461 100644
+--- a/vllm/v1/core/sched/effort_memory.py
++++ b/vllm/v1/core/sched/effort_memory.py
+@@ -202,7 +202,7 @@ class EffortMemory:
+     def ready(self) -> bool:
+         """The memory may decide an effort level."""
+         need = self.cfg.min_entries
+-        return self._n >= (int(self.cfg.k) if need is None else int(need))
++        return self._n >= (1 if need is None else int(need))
+ 
+     # --------------------------------------------------------------- insert
+ 
+@@ -266,14 +266,22 @@ class EffortMemory:
+         digest.add(log_spend)
+ 
+     def _difficulty(self, level: int, log_spend: float) -> float:
+-        """Spend ranked within its own level's lane; the global spend rank
+-        stands in until the lane has seen `k` natural closes."""
++        """Spend ranked within its own level's lane, smoothed for small lanes.
++
++        The rank carries a uniform prior worth one neighbourhood: with one
++        sample everything sits at the middle, and the rank sharpens as the
++        lane fills. The global spend distribution stands in for an empty
++        lane."""
++        k = float(self.cfg.k)
+         digest = self._level_digests.get(int(level))
+-        if digest is not None and digest.count >= self.cfg.k:
+-            rank = digest.rank(log_spend)
+-            if rank is not None:
+-                return rank
+-        return self._spend_digest.rank(log_spend) or 0.0
++        if digest is None or digest.count == 0:
++            digest = self._spend_digest
++        if digest.count == 0:
++            return 0.5
++        rank = digest.rank(log_spend)
++        if rank is None:
++            return 0.5
++        return (rank * digest.count + 0.5 * k) / (digest.count + k)
+ 
+     def take_probe(self) -> bool:
+         """Every `probe_every`-th call answers True (0 disables)."""
+@@ -311,10 +319,10 @@ class EffortMemory:
+         The memory already holds the evidence a fresh pair gives: what it
+         would predict for an entry it has, against what that entry spent. One
+         batched matmul yields ~k+1 pairs per insert instead of one."""
+-        k = int(self.cfg.k)
+         n = self._n
+-        if n <= k:
++        if n < 2:
+             return
++        k = min(int(self.cfg.k), n - 1)
+         sims_new = self._keys[:n] @ self._keys[slot]
+         sims_new[slot] = -np.inf
+         near = np.argpartition(-sims_new, k - 1)[:k]
+@@ -376,9 +384,9 @@ class EffortMemory:
+         also warms them during the cold phase, where the result is computed and
+         discarded.
+         """
+-        k = int(self.cfg.k)
+-        if self._n < max(k, 1):
++        if self._n < 1:
+             return None
++        k = min(int(self.cfg.k), self._n)
+         key = _unit(vec)
+         sims = self._keys[: self._n] @ key
+         top = np.argpartition(-sims, k - 1)[:k] if self._n > k else np.arange(self._n)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 2ce4dd56ca..c89ff3066b 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2799,7 +2799,7 @@ class Scheduler(SchedulerInterface):
+             "warm" if warmed else "cold",
+             memory.n_entries,
+             hidden.memory_size,
+-            hidden.min_entries if hidden.min_entries is not None else hidden.k,
++            hidden.min_entries if hidden.min_entries is not None else 1,
+             hidden.k,
+             hidden.q_mid,
+             hidden.q_high,
