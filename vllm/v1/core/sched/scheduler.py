@@ -3182,16 +3182,22 @@ class Scheduler(SchedulerInterface):
         """
         tokens = request.effort_meta_tokens
         done = stopped
+        truncated = False
         for tok in new_token_ids:
             if tok in request.effort_meta_stop_ids:
                 done = True
                 break
             tokens.append(int(tok))
             if len(tokens) >= request.effort_meta_max_tokens:
+                # Still running at the cap: the line is cut mid-sentence and
+                # would be worse than no guidance. Fall back to the default.
                 done = True
+                truncated = True
                 break
         if not done:
             return None
+        if truncated:
+            tokens.clear()
         request.effort_meta_phase = False
         if stopped:
             # check_stop marked the request finished; it is not.

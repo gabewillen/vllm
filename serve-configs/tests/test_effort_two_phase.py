@@ -705,3 +705,50 @@ def test_think_off_extends_the_prefilled_prompt_in_place():
     assert outs[0].outputs[0].routed_prompt_update.prompt_token_ids == prompt + OFF
     step = scheduler.schedule()
     assert step.num_scheduled_tokens["a"] == len(OFF)
+
+
+def test_truncated_guidance_falls_back_to_the_default_tail():
+    """A note still running at custom_max_tokens was cut mid-sentence; it is
+    dropped and the request runs at the default level."""
+    scheduler = _scheduler(q_mid=0.0, q_high=0.0)
+    _fill_memory(scheduler)
+    scheduler.need_mamba_block_aligned_split = True
+    params = SamplingParams(
+        max_tokens=60000,
+        extra_args={
+            "dynamic_effort": {
+                "default_level": 1,
+                "body_len": 90,
+                "tails": [TAILS[0], TAILS[1], [700, 701]],
+                "custom_level": 2,
+                "custom_suffix": [710],
+                "meta_tail": [900, 901],
+                "meta_stop_ids": [198],
+                "custom_max_tokens": 3,
+            }
+        },
+    )
+    request = Request(
+        request_id="a", prompt_token_ids=_prompt(7, TAILS[1]),
+        sampling_params=params, pooling_params=None, block_hasher=_block_hasher(),
+    )
+    scheduler.add_request(request)
+    prompt = list(request.prompt_token_ids)
+    for _ in range(8):
+        output = scheduler.schedule()
+        if output.effort_prefill_capture:
+            break
+        scheduler.update_from_output(output, _runner_output(output))
+    scheduler.update_from_output(
+        output,
+        _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}),
+    )
+    assert request.effort_meta_phase
+    step = scheduler.schedule()
+    outs = scheduler.update_from_output(
+        step, _runner_output(step, sampled={"a": [501, 502, 503, 504]})
+    )
+    upd = [o.routed_prompt_update for o in outs[0].outputs if o.routed_prompt_update]
+    assert upd and list(request.prompt_token_ids) == prompt[:90] + TAILS[1]
+    assert scheduler._effort["a"].level == 1
+    assert scheduler._effort["a"].custom_note_tokens == 0

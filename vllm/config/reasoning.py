@@ -31,8 +31,9 @@ CUSTOM_EFFORT_SENTENCE = "__custom__"
 thinking off before the real request runs."""
 
 CUSTOM_META_PROMPT = (
-    "Before answering, in one sentence say what a careful solver of the request "
-    "above must get right. Reply with that sentence only."
+    "Before answering, in one short sentence (at most 25 words) say what a "
+    "careful solver of the request above must get right. Reply with that "
+    "sentence only."
 )
 CUSTOM_TAIL_PREFIX = "Guidance for this task: "
 CUSTOM_TAIL_SUFFIX = " Decide your approach, verify it once, then answer."
@@ -139,8 +140,11 @@ class HiddenEffortConfig:
     matched the default's accuracy and thought 40-55% less on the hard
     prompts; the model's own 1-5 difficulty rating tracked realised thinking
     at Spearman 0.77."""
-    custom_max_tokens: int = Field(default=80, ge=8)
-    """Longest guidance line the custom level may generate."""
+    custom_max_tokens: int = Field(default=150, ge=8)
+    """Hard cap on the guidance line. A line still running at the cap was
+    truncated mid-sentence and is NOT spliced - the request falls back to the
+    default tail - so this is a backstop, not a target; the meta prompt asks
+    for one short sentence."""
 
     def __post_init__(self) -> None:
         if self.q_high < self.q_mid:
