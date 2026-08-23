@@ -2799,7 +2799,7 @@ class Scheduler(SchedulerInterface):
             "warm" if warmed else "cold",
             memory.n_entries,
             hidden.memory_size,
-            hidden.min_entries if hidden.min_entries is not None else hidden.k,
+            hidden.min_entries if hidden.min_entries is not None else 1,
             hidden.k,
             hidden.q_mid,
             hidden.q_high,

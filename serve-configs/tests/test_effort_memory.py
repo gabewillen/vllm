@@ -108,10 +108,16 @@ def test_query_matches_numpy_reference():
     best = sims[top[0]]
     weights = np.exp((sims[top] - best) / 0.05)
     weights /= weights.sum()
-    # Every entry went in at level 0: each value is its spend rank in that lane.
+    # Every entry went in at level 0: each value is its spend rank in that
+    # lane, smoothed toward the middle by a prior worth one neighbourhood.
     lane = memory._level_digests[0]
+    k = memory.cfg.k
     values = np.array(
-        [lane.rank(float(np.float32(math.log1p(int(t))))) for t in tokens[top]]
+        [
+            (lane.rank(float(np.float32(math.log1p(int(t))))) * lane.count + 0.5 * k)
+            / (lane.count + k)
+            for t in tokens[top]
+        ]
     )
     expected = float((weights * values).sum())
     expected_spread = float(math.sqrt((weights * (values - expected) ** 2).sum()))

@@ -59,9 +59,10 @@ class HiddenEffortConfig:
     k: int = Field(default=16, ge=1)
     """Neighbours the value estimate averages over."""
     min_entries: int | None = Field(default=None, ge=1)
-    """Entries the memory needs before it may decide. `None` means `k`: the
-    memory decides as soon as it has a full neighbourhood to average, and the
-    calibration pulls an unproven estimate toward the mean on its own. A cold
+    """Entries the memory needs before it may decide. `None` means 1: the
+    second request is already decided from the first, bluntly - small-lane
+    ranks are smoothed toward the middle and sharpen as the lanes fill - and
+    the calibration pulls an unproven estimate toward the mean. Only an empty
     memory renders `default_level`."""
     temperature: float = Field(default=0.05, gt=0.0)
     """Softmax temperature on cosine similarity in the neighbour weights."""
@@ -108,8 +109,6 @@ class HiddenEffortConfig:
             raise ValueError("hidden_effort.q_high must be >= q_mid")
         if self.k > self.memory_size:
             raise ValueError("hidden_effort.k must not exceed memory_size")
-        if self.min_entries is not None and self.min_entries < self.k:
-            raise ValueError("hidden_effort.min_entries must be >= k")
         if self.effort_sentences is not None and len(self.effort_sentences) < 2:
             raise ValueError("hidden_effort.effort_sentences needs at least two levels")
         if self.default_level >= len(self.sentences()):

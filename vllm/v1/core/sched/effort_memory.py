@@ -202,7 +202,7 @@ class EffortMemory:
     def ready(self) -> bool:
         """The memory may decide an effort level."""
         need = self.cfg.min_entries
-        return self._n >= (int(self.cfg.k) if need is None else int(need))
+        return self._n >= (1 if need is None else int(need))
 
     # --------------------------------------------------------------- insert
 
@@ -266,14 +266,22 @@ class EffortMemory:
         digest.add(log_spend)
 
     def _difficulty(self, level: int, log_spend: float) -> float:
-        """Spend ranked within its own level's lane; the global spend rank
-        stands in until the lane has seen `k` natural closes."""
+        """Spend ranked within its own level's lane, smoothed for small lanes.
+
+        The rank carries a uniform prior worth one neighbourhood: with one
+        sample everything sits at the middle, and the rank sharpens as the
+        lane fills. The global spend distribution stands in for an empty
+        lane."""
+        k = float(self.cfg.k)
         digest = self._level_digests.get(int(level))
-        if digest is not None and digest.count >= self.cfg.k:
-            rank = digest.rank(log_spend)
-            if rank is not None:
-                return rank
-        return self._spend_digest.rank(log_spend) or 0.0
+        if digest is None or digest.count == 0:
+            digest = self._spend_digest
+        if digest.count == 0:
+            return 0.5
+        rank = digest.rank(log_spend)
+        if rank is None:
+            return 0.5
+        return (rank * digest.count + 0.5 * k) / (digest.count + k)
 
     def take_probe(self) -> bool:
         """Every `probe_every`-th call answers True (0 disables)."""
@@ -311,10 +319,10 @@ class EffortMemory:
         The memory already holds the evidence a fresh pair gives: what it
         would predict for an entry it has, against what that entry spent. One
         batched matmul yields ~k+1 pairs per insert instead of one."""
-        k = int(self.cfg.k)
         n = self._n
-        if n <= k:
+        if n < 2:
             return
+        k = min(int(self.cfg.k), n - 1)
         sims_new = self._keys[:n] @ self._keys[slot]
         sims_new[slot] = -np.inf
         near = np.argpartition(-sims_new, k - 1)[:k]
@@ -376,9 +384,9 @@ class EffortMemory:
         also warms them during the cold phase, where the result is computed and
         discarded.
         """
-        k = int(self.cfg.k)
-        if self._n < max(k, 1):
+        if self._n < 1:
             return None
+        k = min(int(self.cfg.k), self._n)
         key = _unit(vec)
         sims = self._keys[: self._n] @ key
         top = np.argpartition(-sims, k - 1)[:k] if self._n > k else np.arange(self._n)
