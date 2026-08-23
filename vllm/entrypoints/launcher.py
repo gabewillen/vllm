@@ -11,7 +11,6 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
 from vllm import envs
 from vllm.engine.protocol import EngineClient
@@ -83,7 +82,33 @@ async def serve_http(
     if h11_max_header_count is None:
         h11_max_header_count = H11_MAX_HEADER_COUNT_DEFAULT
 
-    config = uvicorn.Config(app, **uvicorn_kwargs)
+    draining = {"on": False}
+
+    async def draining_guard(scope, receive, send):
+        # From the shutdown signal until the process exits, the engine client
+        # is being drained or is gone: a request reaching it now fails with a
+        # 500. Answer 503 + Retry-After so clients wait for the next process.
+        if scope["type"] == "http" and draining["on"]:
+            body = (
+                b'{"error": {"message": "server is draining for restart; retry '
+                b'shortly", "type": "server_error", "code": 503}}'
+            )
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 503,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                        (b"retry-after", b"5"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await app(scope, receive, send)
+
+    config = uvicorn.Config(draining_guard, **uvicorn_kwargs)
     # Set header limits
     config.h11_max_incomplete_event_size = h11_max_incomplete_event_size
     config.h11_max_header_count = h11_max_header_count
@@ -108,32 +133,11 @@ async def serve_http(
     )
 
     shutdown_event = asyncio.Event()
-    app.state.draining = False
-
-    @app.middleware("http")
-    async def reject_while_draining(request, call_next):
-        # From the shutdown signal until the process exits, the engine client
-        # is being drained or is gone: a request that reaches it now fails
-        # with a 500. Tell clients to retry on the next process instead.
-        if app.state.draining:
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": "server is draining for restart; retry shortly",
-                        "type": "server_error",
-                        "code": 503,
-                    }
-                },
-                status_code=503,
-                headers={"Retry-After": "5"},
-            )
-        return await call_next(request)
-
     def signal_handler() -> None:
         if shutdown_event.is_set():
             return
         logger.info_once("[shutdown] API server: shutdown triggered")
-        app.state.draining = True
+        draining["on"] = True
         shutdown_event.set()
 
     async def dummy_shutdown() -> None:
