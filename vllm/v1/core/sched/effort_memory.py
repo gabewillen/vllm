@@ -200,7 +200,8 @@ class EffortMemory:
     @property
     def ready(self) -> bool:
         """The memory may decide an effort level."""
-        return self._n >= self.cfg.min_entries
+        need = self.cfg.min_entries
+        return self._n >= (int(self.cfg.k) if need is None else int(need))
 
     # --------------------------------------------------------------- insert
 

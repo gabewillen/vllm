@@ -56,12 +56,13 @@ class HiddenEffortConfig:
     """Entries in the ring. 512 already reach the measured AUC of 2048, so
     4096 is headroom; it costs `memory_size * hidden_size * 4` bytes of host
     RAM (84 MB at 4096 x 5120) and half that on disk."""
-    min_entries: int = Field(default=128, ge=1)
-    """Entries the memory needs before it may decide. Below this the request
-    is rendered at `default_level`, and the query result - which is still
-    computed once there are `k` entries - only warms the digests."""
     k: int = Field(default=16, ge=1)
     """Neighbours the value estimate averages over."""
+    min_entries: int | None = Field(default=None, ge=1)
+    """Entries the memory needs before it may decide. `None` means `k`: the
+    memory decides as soon as it has a full neighbourhood to average, and the
+    calibration pulls an unproven estimate toward the mean on its own. A cold
+    memory renders `default_level`."""
     temperature: float = Field(default=0.05, gt=0.0)
     """Softmax temperature on cosine similarity in the neighbour weights."""
     q_mid: float = Field(default=0.35, ge=0.0, le=1.0)
@@ -107,6 +108,8 @@ class HiddenEffortConfig:
             raise ValueError("hidden_effort.q_high must be >= q_mid")
         if self.k > self.memory_size:
             raise ValueError("hidden_effort.k must not exceed memory_size")
+        if self.min_entries is not None and self.min_entries < self.k:
+            raise ValueError("hidden_effort.min_entries must be >= k")
         if self.effort_sentences is not None and len(self.effort_sentences) < 2:
             raise ValueError("hidden_effort.effort_sentences needs at least two levels")
         if self.default_level >= len(self.sentences()):

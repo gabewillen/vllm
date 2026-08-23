@@ -68,7 +68,7 @@ def test_ring_evicts_fifo_and_caps_one_session():
 
 
 def test_censored_closes_are_keys_not_values():
-    memory = _mem(k=5)
+    memory = _mem(k=5, min_entries=5)
     query_vec = _vec(1)
     # One natural close far away, three forced/soft closes right on top of the
     # query: the estimate must come from the natural close alone.
