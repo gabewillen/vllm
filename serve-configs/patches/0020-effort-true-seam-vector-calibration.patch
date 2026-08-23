@@ -798,3 +798,149 @@ index 9b6ad71a2d..2ce4dd56ca 100644
              hidden.k,
              hidden.q_mid,
              hidden.q_high,
+diff --git a/vllm/v1/core/sched/effort_memory.py b/vllm/v1/core/sched/effort_memory.py
+index 3f60f4f2c8..32ad61d84b 100644
+--- a/vllm/v1/core/sched/effort_memory.py
++++ b/vllm/v1/core/sched/effort_memory.py
+@@ -58,11 +58,14 @@ CALIBRATION_BINS = 8
+ 
+ 
+ class _Calibration:
+-    """Online least squares of realised difficulty on the kNN estimate.
+-
+-    One per novelty bin. `apply` maps an estimate to `a + b * estimate`; with
+-    no predictive value in the neighbours `b` goes to 0 and every estimate
+-    collapses to the mean realised difficulty, which for ranks is the middle.
++    """Bayesian least squares of realised difficulty on the kNN estimate.
++
++    One per novelty bin plus a pooled one. `fit` returns `(a, b)` for
++    `a + b * estimate` under a prior worth `weight` observations spread over
++    the unit interval at the parent's line: a bin shrinks toward the pooled
++    fit, the pooled fit toward the identity, and the first pair already moves
++    the posterior. With no predictive value in the neighbours `b` goes to 0
++    and every estimate collapses to the mean realised difficulty.
+     """
+ 
+     __slots__ = ("n", "sx", "sy", "sxx", "sxy")
+@@ -78,24 +81,22 @@ class _Calibration:
+         self.sxx += x * x
+         self.sxy += x * y
+ 
+-    def fit(self) -> tuple[float, float] | None:
+-        if self.n < 2:
+-            return None
+-        mx, my = self.sx / self.n, self.sy / self.n
+-        var = self.sxx / self.n - mx * mx
++    def fit(self, prior: tuple[float, float], weight: float) -> tuple[float, float]:
++        a0, b0 = prior
++        half = weight / 2.0
++        n = self.n + weight
++        sx = self.sx + half
++        sy = self.sy + half * a0 + half * (a0 + b0)
++        sxx = self.sxx + half
++        sxy = self.sxy + half * (a0 + b0)
++        mx, my = sx / n, sy / n
++        var = sxx / n - mx * mx
+         if var <= 1e-9:
+             return my, 0.0
+-        slope = (self.sxy / self.n - mx * my) / var
++        slope = (sxy / n - mx * my) / var
+         slope = min(max(slope, 0.0), 2.0)
+         return my - slope * mx, slope
+ 
+-    def apply(self, x: float) -> float:
+-        fit = self.fit()
+-        if fit is None:
+-            return x
+-        a, b = fit
+-        return min(max(a + b * x, 0.0), 1.0)
+-
+     def to_dict(self) -> dict[str, float]:
+         return {"n": self.n, "sx": self.sx, "sy": self.sy, "sxx": self.sxx, "sxy": self.sxy}
+ 
+@@ -244,11 +245,11 @@ class EffortMemory:
+         self._levels_used[slot] = np.int8(max(-128, min(127, level)))
+         if valued:
+             log_spend = float(self._values[slot])
+-            if estimate is not None and novelty_rank is not None:
++            if estimate is not None:
+                 realised = self._difficulty(int(level), log_spend)
+-                self._calibration[self._bin(novelty_rank)].add(estimate, realised)
+-                self._calibration_all.add(estimate, realised)
++                self._observe(estimate, novelty_rank, realised)
+             self._absorb_spend(int(level), log_spend)
++            self._loo_observe(slot)
+         if session_id is not None:
+             self._by_session.setdefault(session_id, deque()).append(slot)
+         self._inserts += 1
+@@ -289,16 +290,61 @@ class EffortMemory:
+     def calibrate(self, estimate: float, novelty_rank: float | None) -> float:
+         """Map a raw estimate through the calibration of its novelty bin.
+ 
+-        The bin must hold `k` closes before it speaks; until then the pooled
+-        fit stands in, and before that the estimate passes through."""
+-        k = int(self.cfg.k)
++        Hierarchical: the bin's posterior sits on the pooled posterior, which
++        sits on the identity; each prior is worth one neighbourhood (`k`)."""
++        k = float(self.cfg.k)
++        pooled = self._calibration_all.fit((0.0, 1.0), k)
++        line = pooled
++        if novelty_rank is not None:
++            line = self._calibration[self._bin(novelty_rank)].fit(pooled, k)
++        a, b = line
++        return min(max(a + b * estimate, 0.0), 1.0)
++
++    def _observe(self, estimate: float, novelty_rank: float | None, realised: float) -> None:
++        self._calibration_all.add(estimate, realised)
+         if novelty_rank is not None:
+-            cal = self._calibration[self._bin(novelty_rank)]
+-            if cal.n >= k:
+-                return cal.apply(estimate)
+-        if self._calibration_all.n >= k:
+-            return self._calibration_all.apply(estimate)
+-        return estimate
++            self._calibration[self._bin(novelty_rank)].add(estimate, realised)
++
++    def _loo_observe(self, slot: int) -> None:
++        """Leave-one-out estimates for `slot` and the neighbours it changed.
++
++        The memory already holds the evidence a fresh pair gives: what it
++        would predict for an entry it has, against what that entry spent. One
++        batched matmul yields ~k+1 pairs per insert instead of one."""
++        k = int(self.cfg.k)
++        n = self._n
++        if n <= k:
++            return
++        sims_new = self._keys[:n] @ self._keys[slot]
++        sims_new[slot] = -np.inf
++        near = np.argpartition(-sims_new, k - 1)[:k]
++        slots = [slot] + [int(i) for i in near if not math.isnan(self._values[i])]
++        sims = self._keys[slots] @ self._keys[:n].T
++        for row, s_ in enumerate(slots):
++            if math.isnan(self._values[s_]):
++                continue
++            sim = sims[row]
++            sim[s_] = -np.inf
++            top = np.argpartition(-sim, k - 1)[:k]
++            vals = self._values[top]
++            ok = ~np.isnan(vals)
++            if not ok.any():
++                continue
++            vs = sim[top][ok]
++            w = np.exp((vs - vs.max()) / max(self.cfg.temperature, 1e-6))
++            w /= w.sum()
++            diff = np.fromiter(
++                (
++                    self._difficulty(int(lv), float(r))
++                    for lv, r in zip(self._levels_used[top][ok], vals[ok])
++                ),
++                dtype=np.float64,
++                count=int(ok.sum()),
++            )
++            est = float((w * diff).sum())
++            novelty = (1.0 - float(sim[top].max())) / 2.0
++            realised = self._difficulty(int(self._levels_used[s_]), float(self._values[s_]))
++            self._observe(est, self._novelty_digest.rank(novelty), realised)
+ 
+     def _claim_slot(self, session_id: str | None) -> int:
+         """FIFO ring, with a per-session cap that reuses the session's oldest."""
