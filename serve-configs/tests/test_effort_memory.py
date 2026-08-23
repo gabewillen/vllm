@@ -439,3 +439,18 @@ def test_enabling_the_think_off_level_shifts_a_saved_memory(tmp_path):
     assert four.load()
     assert sorted(int(x) for x in four._levels_used[:3]) == [1, 2, 3]
     assert sorted(four._level_digests) == [1, 2, 3]
+
+
+def test_three_level_map_off_default_custom():
+    """off / default / custom: one level above the resting default, so only
+    `q_high` matters above it; `q_none` below; probes go down from custom
+    and up from off."""
+    cfg = _cfg(think_off_level=True, custom_level=True, q_none=0.3, q_high=0.6, default_level=1)
+    q = _query()
+    top = 2
+    assert decide_effort_level(q, (0.20, 0.1, 0.1), cfg, top).level == 0
+    assert decide_effort_level(q, (0.45, 0.1, 0.1), cfg, top).level == 1
+    assert decide_effort_level(q, (0.59, 0.1, 0.1), cfg, top).level == 1
+    assert decide_effort_level(q, (0.60, 0.1, 0.1), cfg, top).level == 2
+    assert decide_effort_level(q, (0.90, 0.1, 0.1), cfg, top, probe=True).level == 1
+    assert decide_effort_level(q, (0.20, 0.1, 0.1), cfg, top, probe=True).level == 1

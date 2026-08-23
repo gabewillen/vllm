@@ -205,6 +205,17 @@ class Request:
         # and the seam is where a non-default tail is spliced on resubmission.
         self.effort_seam = 0
         self.effort_tail_variants: list[list[int]] | None = None
+        # Custom level: the hidden meta generation and how its note is spliced.
+        self.effort_custom_level: int | None = None
+        self.effort_default_level = 0
+        self.effort_force_custom = False
+        self.effort_meta_tail: list[int] | None = None
+        self.effort_custom_suffix: list[int] = []
+        self.effort_meta_stop_ids: set[int] = set()
+        self.effort_meta_max_tokens = 0
+        self.effort_meta_phase = False
+        self.effort_meta_tokens: list[int] = []
+        self.effort_prompt_revision = 0
         self.effort_decision_pending = False
         # True only for the two-phase form: the prefill stops at
         # `effort_body_len` and the request is held until the level is chosen.

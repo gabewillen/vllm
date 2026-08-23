@@ -65,6 +65,8 @@ class EffortState:
     decided_difficulty: float | None = None
     """Calibrated estimate the level was chosen from; a think-off request is
     remembered with it."""
+    custom_note_tokens: int = 0
+    """Length of the generated guidance line (custom level)."""
     spread: float | None = None
     neighbours: int = 0
     memory_entries: int = 0
@@ -90,7 +92,9 @@ class EffortState:
             "memory_entries": self.memory_entries,
             "neighbours": self.neighbours,
             "estimate": self.estimate,
+            "calibrated": self.decided_difficulty,
             "novelty_rank": self.novelty_rank,
+            "custom_note_tokens": self.custom_note_tokens,
         }
 
 

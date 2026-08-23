@@ -275,7 +275,9 @@ def test_the_report_is_the_level_and_how_it_closed():
         "memory_entries": 4096,
         "neighbours": 16,
         "estimate": None,
+        "calibrated": None,
         "novelty_rank": None,
+        "custom_note_tokens": 0,
     }
     info = EffortInfo.from_report(report)
     assert info.level == 2 and info.decided and info.close_kind == CLOSE_NATURAL
@@ -368,3 +370,31 @@ def test_think_off_variant_renders_without_a_sentence():
     assert cfg.low_level == 1
     with pytest.raises(ValueError):
         HiddenEffortConfig(enabled=True, think_off_level=True, default_level=0)
+
+
+def test_custom_level_variants_carry_placeholders_and_the_meta_prompt():
+    from vllm.config.reasoning import (
+        CUSTOM_EFFORT_SENTENCE,
+        CUSTOM_META_PROMPT,
+        CUSTOM_TAIL_PREFIX,
+    )
+    from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+        CUSTOM_PLACEHOLDERS,
+        custom_aux_variants,
+        render_effort_variants,
+    )
+
+    cfg = HiddenEffortConfig(
+        enabled=True, think_off_level=True, custom_level=True, default_level=1
+    )
+    assert cfg.sentences() == [None, "", CUSTOM_EFFORT_SENTENCE]
+    assert cfg.low_level == 1
+    msgs = [{"role": "user", "content": "hi"}]
+    variants = render_effort_variants(msgs, cfg.sentences())
+    assert variants[0] == msgs and variants[1] == msgs
+    assert variants[2][-1]["content"].startswith(CUSTOM_TAIL_PREFIX + CUSTOM_PLACEHOLDERS[0])
+    second, meta = custom_aux_variants(msgs)
+    assert CUSTOM_PLACEHOLDERS[1] in second[-1]["content"]
+    assert meta[-1]["content"] == CUSTOM_META_PROMPT
+    with pytest.raises(ValueError):
+        HiddenEffortConfig(enabled=True, custom_level=True, default_level=1)

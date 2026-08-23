@@ -2176,6 +2176,20 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            if request.effort_meta_phase and not output_is_stale:
+                # Hidden guidance generation: keep the tokens, show none.
+                update = self._step_effort_meta(request, new_token_ids, stopped)
+                if update is not None:
+                    effort_requeued.add(request)
+                    outputs[request.client_index].append(
+                        EngineCoreOutput(
+                            request_id=req_id,
+                            new_token_ids=[],
+                            routed_prompt_update=update,
+                        )
+                    )
+                continue
+
             effort_state = self._effort.get(req_id) if self._effort else None
             if effort_state is not None and new_token_ids:
                 assert self._effort_cfg is not None
@@ -2847,6 +2861,24 @@ class Scheduler(SchedulerInterface):
                     request.effort_tail_variants = [list(t) for t in tails]
                     request.effort_hold_prefill = True
                     request.effort_decision_pending = True
+                    request.effort_default_level = state.level
+                    custom = overrides.get("custom_level")
+                    meta_tail = overrides.get("meta_tail")
+                    if isinstance(custom, int) and isinstance(meta_tail, list):
+                        request.effort_custom_level = custom
+                        request.effort_meta_tail = list(meta_tail)
+                        request.effort_custom_suffix = list(
+                            overrides.get("custom_suffix") or []
+                        )
+                        request.effort_meta_stop_ids = {
+                            int(i) for i in overrides.get("meta_stop_ids") or []
+                        }
+                        request.effort_meta_max_tokens = int(
+                            overrides.get("custom_max_tokens") or 80
+                        )
+                        request.effort_force_custom = bool(
+                            overrides.get("force_custom")
+                        )
                 else:
                     boundary = self._effort_body_boundary(request, body_len)
                     if boundary and self._effort_split_worth_it(request, boundary):
@@ -2943,7 +2975,15 @@ class Scheduler(SchedulerInterface):
                 "present" if vector is not None else "MISSING",
                 memory.n_entries if memory is not None else -1,
             )
-        if memory is not None and vector is not None:
+        if request.effort_force_custom and request.effort_custom_level is not None:
+            level, reason = request.effort_custom_level, "forced-custom"
+            if memory is not None and vector is not None:
+                self._effort_vectors[request.request_id] = np.asarray(
+                    vector, dtype=np.float32
+                )
+            if state is not None:
+                state.decided = True
+        elif memory is not None and vector is not None:
             self._effort_vectors[request.request_id] = np.asarray(
                 vector, dtype=np.float32
             )
@@ -2997,6 +3037,15 @@ class Scheduler(SchedulerInterface):
         if level == default_level or not tails:
             return None
         if request.effort_seam:
+            if (
+                level == request.effort_custom_level
+                and request.effort_meta_tail is not None
+            ):
+                # Custom level: first a hidden, thinking-off generation of the
+                # guidance line; the real tail is spliced when it stops.
+                request.effort_meta_phase = True
+                request.effort_meta_tokens = []
+                return self._resubmit_effort_tail(request, request.effort_meta_tail)
             return self._resubmit_effort_tail(request, tails[level])
         return self._apply_effort_tail(
             request=request,
@@ -3037,9 +3086,13 @@ class Scheduler(SchedulerInterface):
         request.draft_stale = False
         if request.spec_token_ids:
             request.spec_token_ids = []
+        # Any step still in flight computed the rendering just replaced.
+        request.drop_stale_output = True
+        request.num_stale_output_tokens = request.num_in_flight_tokens
         request.status = RequestStatus.WAITING
+        request.effort_prompt_revision += 1
         return RoutedPromptUpdate(
-            revision=1,
+            revision=request.effort_prompt_revision,
             prompt_token_ids=list(prompt),
         )
 
@@ -3070,6 +3123,52 @@ class Scheduler(SchedulerInterface):
             revision=1,
             prompt_token_ids=list(prompt),
         )
+
+    def _step_effort_meta(
+        self, request: Request, new_token_ids: list[int], stopped: bool
+    ) -> RoutedPromptUpdate | None:
+        """Collect the guidance line; when it ends, splice it into the custom
+        tail and resubmit the real request.
+
+        The line ends at a stop id (newline, end of turn, EOS), at
+        `custom_max_tokens`, or if the request itself stopped (a client cap
+        smaller than the line). An empty line falls back to the default tail.
+        """
+        tokens = request.effort_meta_tokens
+        done = stopped
+        for tok in new_token_ids:
+            if tok in request.effort_meta_stop_ids:
+                done = True
+                break
+            tokens.append(int(tok))
+            if len(tokens) >= request.effort_meta_max_tokens:
+                done = True
+                break
+        if not done:
+            return None
+        request.effort_meta_phase = False
+        if stopped:
+            # check_stop marked the request finished; it is not.
+            request.status = RequestStatus.RUNNING
+        tails = request.effort_tail_variants or []
+        custom = request.effort_custom_level
+        state = self._effort.get(request.request_id)
+        if tokens and custom is not None and custom < len(tails):
+            tail = list(tails[custom]) + tokens + list(request.effort_custom_suffix)
+        else:
+            default = request.effort_default_level
+            if state is not None:
+                state.level = default
+            tail = list(tails[default]) if default < len(tails) else []
+        if state is not None:
+            state.custom_note_tokens = len(tokens)
+        if self._effort_trace_budget > 0:
+            logger.info(
+                "dynamic_effort %s: custom guidance of %d tokens spliced",
+                request.request_id,
+                len(tokens),
+            )
+        return self._resubmit_effort_tail(request, tail)
 
     def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
         """Record a finished request in the memory (§13.4).

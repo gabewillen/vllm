@@ -25,6 +25,18 @@ QWEN_LOW_EFFORT_SENTENCE = (
     "moving directly to the conclusion without unnecessary elaboration."
 )
 
+CUSTOM_EFFORT_SENTENCE = "__custom__"
+"""Sentinel level: the tail is written by the model itself for this request
+(a one-line note on what a careful solver must get right), generated with
+thinking off before the real request runs."""
+
+CUSTOM_META_PROMPT = (
+    "Before answering, in one sentence say what a careful solver of the request "
+    "above must get right. Reply with that sentence only."
+)
+CUSTOM_TAIL_PREFIX = "Guidance for this task: "
+CUSTOM_TAIL_SUFFIX = " Decide your approach, verify it once, then answer."
+
 QWEN_XHIGH_EFFORT_SENTENCE = (
     "Reasoning effort is set to xhigh. Please think carefully through the task, "
     "validate key assumptions, consider plausible alternatives, and prioritize "
@@ -117,6 +129,18 @@ class HiddenEffortConfig:
     q_none: float = Field(default=0.15, ge=0.0, le=1.0)
     """Neighbour difficulty below which a request skips thinking entirely
     (only with `think_off_level`)."""
+    custom_level: bool = False
+    """Replace the static low/xhigh sentences with two levels: the model's
+    default (no sentence) and a *custom* level whose tail the model writes
+    itself. On a custom verdict the engine first generates, thinking off and
+    hidden from the client, one line on what a careful solver must get right
+    (`CUSTOM_META_PROMPT`, at most `custom_max_tokens`), then resubmits the
+    request with that line as its tail. Measured 2026-08-23: the guided run
+    matched the default's accuracy and thought 40-55% less on the hard
+    prompts; the model's own 1-5 difficulty rating tracked realised thinking
+    at Spearman 0.77."""
+    custom_max_tokens: int = Field(default=80, ge=8)
+    """Longest guidance line the custom level may generate."""
 
     def __post_init__(self) -> None:
         if self.q_high < self.q_mid:
@@ -125,10 +149,14 @@ class HiddenEffortConfig:
             raise ValueError("hidden_effort.k must not exceed memory_size")
         if self.effort_sentences is not None and len(self.effort_sentences) < 2:
             raise ValueError("hidden_effort.effort_sentences needs at least two levels")
+        if self.custom_level and self.effort_sentences is not None:
+            raise ValueError("hidden_effort.custom_level and effort_sentences conflict")
         if self.default_level >= len(self.sentences()):
             raise ValueError("hidden_effort.default_level is outside the levels")
         if self.think_off_level and self.default_level == 0:
             raise ValueError("hidden_effort.default_level may not be the think-off level")
+        if self.sentences()[self.default_level] == CUSTOM_EFFORT_SENTENCE:
+            raise ValueError("hidden_effort.default_level may not be the custom level")
         if self.think_off_level and self.q_none > self.q_mid:
             raise ValueError("hidden_effort.q_none must be <= q_mid")
 
@@ -137,6 +165,8 @@ class HiddenEffortConfig:
         think-off level: no sentence, `enable_thinking=false`."""
         if self.effort_sentences is not None:
             base: list[str | None] = list(self.effort_sentences)
+        elif self.custom_level:
+            base = ["", CUSTOM_EFFORT_SENTENCE]
         else:
             base = [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_XHIGH_EFFORT_SENTENCE]
         return ([None] if self.think_off_level else []) + base

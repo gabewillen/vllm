@@ -651,10 +651,13 @@ def decide_effort_level(
     if query is None or estimate is None:
         return LevelDecision(default, "no-estimate", estimate, nov_rank, spread_rank)
     low = cfg.low_level
-    if estimate >= cfg.q_high:
-        level, reason = min(low + 2, top_level), "q>=q_high"
-    elif estimate >= cfg.q_mid:
-        level, reason = min(low + 1, top_level), "q>=q_mid"
+    above = max(top_level - low, 0)
+    if above >= 2 and estimate >= cfg.q_high:
+        level, reason = low + 2, "q>=q_high"
+    elif above >= 2 and estimate >= cfg.q_mid:
+        level, reason = low + 1, "q>=q_mid"
+    elif above == 1 and estimate >= cfg.q_high:
+        level, reason = low + 1, "q>=q_high"
     elif cfg.think_off_level and estimate < cfg.q_none:
         level, reason = 0, "q<q_none"
     else:

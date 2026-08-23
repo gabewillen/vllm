@@ -29,6 +29,7 @@ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     DynamicEffortError,
     apply_default_effort,
     apply_dynamic_effort,
+    custom_aux_variants,
     split_body_and_tails,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -246,6 +247,9 @@ class OpenAIServingChat(GenerateBaseServing):
         if variants is None or request._dynamic_effort is None:
             return None
         think_off_levels = set(request._dynamic_effort.get("think_off_levels", ()))
+        custom_level = request._dynamic_effort.get("custom_level")
+        if custom_level is not None:
+            variants = list(variants) + custom_aux_variants(variants[custom_level][:-1])
         if len(engine_inputs) != 1:
             return None
         default_level = request._dynamic_effort["default_level"]
@@ -257,7 +261,8 @@ class OpenAIServingChat(GenerateBaseServing):
                 continue
             variant_request = copy(request)
             variant_request.messages = messages
-            if level in think_off_levels:
+            is_meta = custom_level is not None and level == len(variants) - 1
+            if level in think_off_levels or is_meta:
                 variant_request.chat_template_kwargs = {
                     **(request.chat_template_kwargs or {}),
                     "enable_thinking": False,
@@ -277,6 +282,36 @@ class OpenAIServingChat(GenerateBaseServing):
         if split is None:
             return None
         body_len, tails = split
+        if custom_level is not None:
+            # tails[-2] is the second placeholder rendering, tails[-1] the meta
+            # prompt. The custom tail's prefix/suffix are what the two
+            # placeholder renderings share; the engine splices the note in.
+            meta_tail = tails.pop()
+            second = tails.pop()
+            first = tails[custom_level]
+            lp = 0
+            while lp < min(len(first), len(second)) and first[lp] == second[lp]:
+                lp += 1
+            ls = 0
+            while (
+                ls < min(len(first), len(second)) - lp
+                and first[-1 - ls] == second[-1 - ls]
+            ):
+                ls += 1
+            tails[custom_level] = first[:lp]
+            request._dynamic_effort["custom_suffix"] = first[len(first) - ls :]
+            request._dynamic_effort["meta_tail"] = meta_tail
+            tokenizer = self.renderer.tokenizer
+            stop_ids: set[int] = set()
+            if tokenizer is not None:
+                for text in ("\n", "\n\n", ".\n"):
+                    ids = tokenizer.encode(text, add_special_tokens=False)
+                    if len(ids) == 1:
+                        stop_ids.add(int(ids[0]))
+                eos = getattr(tokenizer, "eos_token_id", None)
+                if eos is not None:
+                    stop_ids.add(int(eos))
+            request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
         request._dynamic_effort["body_len"] = body_len
         request._dynamic_effort["tails"] = tails
         return None

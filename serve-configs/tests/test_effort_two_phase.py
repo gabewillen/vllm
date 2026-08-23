@@ -581,3 +581,76 @@ def test_a_seam_far_from_the_prompt_tail_is_not_worth_a_split():
     _fill_memory(lenient)
     other = _add(lenient, "a", body_len=32)
     assert other.effort_hold_prefill and other.effort_body_len == 32
+
+
+def test_custom_level_generates_a_hidden_note_and_splices_it():
+    """A custom verdict resubmits with the meta tail, collects the generated
+    line without emitting it, then resubmits once more with the note spliced
+    between the custom tail's prefix and suffix (prompt revision 2)."""
+    scheduler = _scheduler(q_mid=0.0, q_high=0.0)  # everything routes to 2
+    _fill_memory(scheduler)
+    scheduler.need_mamba_block_aligned_split = True
+    seam = 90
+    META = [900, 901, 902]
+    PREFIX, SUFFIX = [700, 701], [710, 711, 712]
+    params = SamplingParams(
+        max_tokens=60000,
+        extra_args={
+            "dynamic_effort": {
+                "default_level": 1,
+                "body_len": seam,
+                "tails": [TAILS[0], TAILS[1], PREFIX],
+                "custom_level": 2,
+                "custom_suffix": SUFFIX,
+                "meta_tail": META,
+                "meta_stop_ids": [198],
+                "custom_max_tokens": 8,
+            }
+        },
+    )
+    request = Request(
+        request_id="a",
+        prompt_token_ids=_prompt(7, TAILS[1]),
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=_block_hasher(),
+    )
+    scheduler.add_request(request)
+    prompt = list(request.prompt_token_ids)
+    assert request.effort_custom_level == 2 and request.effort_meta_tail == META
+
+    while True:
+        output = scheduler.schedule()
+        if output.effort_prefill_capture:
+            break
+        scheduler.update_from_output(output, _runner_output(output))
+    outs = scheduler.update_from_output(
+        output,
+        _runner_output(
+            output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}
+        ),
+    )
+    # Resubmitted with the meta tail, hidden from the client.
+    upd = outs[0].outputs[0].routed_prompt_update
+    assert upd is not None and upd.revision == 1
+    assert list(request.prompt_token_ids) == prompt[:seam] + META
+    assert request.effort_meta_phase
+
+    # Prefill the meta prompt, then generate the note: two tokens, then newline.
+    step = scheduler.schedule()
+    outs = scheduler.update_from_output(step, _runner_output(step, sampled={"a": [501]}))
+    assert all(o.new_token_ids == [] for o in outs[0].outputs)  # nothing shown
+    step = scheduler.schedule()
+    outs = scheduler.update_from_output(step, _runner_output(step, sampled={"a": [502]}))
+    step = scheduler.schedule()
+    outs = scheduler.update_from_output(step, _runner_output(step, sampled={"a": [198]}))
+    upd = [o.routed_prompt_update for o in outs[0].outputs if o.routed_prompt_update]
+    assert upd and upd[0].revision == 2
+    assert list(request.prompt_token_ids) == prompt[:seam] + PREFIX + [501, 502] + SUFFIX
+    assert not request.effort_meta_phase
+    assert len(request.output_token_ids) == 0
+    assert scheduler._effort["a"].level == 2
+    assert scheduler._effort["a"].custom_note_tokens == 2
+    # And the real request prefills its new tail and runs.
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens["a"] > 0

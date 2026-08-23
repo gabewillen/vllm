@@ -186,11 +186,15 @@ reasoning-parser: qwen3
 # effort-telemetry.conf): per-step entropy/margin rows plus one `event: finish`
 # record with requested vs effective effort and this report
 # (level, decided, reasoning_tokens, close_kind, memory_entries, neighbours).
-# think_off_level: a fourth, bottom level that renders enable_thinking=false
-# (instant answer). q_none 0.30 measured 2026-08-23 on 460 replayed requests:
-# estimates < 0.30 (4%) thought 19 tokens median, 63 max; < 0.35 (the low
-# lane, 8%) 19 median, 116 max. Level indices shift: default_level 2 = medium.
-reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "think_off_level": true, "q_none": 0.30, "default_level": 2, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
+# Levels: off / default / custom (2026-08-23). off = enable_thinking=false
+# below q_none (0.30: replayed estimates under it thought 19 tokens median,
+# 63 max). default = no sentence; measured 14/14 on the hard grid at 816 tokens
+# - every static "think harder" wording was worse (12-13/14, 2x tokens, cap
+# runaways), so low/xhigh sentences are gone. custom (>= q_high) = the model
+# writes its own one-line guidance thinking-off (~0.8 s, 37 tokens), which
+# is spliced in as the tail: 22/24 on the grid, hard prompts 40-55% shorter.
+# default_level 1 = default; the memory was restarted cold for the new lanes.
+reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "think_off_level": true, "custom_level": true, "q_none": 0.30, "q_high": 0.60, "default_level": 1, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B
