@@ -1,0 +1,430 @@
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index 9f9a09ca50..80ad529289 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -25,6 +25,18 @@ QWEN_LOW_EFFORT_SENTENCE = (
+     "moving directly to the conclusion without unnecessary elaboration."
+ )
+ 
++CUSTOM_EFFORT_SENTENCE = "__custom__"
++"""Sentinel level: the tail is written by the model itself for this request
++(a one-line note on what a careful solver must get right), generated with
++thinking off before the real request runs."""
++
++CUSTOM_META_PROMPT = (
++    "Before answering, in one sentence say what a careful solver of the request "
++    "above must get right. Reply with that sentence only."
++)
++CUSTOM_TAIL_PREFIX = "Guidance for this task: "
++CUSTOM_TAIL_SUFFIX = " Decide your approach, verify it once, then answer."
++
+ QWEN_XHIGH_EFFORT_SENTENCE = (
+     "Reasoning effort is set to xhigh. Please think carefully through the task, "
+     "validate key assumptions, consider plausible alternatives, and prioritize "
+@@ -117,6 +129,18 @@ class HiddenEffortConfig:
+     q_none: float = Field(default=0.15, ge=0.0, le=1.0)
+     """Neighbour difficulty below which a request skips thinking entirely
+     (only with `think_off_level`)."""
++    custom_level: bool = False
++    """Replace the static low/xhigh sentences with two levels: the model's
++    default (no sentence) and a *custom* level whose tail the model writes
++    itself. On a custom verdict the engine first generates, thinking off and
++    hidden from the client, one line on what a careful solver must get right
++    (`CUSTOM_META_PROMPT`, at most `custom_max_tokens`), then resubmits the
++    request with that line as its tail. Measured 2026-08-23: the guided run
++    matched the default's accuracy and thought 40-55% less on the hard
++    prompts; the model's own 1-5 difficulty rating tracked realised thinking
++    at Spearman 0.77."""
++    custom_max_tokens: int = Field(default=80, ge=8)
++    """Longest guidance line the custom level may generate."""
+ 
+     def __post_init__(self) -> None:
+         if self.q_high < self.q_mid:
+@@ -125,10 +149,14 @@ class HiddenEffortConfig:
+             raise ValueError("hidden_effort.k must not exceed memory_size")
+         if self.effort_sentences is not None and len(self.effort_sentences) < 2:
+             raise ValueError("hidden_effort.effort_sentences needs at least two levels")
++        if self.custom_level and self.effort_sentences is not None:
++            raise ValueError("hidden_effort.custom_level and effort_sentences conflict")
+         if self.default_level >= len(self.sentences()):
+             raise ValueError("hidden_effort.default_level is outside the levels")
+         if self.think_off_level and self.default_level == 0:
+             raise ValueError("hidden_effort.default_level may not be the think-off level")
++        if self.sentences()[self.default_level] == CUSTOM_EFFORT_SENTENCE:
++            raise ValueError("hidden_effort.default_level may not be the custom level")
+         if self.think_off_level and self.q_none > self.q_mid:
+             raise ValueError("hidden_effort.q_none must be <= q_mid")
+ 
+@@ -137,6 +165,8 @@ class HiddenEffortConfig:
+         think-off level: no sentence, `enable_thinking=false`."""
+         if self.effort_sentences is not None:
+             base: list[str | None] = list(self.effort_sentences)
++        elif self.custom_level:
++            base = ["", CUSTOM_EFFORT_SENTENCE]
+         else:
+             base = [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_XHIGH_EFFORT_SENTENCE]
+         return ([None] if self.think_off_level else []) + base
+diff --git a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+index 7473c03be3..c0f92b3bb1 100644
+--- a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
++++ b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+@@ -21,7 +21,17 @@ is set: on this path the model ends its own think block.
+ import copy
+ from typing import TYPE_CHECKING, Any
+ 
+-from vllm.config.reasoning import DynamicEffortConfig
++from vllm.config.reasoning import (
++    CUSTOM_EFFORT_SENTENCE,
++    CUSTOM_META_PROMPT,
++    CUSTOM_TAIL_PREFIX,
++    CUSTOM_TAIL_SUFFIX,
++    DynamicEffortConfig,
++)
++
++CUSTOM_PLACEHOLDERS = ("QZQZQZ", "QZQZQZQZQZQZ")
++"""Two placeholder notes of different length; the custom tail's prefix and
++suffix token ids are the common prefix and suffix of their renderings."""
+ 
+ if TYPE_CHECKING:
+     from vllm.entrypoints.openai.chat_completion.protocol import (
+@@ -105,6 +115,12 @@ def apply_dynamic_effort(
+             "chat_template_kwargs.enable_thinking=false"
+         )
+     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
++    forced = overrides.get("forced_level")
++    if forced is not None and cfg.level_sentences[forced] == CUSTOM_EFFORT_SENTENCE:
++        # Custom needs the engine's meta pass: run the normal two-phase path
++        # and force the verdict there instead of rendering it as the default.
++        overrides["force_custom"] = True
++        del overrides["forced_level"]
+     default_level = overrides.get("forced_level", cfg.hidden_effort.default_level)
+     variants = render_effort_variants(request.messages, cfg.level_sentences)
+     request.messages = variants[default_level]
+@@ -113,6 +129,12 @@ def apply_dynamic_effort(
+     overrides["think_off_levels"] = [
+         i for i, sentence in enumerate(cfg.level_sentences) if sentence is None
+     ]
++    custom = [
++        i for i, sentence in enumerate(cfg.level_sentences)
++        if sentence == CUSTOM_EFFORT_SENTENCE
++    ]
++    overrides["custom_level"] = custom[0] if custom else None
++    overrides["custom_max_tokens"] = cfg.hidden_effort.custom_max_tokens
+     if default_level in overrides["think_off_levels"]:
+         request.chat_template_kwargs = {**kwargs, "enable_thinking": False}
+     request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
+@@ -129,11 +151,27 @@ def render_effort_variants(
+     variants: list[list[Any]] = []
+     for sentence in sentences:
+         rendered = copy.deepcopy(messages)
++        if sentence == CUSTOM_EFFORT_SENTENCE:
++            # The level's own rendering is the first placeholder; the engine
++            # splices the generated note between the tail's prefix and suffix.
++            sentence = CUSTOM_TAIL_PREFIX + CUSTOM_PLACEHOLDERS[0] + CUSTOM_TAIL_SUFFIX
+         append_to_last_message(rendered, sentence or "")
+         variants.append(rendered)
+     return variants
+ 
+ 
++def custom_aux_variants(messages: list[Any]) -> list[list[Any]]:
++    """The two extra renderings a custom level needs: the second placeholder
++    and the hidden meta prompt (rendered thinking-off)."""
++    second = copy.deepcopy(messages)
++    append_to_last_message(
++        second, CUSTOM_TAIL_PREFIX + CUSTOM_PLACEHOLDERS[1] + CUSTOM_TAIL_SUFFIX
++    )
++    meta = copy.deepcopy(messages)
++    append_to_last_message(meta, CUSTOM_META_PROMPT)
++    return [second, meta]
++
++
+ def split_body_and_tails(
+     variant_token_ids: list[list[int]],
+ ) -> tuple[int, list[list[int]]] | None:
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 2b53b26c11..eb3027d056 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -29,6 +29,7 @@ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+     DynamicEffortError,
+     apply_default_effort,
+     apply_dynamic_effort,
++    custom_aux_variants,
+     split_body_and_tails,
+ )
+ from vllm.entrypoints.openai.chat_completion.protocol import (
+@@ -246,6 +247,9 @@ class OpenAIServingChat(GenerateBaseServing):
+         if variants is None or request._dynamic_effort is None:
+             return None
+         think_off_levels = set(request._dynamic_effort.get("think_off_levels", ()))
++        custom_level = request._dynamic_effort.get("custom_level")
++        if custom_level is not None:
++            variants = list(variants) + custom_aux_variants(variants[custom_level][:-1])
+         if len(engine_inputs) != 1:
+             return None
+         default_level = request._dynamic_effort["default_level"]
+@@ -257,7 +261,8 @@ class OpenAIServingChat(GenerateBaseServing):
+                 continue
+             variant_request = copy(request)
+             variant_request.messages = messages
+-            if level in think_off_levels:
++            is_meta = custom_level is not None and level == len(variants) - 1
++            if level in think_off_levels or is_meta:
+                 variant_request.chat_template_kwargs = {
+                     **(request.chat_template_kwargs or {}),
+                     "enable_thinking": False,
+@@ -277,6 +282,36 @@ class OpenAIServingChat(GenerateBaseServing):
+         if split is None:
+             return None
+         body_len, tails = split
++        if custom_level is not None:
++            # tails[-2] is the second placeholder rendering, tails[-1] the meta
++            # prompt. The custom tail's prefix/suffix are what the two
++            # placeholder renderings share; the engine splices the note in.
++            meta_tail = tails.pop()
++            second = tails.pop()
++            first = tails[custom_level]
++            lp = 0
++            while lp < min(len(first), len(second)) and first[lp] == second[lp]:
++                lp += 1
++            ls = 0
++            while (
++                ls < min(len(first), len(second)) - lp
++                and first[-1 - ls] == second[-1 - ls]
++            ):
++                ls += 1
++            tails[custom_level] = first[:lp]
++            request._dynamic_effort["custom_suffix"] = first[len(first) - ls :]
++            request._dynamic_effort["meta_tail"] = meta_tail
++            tokenizer = self.renderer.tokenizer
++            stop_ids: set[int] = set()
++            if tokenizer is not None:
++                for text in ("\n", "\n\n", ".\n"):
++                    ids = tokenizer.encode(text, add_special_tokens=False)
++                    if len(ids) == 1:
++                        stop_ids.add(int(ids[0]))
++                eos = getattr(tokenizer, "eos_token_id", None)
++                if eos is not None:
++                    stop_ids.add(int(eos))
++            request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
+         request._dynamic_effort["body_len"] = body_len
+         request._dynamic_effort["tails"] = tails
+         return None
+diff --git a/vllm/v1/core/sched/effort_controller.py b/vllm/v1/core/sched/effort_controller.py
+index 1fe20bca76..69134e3791 100644
+--- a/vllm/v1/core/sched/effort_controller.py
++++ b/vllm/v1/core/sched/effort_controller.py
+@@ -65,6 +65,8 @@ class EffortState:
+     decided_difficulty: float | None = None
+     """Calibrated estimate the level was chosen from; a think-off request is
+     remembered with it."""
++    custom_note_tokens: int = 0
++    """Length of the generated guidance line (custom level)."""
+     spread: float | None = None
+     neighbours: int = 0
+     memory_entries: int = 0
+@@ -90,7 +92,9 @@ class EffortState:
+             "memory_entries": self.memory_entries,
+             "neighbours": self.neighbours,
+             "estimate": self.estimate,
++            "calibrated": self.decided_difficulty,
+             "novelty_rank": self.novelty_rank,
++            "custom_note_tokens": self.custom_note_tokens,
+         }
+ 
+ 
+diff --git a/vllm/v1/core/sched/effort_memory.py b/vllm/v1/core/sched/effort_memory.py
+index 366367a747..8ddab4566e 100644
+--- a/vllm/v1/core/sched/effort_memory.py
++++ b/vllm/v1/core/sched/effort_memory.py
+@@ -651,10 +651,13 @@ def decide_effort_level(
+     if query is None or estimate is None:
+         return LevelDecision(default, "no-estimate", estimate, nov_rank, spread_rank)
+     low = cfg.low_level
+-    if estimate >= cfg.q_high:
+-        level, reason = min(low + 2, top_level), "q>=q_high"
+-    elif estimate >= cfg.q_mid:
+-        level, reason = min(low + 1, top_level), "q>=q_mid"
++    above = max(top_level - low, 0)
++    if above >= 2 and estimate >= cfg.q_high:
++        level, reason = low + 2, "q>=q_high"
++    elif above >= 2 and estimate >= cfg.q_mid:
++        level, reason = low + 1, "q>=q_mid"
++    elif above == 1 and estimate >= cfg.q_high:
++        level, reason = low + 1, "q>=q_high"
+     elif cfg.think_off_level and estimate < cfg.q_none:
+         level, reason = 0, "q<q_none"
+     else:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index f8e8b3d353..bfbeb515e2 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2176,6 +2176,20 @@ class Scheduler(SchedulerInterface):
+                 request.status = RequestStatus.FINISHED_STOPPED
+                 stopped = True
+ 
++            if request.effort_meta_phase and not output_is_stale:
++                # Hidden guidance generation: keep the tokens, show none.
++                update = self._step_effort_meta(request, new_token_ids, stopped)
++                if update is not None:
++                    effort_requeued.add(request)
++                    outputs[request.client_index].append(
++                        EngineCoreOutput(
++                            request_id=req_id,
++                            new_token_ids=[],
++                            routed_prompt_update=update,
++                        )
++                    )
++                continue
++
+             effort_state = self._effort.get(req_id) if self._effort else None
+             if effort_state is not None and new_token_ids:
+                 assert self._effort_cfg is not None
+@@ -2847,6 +2861,24 @@ class Scheduler(SchedulerInterface):
+                     request.effort_tail_variants = [list(t) for t in tails]
+                     request.effort_hold_prefill = True
+                     request.effort_decision_pending = True
++                    request.effort_default_level = state.level
++                    custom = overrides.get("custom_level")
++                    meta_tail = overrides.get("meta_tail")
++                    if isinstance(custom, int) and isinstance(meta_tail, list):
++                        request.effort_custom_level = custom
++                        request.effort_meta_tail = list(meta_tail)
++                        request.effort_custom_suffix = list(
++                            overrides.get("custom_suffix") or []
++                        )
++                        request.effort_meta_stop_ids = {
++                            int(i) for i in overrides.get("meta_stop_ids") or []
++                        }
++                        request.effort_meta_max_tokens = int(
++                            overrides.get("custom_max_tokens") or 80
++                        )
++                        request.effort_force_custom = bool(
++                            overrides.get("force_custom")
++                        )
+                 else:
+                     boundary = self._effort_body_boundary(request, body_len)
+                     if boundary and self._effort_split_worth_it(request, boundary):
+@@ -2943,7 +2975,15 @@ class Scheduler(SchedulerInterface):
+                 "present" if vector is not None else "MISSING",
+                 memory.n_entries if memory is not None else -1,
+             )
+-        if memory is not None and vector is not None:
++        if request.effort_force_custom and request.effort_custom_level is not None:
++            level, reason = request.effort_custom_level, "forced-custom"
++            if memory is not None and vector is not None:
++                self._effort_vectors[request.request_id] = np.asarray(
++                    vector, dtype=np.float32
++                )
++            if state is not None:
++                state.decided = True
++        elif memory is not None and vector is not None:
+             self._effort_vectors[request.request_id] = np.asarray(
+                 vector, dtype=np.float32
+             )
+@@ -2997,6 +3037,15 @@ class Scheduler(SchedulerInterface):
+         if level == default_level or not tails:
+             return None
+         if request.effort_seam:
++            if (
++                level == request.effort_custom_level
++                and request.effort_meta_tail is not None
++            ):
++                # Custom level: first a hidden, thinking-off generation of the
++                # guidance line; the real tail is spliced when it stops.
++                request.effort_meta_phase = True
++                request.effort_meta_tokens = []
++                return self._resubmit_effort_tail(request, request.effort_meta_tail)
+             return self._resubmit_effort_tail(request, tails[level])
+         return self._apply_effort_tail(
+             request=request,
+@@ -3037,9 +3086,13 @@ class Scheduler(SchedulerInterface):
+         request.draft_stale = False
+         if request.spec_token_ids:
+             request.spec_token_ids = []
++        # Any step still in flight computed the rendering just replaced.
++        request.drop_stale_output = True
++        request.num_stale_output_tokens = request.num_in_flight_tokens
+         request.status = RequestStatus.WAITING
++        request.effort_prompt_revision += 1
+         return RoutedPromptUpdate(
+-            revision=1,
++            revision=request.effort_prompt_revision,
+             prompt_token_ids=list(prompt),
+         )
+ 
+@@ -3071,6 +3124,52 @@ class Scheduler(SchedulerInterface):
+             prompt_token_ids=list(prompt),
+         )
+ 
++    def _step_effort_meta(
++        self, request: Request, new_token_ids: list[int], stopped: bool
++    ) -> RoutedPromptUpdate | None:
++        """Collect the guidance line; when it ends, splice it into the custom
++        tail and resubmit the real request.
++
++        The line ends at a stop id (newline, end of turn, EOS), at
++        `custom_max_tokens`, or if the request itself stopped (a client cap
++        smaller than the line). An empty line falls back to the default tail.
++        """
++        tokens = request.effort_meta_tokens
++        done = stopped
++        for tok in new_token_ids:
++            if tok in request.effort_meta_stop_ids:
++                done = True
++                break
++            tokens.append(int(tok))
++            if len(tokens) >= request.effort_meta_max_tokens:
++                done = True
++                break
++        if not done:
++            return None
++        request.effort_meta_phase = False
++        if stopped:
++            # check_stop marked the request finished; it is not.
++            request.status = RequestStatus.RUNNING
++        tails = request.effort_tail_variants or []
++        custom = request.effort_custom_level
++        state = self._effort.get(request.request_id)
++        if tokens and custom is not None and custom < len(tails):
++            tail = list(tails[custom]) + tokens + list(request.effort_custom_suffix)
++        else:
++            default = request.effort_default_level
++            if state is not None:
++                state.level = default
++            tail = list(tails[default]) if default < len(tails) else []
++        if state is not None:
++            state.custom_note_tokens = len(tokens)
++        if self._effort_trace_budget > 0:
++            logger.info(
++                "dynamic_effort %s: custom guidance of %d tokens spliced",
++                request.request_id,
++                len(tokens),
++            )
++        return self._resubmit_effort_tail(request, tail)
++
+     def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
+         """Record a finished request in the memory (§13.4).
+ 
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 934398753b..aec6da5710 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -205,6 +205,17 @@ class Request:
+         # and the seam is where a non-default tail is spliced on resubmission.
+         self.effort_seam = 0
+         self.effort_tail_variants: list[list[int]] | None = None
++        # Custom level: the hidden meta generation and how its note is spliced.
++        self.effort_custom_level: int | None = None
++        self.effort_default_level = 0
++        self.effort_force_custom = False
++        self.effort_meta_tail: list[int] | None = None
++        self.effort_custom_suffix: list[int] = []
++        self.effort_meta_stop_ids: set[int] = set()
++        self.effort_meta_max_tokens = 0
++        self.effort_meta_phase = False
++        self.effort_meta_tokens: list[int] = []
++        self.effort_prompt_revision = 0
+         self.effort_decision_pending = False
+         # True only for the two-phase form: the prefill stops at
+         # `effort_body_len` and the request is held until the level is chosen.
