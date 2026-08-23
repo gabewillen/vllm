@@ -303,15 +303,25 @@ class OpenAIServingChat(GenerateBaseServing):
             request._dynamic_effort["meta_tail"] = meta_tail
             tokenizer = self.renderer.tokenizer
             stop_ids: set[int] = set()
+            end_ids: set[int] = set()
             if tokenizer is not None:
                 for text in ("\n", "\n\n", ".\n"):
                     ids = tokenizer.encode(text, add_special_tokens=False)
                     if len(ids) == 1:
                         stop_ids.add(int(ids[0]))
+                # Sentence enders stop the note *inclusively* once past a
+                # short floor: the ". " form of a sentence end, with the
+                # following space riding on the next token. The note is one
+                # sentence by construction instead of by request.
+                for text in (".", "!", "?"):
+                    ids = tokenizer.encode(text, add_special_tokens=False)
+                    if len(ids) == 1:
+                        end_ids.add(int(ids[0]))
                 eos = getattr(tokenizer, "eos_token_id", None)
                 if eos is not None:
                     stop_ids.add(int(eos))
             request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
+            request._dynamic_effort["meta_end_ids"] = sorted(end_ids)
         if think_off_levels:
             # Thinking off is the default rendering plus a closed think block:
             # appended in place, no resubmission (measured identical to the

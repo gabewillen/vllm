@@ -2876,6 +2876,9 @@ class Scheduler(SchedulerInterface):
                         request.effort_meta_stop_ids = {
                             int(i) for i in overrides.get("meta_stop_ids") or []
                         }
+                        request.effort_meta_end_ids = {
+                            int(i) for i in overrides.get("meta_end_ids") or []
+                        }
                         request.effort_meta_max_tokens = int(
                             overrides.get("custom_max_tokens") or 80
                         )
@@ -3188,6 +3191,10 @@ class Scheduler(SchedulerInterface):
                 done = True
                 break
             tokens.append(int(tok))
+            if tok in request.effort_meta_end_ids and len(tokens) >= 12:
+                # Sentence over: keep the full stop and stop.
+                done = True
+                break
             if len(tokens) >= request.effort_meta_max_tokens:
                 # Still running at the cap: the line is cut mid-sentence and
                 # would be worse than no guidance. Fall back to the default.

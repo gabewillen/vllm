@@ -752,3 +752,99 @@ def test_truncated_guidance_falls_back_to_the_default_tail():
     assert upd and list(request.prompt_token_ids) == prompt[:90] + TAILS[1]
     assert scheduler._effort["a"].level == 1
     assert scheduler._effort["a"].custom_note_tokens == 0
+
+
+def test_guidance_stops_at_the_sentence_end_inclusively():
+    scheduler = _scheduler(q_mid=0.0, q_high=0.0)
+    _fill_memory(scheduler)
+    scheduler.need_mamba_block_aligned_split = True
+    DOT = 13
+    params = SamplingParams(
+        max_tokens=60000,
+        extra_args={
+            "dynamic_effort": {
+                "default_level": 1,
+                "body_len": 90,
+                "tails": [TAILS[0], TAILS[1], [700]],
+                "custom_level": 2,
+                "custom_suffix": [710],
+                "meta_tail": [900],
+                "meta_stop_ids": [198],
+                "meta_end_ids": [DOT],
+                "custom_max_tokens": 150,
+            }
+        },
+    )
+    request = Request(
+        request_id="a", prompt_token_ids=_prompt(7, TAILS[1]),
+        sampling_params=params, pooling_params=None, block_hasher=_block_hasher(),
+    )
+    scheduler.add_request(request)
+    prompt = list(request.prompt_token_ids)
+    for _ in range(8):
+        output = scheduler.schedule()
+        if output.effort_prefill_capture:
+            break
+        scheduler.update_from_output(output, _runner_output(output))
+    scheduler.update_from_output(
+        output,
+        _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}),
+    )
+    # An early dot (below the 12-token floor) does not end the note.
+    note=[500+i for i in range(11)]
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _runner_output(step, sampled={"a": [note[0], DOT]+note[1:]}))
+    assert request.effort_meta_phase
+    step = scheduler.schedule()
+    outs = scheduler.update_from_output(step, _runner_output(step, sampled={"a": [DOT, 999]}))
+    assert not request.effort_meta_phase
+    spliced = request.prompt_token_ids[90:]
+    assert spliced[0] == 700 and spliced[-1] == 710
+    assert spliced[1:-1] == [note[0], DOT] + note[1:] + [DOT]  # ends at the dot, dot kept
+
+
+def test_guidance_ends_at_the_first_sentence_dot_past_the_floor():
+    scheduler = _scheduler(q_mid=0.0, q_high=0.0)
+    _fill_memory(scheduler)
+    scheduler.need_mamba_block_aligned_split = True
+    DOT = 13
+    params = SamplingParams(
+        max_tokens=60000,
+        extra_args={
+            "dynamic_effort": {
+                "default_level": 1,
+                "body_len": 90,
+                "tails": [TAILS[0], TAILS[1], [700]],
+                "custom_level": 2,
+                "custom_suffix": [710],
+                "meta_tail": [900],
+                "meta_stop_ids": [198],
+                "meta_end_ids": [DOT],
+                "custom_max_tokens": 150,
+            }
+        },
+    )
+    request = Request(
+        request_id="a", prompt_token_ids=_prompt(7, TAILS[1]),
+        sampling_params=params, pooling_params=None, block_hasher=_block_hasher(),
+    )
+    scheduler.add_request(request)
+    for _ in range(8):
+        output = scheduler.schedule()
+        if output.effort_prefill_capture:
+            break
+        scheduler.update_from_output(output, _runner_output(output))
+    scheduler.update_from_output(
+        output,
+        _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}),
+    )
+    # A dot below the 12-token floor (e.g. "v1.2") does not end the note.
+    early = [500, 501, DOT, 502, 503, 504, 505, 506, 507, 508]
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _runner_output(step, sampled={"a": early}))
+    assert request.effort_meta_phase
+    step = scheduler.schedule()
+    scheduler.update_from_output(step, _runner_output(step, sampled={"a": [509, 510, DOT, 999, 998]}))
+    assert not request.effort_meta_phase
+    spliced = request.prompt_token_ids[90:]
+    assert spliced == [700] + early + [509, 510, DOT] + [710]  # ends at the dot, dot kept

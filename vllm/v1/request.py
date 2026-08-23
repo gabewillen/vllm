@@ -213,6 +213,7 @@ class Request:
         self.effort_meta_tail: list[int] | None = None
         self.effort_custom_suffix: list[int] = []
         self.effort_meta_stop_ids: set[int] = set()
+        self.effort_meta_end_ids: set[int] = set()
         self.effort_meta_max_tokens = 0
         self.effort_meta_phase = False
         self.effort_meta_tokens: list[int] = []
