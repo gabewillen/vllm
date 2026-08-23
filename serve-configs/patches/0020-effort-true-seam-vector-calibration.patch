@@ -1052,3 +1052,367 @@ index 2ce4dd56ca..c89ff3066b 100644
              hidden.k,
              hidden.q_mid,
              hidden.q_high,
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index 101e0fb43b..9f9a09ca50 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -102,7 +102,21 @@ class HiddenEffortConfig:
+     across levels and one body per conversation is cached."""
+     default_level: int = Field(default=0, ge=0)
+     """Level a request gets when no decision can be made - a cold memory, a
+-    missing vector, a prompt with no usable seam. 0 is the `low` sentence."""
++    missing vector, a prompt with no usable seam. 0 is the `low` sentence,
++    or the think-off level when `think_off_level` is set (then 1 is `low`).
++    The default may not be the think-off level."""
++    think_off_level: bool = False
++    """Add a bottom level that renders the chat template's
++    `enable_thinking=false` - an instant answer with no think block. The
++    memory sends a request there when its neighbours' difficulty is below
++    `q_none`. A think-off request has no thinking length to rank, so its
++    memory entry carries the difficulty it was decided with: it keeps the
++    neighbourhood where it is and adds no confidence; the probe clock renders
++    every `probe_every`-th think-off verdict at `low` instead, and that
++    evidence is what can lift the neighbourhood back."""
++    q_none: float = Field(default=0.15, ge=0.0, le=1.0)
++    """Neighbour difficulty below which a request skips thinking entirely
++    (only with `think_off_level`)."""
+ 
+     def __post_init__(self) -> None:
+         if self.q_high < self.q_mid:
+@@ -113,12 +127,24 @@ class HiddenEffortConfig:
+             raise ValueError("hidden_effort.effort_sentences needs at least two levels")
+         if self.default_level >= len(self.sentences()):
+             raise ValueError("hidden_effort.default_level is outside the levels")
+-
+-    def sentences(self) -> list[str]:
+-        """The tail sentence of each effort level, lowest first."""
++        if self.think_off_level and self.default_level == 0:
++            raise ValueError("hidden_effort.default_level may not be the think-off level")
++        if self.think_off_level and self.q_none > self.q_mid:
++            raise ValueError("hidden_effort.q_none must be <= q_mid")
++
++    def sentences(self) -> list[str | None]:
++        """The tail sentence of each effort level, lowest first. `None` is the
++        think-off level: no sentence, `enable_thinking=false`."""
+         if self.effort_sentences is not None:
+-            return list(self.effort_sentences)
+-        return [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_XHIGH_EFFORT_SENTENCE]
++            base: list[str | None] = list(self.effort_sentences)
++        else:
++            base = [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_XHIGH_EFFORT_SENTENCE]
++        return ([None] if self.think_off_level else []) + base
++
++    @property
++    def low_level(self) -> int:
++        """Index of the resting `low` level."""
++        return 1 if self.think_off_level else 0
+ 
+ 
+ @config
+@@ -160,7 +186,7 @@ class DynamicEffortConfig:
+             )
+ 
+     @property
+-    def level_sentences(self) -> list[str]:
++    def level_sentences(self) -> list[str | None]:
+         return self.hidden_effort.sentences()
+ 
+     @property
+diff --git a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+index e3dd25f16a..7473c03be3 100644
+--- a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
++++ b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+@@ -110,18 +110,26 @@ def apply_dynamic_effort(
+     request.messages = variants[default_level]
+     request._dynamic_effort_variant_messages = variants
+     overrides["default_level"] = default_level
++    overrides["think_off_levels"] = [
++        i for i, sentence in enumerate(cfg.level_sentences) if sentence is None
++    ]
++    if default_level in overrides["think_off_levels"]:
++        request.chat_template_kwargs = {**kwargs, "enable_thinking": False}
+     request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
+     request._dynamic_effort = overrides
+ 
+ 
+ def render_effort_variants(
+-    messages: list[Any], sentences: list[str]
++    messages: list[Any], sentences: list[str | None]
+ ) -> list[list[Any]]:
+-    """One message list per level, each with that level's tail sentence."""
++    """One message list per level, each with that level's tail sentence.
++
++    A `None` sentence is the think-off level: the messages are untouched and
++    the variant is rendered with `enable_thinking=false` instead."""
+     variants: list[list[Any]] = []
+     for sentence in sentences:
+         rendered = copy.deepcopy(messages)
+-        append_to_last_message(rendered, sentence)
++        append_to_last_message(rendered, sentence or "")
+         variants.append(rendered)
+     return variants
+ 
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 4f4a305e2e..2b53b26c11 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -245,6 +245,7 @@ class OpenAIServingChat(GenerateBaseServing):
+         request._dynamic_effort_variant_messages = None
+         if variants is None or request._dynamic_effort is None:
+             return None
++        think_off_levels = set(request._dynamic_effort.get("think_off_levels", ()))
+         if len(engine_inputs) != 1:
+             return None
+         default_level = request._dynamic_effort["default_level"]
+@@ -256,6 +257,11 @@ class OpenAIServingChat(GenerateBaseServing):
+                 continue
+             variant_request = copy(request)
+             variant_request.messages = messages
++            if level in think_off_levels:
++                variant_request.chat_template_kwargs = {
++                    **(request.chat_template_kwargs or {}),
++                    "enable_thinking": False,
++                }
+             result = await self.render_chat_request(variant_request)
+             if isinstance(result, ErrorResponse):
+                 return result
+diff --git a/vllm/v1/core/sched/effort_controller.py b/vllm/v1/core/sched/effort_controller.py
+index 8924ce1261..1fe20bca76 100644
+--- a/vllm/v1/core/sched/effort_controller.py
++++ b/vllm/v1/core/sched/effort_controller.py
+@@ -62,6 +62,9 @@ class EffortState:
+     novelty_rank: float | None = None
+     estimate: float | None = None
+     """Raw kNN estimate the decision saw; calibrates the memory at finish."""
++    decided_difficulty: float | None = None
++    """Calibrated estimate the level was chosen from; a think-off request is
++    remembered with it."""
+     spread: float | None = None
+     neighbours: int = 0
+     memory_entries: int = 0
+diff --git a/vllm/v1/core/sched/effort_memory.py b/vllm/v1/core/sched/effort_memory.py
+index b989cc1461..366367a747 100644
+--- a/vllm/v1/core/sched/effort_memory.py
++++ b/vllm/v1/core/sched/effort_memory.py
+@@ -167,6 +167,7 @@ class EffortMemory:
+         self._values = np.full(size, np.nan, dtype=np.float32)
+         self._sessions: list[str | None] = [None] * size
+         self._levels_used = np.zeros(size, dtype=np.int8)
++        self._think_off = np.zeros(size, dtype=bool)
+         self._by_session: dict[str, deque[int]] = {}
+         self._next = 0
+         self._n = 0
+@@ -215,6 +216,7 @@ class EffortMemory:
+         level: int = 0,
+         estimate: float | None = None,
+         novelty_rank: float | None = None,
++        difficulty: float | None = None,
+     ) -> None:
+         """Record one finished request.
+ 
+@@ -228,6 +230,9 @@ class EffortMemory:
+             level: effort level the prefill decision chose.
+             estimate: the raw kNN estimate the decision saw, if any.
+             novelty_rank: the novelty rank the decision saw, if any.
++            difficulty: a think-off request has no thinking length; it is
++                stored with this difficulty (the one it was decided with)
++                and teaches the lanes and the calibration nothing.
+         """
+         key = _unit(vec)
+         if key.shape[0] != self.hidden_size:
+@@ -237,12 +242,18 @@ class EffortMemory:
+             )
+         slot = self._claim_slot(session_id)
+         self._keys[slot] = key
+-        valued = close_kind == CLOSE_NATURAL and reasoning_tokens is not None
+-        self._values[slot] = (
+-            math.log1p(max(int(reasoning_tokens or 0), 0)) if valued else np.nan
+-        )
+         self._sessions[slot] = session_id
+         self._levels_used[slot] = np.int8(max(-128, min(127, level)))
++        if difficulty is not None:
++            self._values[slot] = min(max(float(difficulty), 0.0), 1.0)
++            self._think_off[slot] = True
++            valued = False
++        else:
++            self._think_off[slot] = False
++            valued = close_kind == CLOSE_NATURAL and reasoning_tokens is not None
++            self._values[slot] = (
++                math.log1p(max(int(reasoning_tokens or 0), 0)) if valued else np.nan
++            )
+         if valued:
+             log_spend = float(self._values[slot])
+             if estimate is not None:
+@@ -265,6 +276,13 @@ class EffortMemory:
+             )
+         digest.add(log_spend)
+ 
++    def _entry_difficulty(self, slot: int) -> float:
++        """Difficulty of a valued entry: its stored difficulty for a think-off
++        entry, its smoothed within-lane spend rank otherwise."""
++        if self._think_off[slot]:
++            return float(self._values[slot])
++        return self._difficulty(int(self._levels_used[slot]), float(self._values[slot]))
++
+     def _difficulty(self, level: int, log_spend: float) -> float:
+         """Spend ranked within its own level's lane, smoothed for small lanes.
+ 
+@@ -329,7 +347,7 @@ class EffortMemory:
+         slots = [slot] + [int(i) for i in near if not math.isnan(self._values[i])]
+         sims = self._keys[slots] @ self._keys[:n].T
+         for row, s_ in enumerate(slots):
+-            if math.isnan(self._values[s_]):
++            if math.isnan(self._values[s_]) or self._think_off[s_]:
+                 continue
+             sim = sims[row]
+             sim[s_] = -np.inf
+@@ -342,10 +360,7 @@ class EffortMemory:
+             w = np.exp((vs - vs.max()) / max(self.cfg.temperature, 1e-6))
+             w /= w.sum()
+             diff = np.fromiter(
+-                (
+-                    self._difficulty(int(lv), float(r))
+-                    for lv, r in zip(self._levels_used[top][ok], vals[ok])
+-                ),
++                (self._entry_difficulty(int(t)) for t in top[ok]),
+                 dtype=np.float64,
+                 count=int(ok.sum()),
+             )
+@@ -407,10 +422,8 @@ class EffortMemory:
+                 (valued_sims - valued_sims.max()) / max(self.cfg.temperature, 1e-6)
+             )
+             w = w / w.sum()
+-            raw = values[valued].astype(np.float64)
+-            lvls = self._levels_used[top][valued]
+             vals = np.fromiter(
+-                (self._difficulty(int(lv), float(r)) for lv, r in zip(lvls, raw)),
++                (self._entry_difficulty(int(s_)) for s_ in top[valued]),
+                 dtype=np.float64,
+                 count=int(valued.sum()),
+             )
+@@ -471,6 +484,7 @@ class EffortMemory:
+                 for level, digest in self._level_digests.items()
+             },
+             "probe_clock": self._probe_clock,
++            "think_off": [int(i) for i in np.flatnonzero(self._think_off[: self._n])],
+             "calibration": [c.to_dict() for c in self._calibration],
+             "calibration_all": self._calibration_all.to_dict(),
+         }
+@@ -514,11 +528,24 @@ class EffortMemory:
+             return False
+         with np.load(path, allow_pickle=False) as data:
+             meta = json.loads(bytes(data["meta"]).decode())
++            # A file written before the think-off level was enabled has one
++            # level fewer; its levels shift up by one on load.
++            level_shift = (
++                1
++                if self.cfg.think_off_level
++                and self.levels
++                and meta.get("levels") == self.levels - 1
++                else 0
++            )
+             if (
+                 meta.get("version") != MEMORY_VERSION
+                 or meta.get("hidden_size") != self.hidden_size
+                 or (self.model and meta.get("model") not in ("", self.model))
+-                or (self.levels and meta.get("levels") != self.levels)
++                or (
++                    self.levels
++                    and meta.get("levels") != self.levels
++                    and not level_shift
++                )
+             ):
+                 logger.warning(
+                     "dynamic_effort: dropping %s (model/dim/levels/version "
+@@ -531,7 +558,7 @@ class EffortMemory:
+             n = min(keys.shape[0], self._keys.shape[0])
+             self._keys[:n] = keys[:n]
+             self._values[:n] = data["values"][:n]
+-            self._levels_used[:n] = data["levels_used"][:n]
++            self._levels_used[:n] = data["levels_used"][:n] + level_shift
+         sessions = list(meta.get("sessions") or [])[:n]
+         sessions += [None] * (n - len(sessions))
+         self._sessions[:n] = sessions
+@@ -545,6 +572,10 @@ class EffortMemory:
+         self._novelty_digest = TDigest.from_dict(meta["novelty_digest"])
+         self._spread_digest = TDigest.from_dict(meta["spread_digest"])
+         self._probe_clock = int(meta.get("probe_clock", 0))
++        self._think_off[:] = False
++        for i in meta.get("think_off", []):
++            if 0 <= int(i) < n:
++                self._think_off[int(i)] = True
+         cal = meta.get("calibration")
+         if cal and len(cal) == CALIBRATION_BINS:
+             self._calibration = [_Calibration.from_dict(c) for c in cal]
+@@ -555,9 +586,16 @@ class EffortMemory:
+             self._est_digest = TDigest.from_dict(meta["est_digest"])
+             self._spend_digest = TDigest.from_dict(meta["spend_digest"])
+             self._level_digests = {
+-                int(level): TDigest.from_dict(d)
++                int(level) + level_shift: TDigest.from_dict(d)
+                 for level, d in meta["level_digests"].items()
+             }
++            if level_shift:
++                logger.info(
++                    "dynamic_effort: %s written with %d levels; shifted up for "
++                    "the think-off level",
++                    path,
++                    meta.get("levels"),
++                )
+         else:
+             # A file written when the estimate was raw spend: rebuild the
+             # lanes from the stored spend + level and restart the estimate
+@@ -612,12 +650,17 @@ def decide_effort_level(
+     estimate, nov_rank, spread_rank = ranks
+     if query is None or estimate is None:
+         return LevelDecision(default, "no-estimate", estimate, nov_rank, spread_rank)
++    low = cfg.low_level
+     if estimate >= cfg.q_high:
+-        level, reason = min(2, top_level), "q>=q_high"
++        level, reason = min(low + 2, top_level), "q>=q_high"
+     elif estimate >= cfg.q_mid:
+-        level, reason = min(1, top_level), "q>=q_mid"
++        level, reason = min(low + 1, top_level), "q>=q_mid"
++    elif cfg.think_off_level and estimate < cfg.q_none:
++        level, reason = 0, "q<q_none"
+     else:
+-        level, reason = 0, "low"
+-    if probe and level > 0:
++        level, reason = low, "low"
++    if probe and level > low:
+         level, reason = level - 1, f"probe/{reason}"
++    elif probe and level < low:
++        level, reason = low, f"probe/{reason}"
+     return LevelDecision(level, reason, estimate, nov_rank, spread_rank)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c89ff3066b..f8e8b3d353 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2963,6 +2963,7 @@ class Scheduler(SchedulerInterface):
+                     state.novelty = query.novelty
+                     state.novelty_rank = decision.novelty_rank
+                     state.estimate = query.estimate
++                    state.decided_difficulty = decision.estimate_rank
+                     state.spread = query.spread
+                     state.neighbours = query.n_valued
+                     state.memory_entries = query.n_entries
+@@ -3085,14 +3086,18 @@ class Scheduler(SchedulerInterface):
+             # An abort or a max_tokens cap truncates the thinking, so the
+             # length the request would have spent is unknown.
+             close_kind = CLOSE_CLIENT_LIMIT
++        think_off = (
++            memory.cfg.think_off_level and state.level == 0 and state.decided
++        )
+         memory.insert(
+             vector,
+             state.reasoning_tokens,
+             close_kind,
+             session_id=request.session_id,
+             level=state.level,
+-            estimate=state.estimate if state.decided else None,
++            estimate=None if think_off else (state.estimate if state.decided else None),
+             novelty_rank=state.novelty_rank,
++            difficulty=state.decided_difficulty if think_off else None,
+         )
+         if memory.n_entries and memory.n_entries % 64 == 0:
+             logger.info(
