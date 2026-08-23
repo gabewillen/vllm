@@ -714,3 +714,70 @@ index 59238c6920..c37efe7a0b 100644
          request.effort_meta_phase = False
          if stopped:
              # check_stop marked the request finished; it is not.
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 95c2f210bd..5f70cf125c 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -303,15 +303,25 @@ class OpenAIServingChat(GenerateBaseServing):
+             request._dynamic_effort["meta_tail"] = meta_tail
+             tokenizer = self.renderer.tokenizer
+             stop_ids: set[int] = set()
++            end_ids: set[int] = set()
+             if tokenizer is not None:
+                 for text in ("\n", "\n\n", ".\n"):
+                     ids = tokenizer.encode(text, add_special_tokens=False)
+                     if len(ids) == 1:
+                         stop_ids.add(int(ids[0]))
++                # Sentence enders stop the note *inclusively* once past a
++                # short floor: the ". " form of a sentence end, with the
++                # following space riding on the next token. The note is one
++                # sentence by construction instead of by request.
++                for text in (".", "!", "?"):
++                    ids = tokenizer.encode(text, add_special_tokens=False)
++                    if len(ids) == 1:
++                        end_ids.add(int(ids[0]))
+                 eos = getattr(tokenizer, "eos_token_id", None)
+                 if eos is not None:
+                     stop_ids.add(int(eos))
+             request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
++            request._dynamic_effort["meta_end_ids"] = sorted(end_ids)
+         if think_off_levels:
+             # Thinking off is the default rendering plus a closed think block:
+             # appended in place, no resubmission (measured identical to the
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c37efe7a0b..73918a4d10 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2876,6 +2876,9 @@ class Scheduler(SchedulerInterface):
+                         request.effort_meta_stop_ids = {
+                             int(i) for i in overrides.get("meta_stop_ids") or []
+                         }
++                        request.effort_meta_end_ids = {
++                            int(i) for i in overrides.get("meta_end_ids") or []
++                        }
+                         request.effort_meta_max_tokens = int(
+                             overrides.get("custom_max_tokens") or 80
+                         )
+@@ -3188,6 +3191,10 @@ class Scheduler(SchedulerInterface):
+                 done = True
+                 break
+             tokens.append(int(tok))
++            if tok in request.effort_meta_end_ids and len(tokens) >= 12:
++                # Sentence over: keep the full stop and stop.
++                done = True
++                break
+             if len(tokens) >= request.effort_meta_max_tokens:
+                 # Still running at the cap: the line is cut mid-sentence and
+                 # would be worse than no guidance. Fall back to the default.
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 2d8968ea29..3dbbfced59 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -213,6 +213,7 @@ class Request:
+         self.effort_meta_tail: list[int] | None = None
+         self.effort_custom_suffix: list[int] = []
+         self.effort_meta_stop_ids: set[int] = set()
++        self.effort_meta_end_ids: set[int] = set()
+         self.effort_meta_max_tokens = 0
+         self.effort_meta_phase = False
+         self.effort_meta_tokens: list[int] = []
