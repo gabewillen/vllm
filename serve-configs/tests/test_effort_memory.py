@@ -353,3 +353,22 @@ def test_ranks_are_streaming_and_absorb_the_observation():
     assert est == 0.2 and nov == 1.0 and spread == 1.0
     below = _query(estimate=0.0, novelty=0.0, spread=0.0)
     assert memory.ranks(below) == (0.0, 0.0, 0.0)
+
+
+def test_calibration_learns_from_the_first_pair_and_from_the_memory_itself():
+    """No warm-up gate: one observed pair already moves the posterior, and each
+    insert also yields leave-one-out pairs for the entry and its neighbours,
+    so the calibration fills in ~k times faster than one pair per request."""
+    memory, cfg = _calibration_memory()
+    before = memory._calibration_all.n
+    rng = np.random.default_rng(3)
+    memory.insert(rng.standard_normal(8), 300, "natural", level=1,
+                  estimate=0.9, novelty_rank=0.3)
+    assert memory._calibration_all.n - before > 1  # live pair + LOO pairs
+    # Two wildly wrong pairs at one novelty already pull that bin's line
+    # toward the mean, while leaving it above the identity-anchored pooled fit.
+    identity = memory.calibrate(0.95, None)
+    for est, tokens in ((0.95, 2), (0.9, 3)):
+        memory.insert(rng.standard_normal(8), tokens, "natural", level=1,
+                      estimate=est, novelty_rank=0.95)
+    assert memory.calibrate(0.95, 0.95) < identity
