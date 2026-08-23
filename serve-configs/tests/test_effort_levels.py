@@ -351,3 +351,20 @@ def test_the_default_effort_knob_is_validated():
             DynamicEffortConfig(default_effort=bad)
     assert DynamicEffortConfig(default_effort="low").default_effort == "low"
     assert DynamicEffortConfig().default_effort is None
+
+
+def test_think_off_variant_renders_without_a_sentence():
+    from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+        render_effort_variants,
+    )
+
+    cfg = HiddenEffortConfig(enabled=True, think_off_level=True, default_level=2)
+    sentences = cfg.sentences()
+    assert sentences[0] is None and sentences[2] == ""
+    msgs = [{"role": "user", "content": "hi"}]
+    variants = render_effort_variants(msgs, sentences)
+    assert variants[0] == msgs and variants[2] == msgs
+    assert variants[1][-1]["content"].startswith("Reasoning effort is set to low")
+    assert cfg.low_level == 1
+    with pytest.raises(ValueError):
+        HiddenEffortConfig(enabled=True, think_off_level=True, default_level=0)

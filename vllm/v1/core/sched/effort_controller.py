@@ -62,6 +62,9 @@ class EffortState:
     novelty_rank: float | None = None
     estimate: float | None = None
     """Raw kNN estimate the decision saw; calibrates the memory at finish."""
+    decided_difficulty: float | None = None
+    """Calibrated estimate the level was chosen from; a think-off request is
+    remembered with it."""
     spread: float | None = None
     neighbours: int = 0
     memory_entries: int = 0

@@ -110,18 +110,26 @@ def apply_dynamic_effort(
     request.messages = variants[default_level]
     request._dynamic_effort_variant_messages = variants
     overrides["default_level"] = default_level
+    overrides["think_off_levels"] = [
+        i for i, sentence in enumerate(cfg.level_sentences) if sentence is None
+    ]
+    if default_level in overrides["think_off_levels"]:
+        request.chat_template_kwargs = {**kwargs, "enable_thinking": False}
     request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
     request._dynamic_effort = overrides
 
 
 def render_effort_variants(
-    messages: list[Any], sentences: list[str]
+    messages: list[Any], sentences: list[str | None]
 ) -> list[list[Any]]:
-    """One message list per level, each with that level's tail sentence."""
+    """One message list per level, each with that level's tail sentence.
+
+    A `None` sentence is the think-off level: the messages are untouched and
+    the variant is rendered with `enable_thinking=false` instead."""
     variants: list[list[Any]] = []
     for sentence in sentences:
         rendered = copy.deepcopy(messages)
-        append_to_last_message(rendered, sentence)
+        append_to_last_message(rendered, sentence or "")
         variants.append(rendered)
     return variants
 

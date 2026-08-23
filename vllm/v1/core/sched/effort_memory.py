@@ -167,6 +167,7 @@ class EffortMemory:
         self._values = np.full(size, np.nan, dtype=np.float32)
         self._sessions: list[str | None] = [None] * size
         self._levels_used = np.zeros(size, dtype=np.int8)
+        self._think_off = np.zeros(size, dtype=bool)
         self._by_session: dict[str, deque[int]] = {}
         self._next = 0
         self._n = 0
@@ -215,6 +216,7 @@ class EffortMemory:
         level: int = 0,
         estimate: float | None = None,
         novelty_rank: float | None = None,
+        difficulty: float | None = None,
     ) -> None:
         """Record one finished request.
 
@@ -228,6 +230,9 @@ class EffortMemory:
             level: effort level the prefill decision chose.
             estimate: the raw kNN estimate the decision saw, if any.
             novelty_rank: the novelty rank the decision saw, if any.
+            difficulty: a think-off request has no thinking length; it is
+                stored with this difficulty (the one it was decided with)
+                and teaches the lanes and the calibration nothing.
         """
         key = _unit(vec)
         if key.shape[0] != self.hidden_size:
@@ -237,12 +242,18 @@ class EffortMemory:
             )
         slot = self._claim_slot(session_id)
         self._keys[slot] = key
-        valued = close_kind == CLOSE_NATURAL and reasoning_tokens is not None
-        self._values[slot] = (
-            math.log1p(max(int(reasoning_tokens or 0), 0)) if valued else np.nan
-        )
         self._sessions[slot] = session_id
         self._levels_used[slot] = np.int8(max(-128, min(127, level)))
+        if difficulty is not None:
+            self._values[slot] = min(max(float(difficulty), 0.0), 1.0)
+            self._think_off[slot] = True
+            valued = False
+        else:
+            self._think_off[slot] = False
+            valued = close_kind == CLOSE_NATURAL and reasoning_tokens is not None
+            self._values[slot] = (
+                math.log1p(max(int(reasoning_tokens or 0), 0)) if valued else np.nan
+            )
         if valued:
             log_spend = float(self._values[slot])
             if estimate is not None:
@@ -264,6 +275,13 @@ class EffortMemory:
                 compression=self.cfg.digest_compression
             )
         digest.add(log_spend)
+
+    def _entry_difficulty(self, slot: int) -> float:
+        """Difficulty of a valued entry: its stored difficulty for a think-off
+        entry, its smoothed within-lane spend rank otherwise."""
+        if self._think_off[slot]:
+            return float(self._values[slot])
+        return self._difficulty(int(self._levels_used[slot]), float(self._values[slot]))
 
     def _difficulty(self, level: int, log_spend: float) -> float:
         """Spend ranked within its own level's lane, smoothed for small lanes.
@@ -329,7 +347,7 @@ class EffortMemory:
         slots = [slot] + [int(i) for i in near if not math.isnan(self._values[i])]
         sims = self._keys[slots] @ self._keys[:n].T
         for row, s_ in enumerate(slots):
-            if math.isnan(self._values[s_]):
+            if math.isnan(self._values[s_]) or self._think_off[s_]:
                 continue
             sim = sims[row]
             sim[s_] = -np.inf
@@ -342,10 +360,7 @@ class EffortMemory:
             w = np.exp((vs - vs.max()) / max(self.cfg.temperature, 1e-6))
             w /= w.sum()
             diff = np.fromiter(
-                (
-                    self._difficulty(int(lv), float(r))
-                    for lv, r in zip(self._levels_used[top][ok], vals[ok])
-                ),
+                (self._entry_difficulty(int(t)) for t in top[ok]),
                 dtype=np.float64,
                 count=int(ok.sum()),
             )
@@ -407,10 +422,8 @@ class EffortMemory:
                 (valued_sims - valued_sims.max()) / max(self.cfg.temperature, 1e-6)
             )
             w = w / w.sum()
-            raw = values[valued].astype(np.float64)
-            lvls = self._levels_used[top][valued]
             vals = np.fromiter(
-                (self._difficulty(int(lv), float(r)) for lv, r in zip(lvls, raw)),
+                (self._entry_difficulty(int(s_)) for s_ in top[valued]),
                 dtype=np.float64,
                 count=int(valued.sum()),
             )
@@ -471,6 +484,7 @@ class EffortMemory:
                 for level, digest in self._level_digests.items()
             },
             "probe_clock": self._probe_clock,
+            "think_off": [int(i) for i in np.flatnonzero(self._think_off[: self._n])],
             "calibration": [c.to_dict() for c in self._calibration],
             "calibration_all": self._calibration_all.to_dict(),
         }
@@ -514,11 +528,24 @@ class EffortMemory:
             return False
         with np.load(path, allow_pickle=False) as data:
             meta = json.loads(bytes(data["meta"]).decode())
+            # A file written before the think-off level was enabled has one
+            # level fewer; its levels shift up by one on load.
+            level_shift = (
+                1
+                if self.cfg.think_off_level
+                and self.levels
+                and meta.get("levels") == self.levels - 1
+                else 0
+            )
             if (
                 meta.get("version") != MEMORY_VERSION
                 or meta.get("hidden_size") != self.hidden_size
                 or (self.model and meta.get("model") not in ("", self.model))
-                or (self.levels and meta.get("levels") != self.levels)
+                or (
+                    self.levels
+                    and meta.get("levels") != self.levels
+                    and not level_shift
+                )
             ):
                 logger.warning(
                     "dynamic_effort: dropping %s (model/dim/levels/version "
@@ -531,7 +558,7 @@ class EffortMemory:
             n = min(keys.shape[0], self._keys.shape[0])
             self._keys[:n] = keys[:n]
             self._values[:n] = data["values"][:n]
-            self._levels_used[:n] = data["levels_used"][:n]
+            self._levels_used[:n] = data["levels_used"][:n] + level_shift
         sessions = list(meta.get("sessions") or [])[:n]
         sessions += [None] * (n - len(sessions))
         self._sessions[:n] = sessions
@@ -545,6 +572,10 @@ class EffortMemory:
         self._novelty_digest = TDigest.from_dict(meta["novelty_digest"])
         self._spread_digest = TDigest.from_dict(meta["spread_digest"])
         self._probe_clock = int(meta.get("probe_clock", 0))
+        self._think_off[:] = False
+        for i in meta.get("think_off", []):
+            if 0 <= int(i) < n:
+                self._think_off[int(i)] = True
         cal = meta.get("calibration")
         if cal and len(cal) == CALIBRATION_BINS:
             self._calibration = [_Calibration.from_dict(c) for c in cal]
@@ -555,9 +586,16 @@ class EffortMemory:
             self._est_digest = TDigest.from_dict(meta["est_digest"])
             self._spend_digest = TDigest.from_dict(meta["spend_digest"])
             self._level_digests = {
-                int(level): TDigest.from_dict(d)
+                int(level) + level_shift: TDigest.from_dict(d)
                 for level, d in meta["level_digests"].items()
             }
+            if level_shift:
+                logger.info(
+                    "dynamic_effort: %s written with %d levels; shifted up for "
+                    "the think-off level",
+                    path,
+                    meta.get("levels"),
+                )
         else:
             # A file written when the estimate was raw spend: rebuild the
             # lanes from the stored spend + level and restart the estimate
@@ -612,12 +650,17 @@ def decide_effort_level(
     estimate, nov_rank, spread_rank = ranks
     if query is None or estimate is None:
         return LevelDecision(default, "no-estimate", estimate, nov_rank, spread_rank)
+    low = cfg.low_level
     if estimate >= cfg.q_high:
-        level, reason = min(2, top_level), "q>=q_high"
+        level, reason = min(low + 2, top_level), "q>=q_high"
     elif estimate >= cfg.q_mid:
-        level, reason = min(1, top_level), "q>=q_mid"
+        level, reason = min(low + 1, top_level), "q>=q_mid"
+    elif cfg.think_off_level and estimate < cfg.q_none:
+        level, reason = 0, "q<q_none"
     else:
-        level, reason = 0, "low"
-    if probe and level > 0:
+        level, reason = low, "low"
+    if probe and level > low:
         level, reason = level - 1, f"probe/{reason}"
+    elif probe and level < low:
+        level, reason = low, f"probe/{reason}"
     return LevelDecision(level, reason, estimate, nov_rank, spread_rank)

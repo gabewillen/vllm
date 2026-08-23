@@ -2963,6 +2963,7 @@ class Scheduler(SchedulerInterface):
                     state.novelty = query.novelty
                     state.novelty_rank = decision.novelty_rank
                     state.estimate = query.estimate
+                    state.decided_difficulty = decision.estimate_rank
                     state.spread = query.spread
                     state.neighbours = query.n_valued
                     state.memory_entries = query.n_entries
@@ -3085,14 +3086,18 @@ class Scheduler(SchedulerInterface):
             # An abort or a max_tokens cap truncates the thinking, so the
             # length the request would have spent is unknown.
             close_kind = CLOSE_CLIENT_LIMIT
+        think_off = (
+            memory.cfg.think_off_level and state.level == 0 and state.decided
+        )
         memory.insert(
             vector,
             state.reasoning_tokens,
             close_kind,
             session_id=request.session_id,
             level=state.level,
-            estimate=state.estimate if state.decided else None,
+            estimate=None if think_off else (state.estimate if state.decided else None),
             novelty_rank=state.novelty_rank,
+            difficulty=state.decided_difficulty if think_off else None,
         )
         if memory.n_entries and memory.n_entries % 64 == 0:
             logger.info(

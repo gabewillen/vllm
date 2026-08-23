@@ -378,3 +378,64 @@ def test_calibration_learns_from_the_first_pair_and_from_the_memory_itself():
         memory.insert(rng.standard_normal(8), tokens, "natural", level=1,
                       estimate=est, novelty_rank=0.95)
     assert memory.calibrate(0.95, 0.95) < identity
+
+
+def test_think_off_level_sits_under_low_and_probes_upward():
+    """With `think_off_level` the map has four levels: below `q_none` the
+    request skips thinking; the resting level is still `low` (index 1); the
+    probe clock renders a think-off verdict at low so the neighbourhood keeps
+    receiving thinking-length evidence."""
+    cfg = _cfg(think_off_level=True, q_none=0.15, q_mid=0.35, q_high=0.60, default_level=2)
+    q = _query()
+    top = 3
+    assert decide_effort_level(q, (0.10, 0.1, 0.1), cfg, top).level == 0
+    assert decide_effort_level(q, (0.10, 0.1, 0.1), cfg, top).reason == "q<q_none"
+    assert decide_effort_level(q, (0.20, 0.1, 0.1), cfg, top).level == 1
+    assert decide_effort_level(q, (0.40, 0.1, 0.1), cfg, top).level == 2
+    assert decide_effort_level(q, (0.70, 0.1, 0.1), cfg, top).level == 3
+    # Probes: down from above low, up from think-off.
+    assert decide_effort_level(q, (0.70, 0.1, 0.1), cfg, top, probe=True).level == 2
+    up = decide_effort_level(q, (0.10, 0.1, 0.1), cfg, top, probe=True)
+    assert (up.level, up.reason) == (1, "probe/q<q_none")
+    # No estimate -> default, never the think-off level.
+    assert decide_effort_level(None, (None, None, None), cfg, top).level == 2
+
+
+def test_think_off_entry_echoes_its_difficulty_and_teaches_nothing(tmp_path):
+    """A think-off request has no thinking length. Its entry carries the
+    difficulty it was decided with - neighbours see it, the lanes and the
+    calibration do not."""
+    memory, cfg = _calibration_memory(think_off_level=True, default_level=2)
+    lane_before = {k: d.count for k, d in memory._level_digests.items()}
+    cal_before = memory._calibration_all.n
+    v = np.ones(8)
+    memory.insert(v, 0, "natural", level=0, difficulty=0.12)
+    assert memory._level_digests.get(0) is None
+    assert {k: d.count for k, d in memory._level_digests.items()} == lane_before
+    assert memory._calibration_all.n == cal_before
+    got = memory.query(v)
+    assert got is not None and got.estimate is not None
+    # The nearest neighbour is the think-off entry at 0.12; with temperature
+    # 0.05 it dominates the weighted mean.
+    assert got.estimate < 0.3
+    # It survives a save/load round trip as a think-off entry.
+    memory.cfg.memory_path = str(tmp_path / "m.npz")
+    memory.save()
+    again = EffortMemory(8, memory.cfg, levels=3)
+    assert again.load()
+    assert again.query(v).estimate == pytest.approx(got.estimate, rel=1e-5)
+
+
+def test_enabling_the_think_off_level_shifts_a_saved_memory(tmp_path):
+    cfg3 = _cfg(memory_size=64, memory_path=str(tmp_path / "m.npz"))
+    three = EffortMemory(8, cfg3, levels=3)
+    rng = np.random.default_rng(5)
+    for lv, tokens in ((0, 10), (1, 100), (2, 1000)):
+        three.insert(rng.standard_normal(8), tokens, "natural", level=lv)
+    three.save()
+    cfg4 = _cfg(memory_size=64, memory_path=str(tmp_path / "m.npz"),
+                think_off_level=True, default_level=2)
+    four = EffortMemory(8, cfg4, levels=4)
+    assert four.load()
+    assert sorted(int(x) for x in four._levels_used[:3]) == [1, 2, 3]
+    assert sorted(four._level_digests) == [1, 2, 3]

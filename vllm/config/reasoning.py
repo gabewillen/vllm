@@ -102,7 +102,21 @@ class HiddenEffortConfig:
     across levels and one body per conversation is cached."""
     default_level: int = Field(default=0, ge=0)
     """Level a request gets when no decision can be made - a cold memory, a
-    missing vector, a prompt with no usable seam. 0 is the `low` sentence."""
+    missing vector, a prompt with no usable seam. 0 is the `low` sentence,
+    or the think-off level when `think_off_level` is set (then 1 is `low`).
+    The default may not be the think-off level."""
+    think_off_level: bool = False
+    """Add a bottom level that renders the chat template's
+    `enable_thinking=false` - an instant answer with no think block. The
+    memory sends a request there when its neighbours' difficulty is below
+    `q_none`. A think-off request has no thinking length to rank, so its
+    memory entry carries the difficulty it was decided with: it keeps the
+    neighbourhood where it is and adds no confidence; the probe clock renders
+    every `probe_every`-th think-off verdict at `low` instead, and that
+    evidence is what can lift the neighbourhood back."""
+    q_none: float = Field(default=0.15, ge=0.0, le=1.0)
+    """Neighbour difficulty below which a request skips thinking entirely
+    (only with `think_off_level`)."""
 
     def __post_init__(self) -> None:
         if self.q_high < self.q_mid:
@@ -113,12 +127,24 @@ class HiddenEffortConfig:
             raise ValueError("hidden_effort.effort_sentences needs at least two levels")
         if self.default_level >= len(self.sentences()):
             raise ValueError("hidden_effort.default_level is outside the levels")
+        if self.think_off_level and self.default_level == 0:
+            raise ValueError("hidden_effort.default_level may not be the think-off level")
+        if self.think_off_level and self.q_none > self.q_mid:
+            raise ValueError("hidden_effort.q_none must be <= q_mid")
 
-    def sentences(self) -> list[str]:
-        """The tail sentence of each effort level, lowest first."""
+    def sentences(self) -> list[str | None]:
+        """The tail sentence of each effort level, lowest first. `None` is the
+        think-off level: no sentence, `enable_thinking=false`."""
         if self.effort_sentences is not None:
-            return list(self.effort_sentences)
-        return [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_XHIGH_EFFORT_SENTENCE]
+            base: list[str | None] = list(self.effort_sentences)
+        else:
+            base = [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_XHIGH_EFFORT_SENTENCE]
+        return ([None] if self.think_off_level else []) + base
+
+    @property
+    def low_level(self) -> int:
+        """Index of the resting `low` level."""
+        return 1 if self.think_off_level else 0
 
 
 @config
@@ -160,7 +186,7 @@ class DynamicEffortConfig:
             )
 
     @property
-    def level_sentences(self) -> list[str]:
+    def level_sentences(self) -> list[str | None]:
         return self.hidden_effort.sentences()
 
     @property

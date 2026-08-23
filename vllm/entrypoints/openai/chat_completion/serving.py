@@ -245,6 +245,7 @@ class OpenAIServingChat(GenerateBaseServing):
         request._dynamic_effort_variant_messages = None
         if variants is None or request._dynamic_effort is None:
             return None
+        think_off_levels = set(request._dynamic_effort.get("think_off_levels", ()))
         if len(engine_inputs) != 1:
             return None
         default_level = request._dynamic_effort["default_level"]
@@ -256,6 +257,11 @@ class OpenAIServingChat(GenerateBaseServing):
                 continue
             variant_request = copy(request)
             variant_request.messages = messages
+            if level in think_off_levels:
+                variant_request.chat_template_kwargs = {
+                    **(request.chat_template_kwargs or {}),
+                    "enable_thinking": False,
+                }
             result = await self.render_chat_request(variant_request)
             if isinstance(result, ErrorResponse):
                 return result
