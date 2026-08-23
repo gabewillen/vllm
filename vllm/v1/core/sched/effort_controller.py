@@ -59,6 +59,9 @@ class EffortState:
 
     # Decision provenance, for telemetry only.
     novelty: float | None = None
+    novelty_rank: float | None = None
+    estimate: float | None = None
+    """Raw kNN estimate the decision saw; calibrates the memory at finish."""
     spread: float | None = None
     neighbours: int = 0
     memory_entries: int = 0
@@ -83,6 +86,8 @@ class EffortState:
             "close_kind": self.close_kind,
             "memory_entries": self.memory_entries,
             "neighbours": self.neighbours,
+            "estimate": self.estimate,
+            "novelty_rank": self.novelty_rank,
         }
 
 

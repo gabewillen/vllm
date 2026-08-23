@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import field
+from typing import TYPE_CHECKING
 
 from pydantic import Field
 
@@ -9,6 +10,9 @@ from vllm.config.model import ModelConfig
 from vllm.config.utils import config
 from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
+
+if TYPE_CHECKING:
+    from vllm.config.parallel import ParallelConfig
 
 VALID_REASONING_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max", "dynamic"}
@@ -21,9 +25,10 @@ QWEN_LOW_EFFORT_SENTENCE = (
     "moving directly to the conclusion without unnecessary elaboration."
 )
 
-QWEN_HIGH_EFFORT_SENTENCE = (
-    "Reasoning effort is set to high. Think this through carefully and "
-    "completely before answering, checking your work as you go."
+QWEN_XHIGH_EFFORT_SENTENCE = (
+    "Reasoning effort is set to xhigh. Please think carefully through the task, "
+    "validate key assumptions, consider plausible alternatives, and prioritize "
+    "correctness, consistency, and clarity in the final answer."
 )
 
 
@@ -64,9 +69,6 @@ class HiddenEffortConfig:
     above which the request leaves the resting low level for the middle."""
     q_high: float = Field(default=0.60, ge=0.0, le=1.0)
     """Neighbour difficulty at or above which it gets the top level."""
-    novelty_gate_q: float = Field(default=0.60, ge=0.0, le=1.0)
-    """Novelty rank above which the memory has nothing comparable and the
-    request falls back to `default_level` instead of the map."""
     spread_gate_q: float = Field(default=0.60, ge=0.0, le=1.0)
     """Kept for telemetry; the spread rank is reported, not cut on."""
     probe_every: int = Field(default=8, ge=0)
@@ -91,7 +93,7 @@ class HiddenEffortConfig:
     `default_level`, with a byte-identical prompt."""
     effort_sentences: list[str] | None = None
     """One prompt sentence per effort level, lowest first. `None` uses
-    `[low, "", high]`: the model's own `low` and `xhigh` wording, with the
+    `[low, "", xhigh]`: the model's own `low` and `xhigh` wording, with the
     middle level rendering no sentence at all - the chat template's `medium`.
     The sentence is the *whole* actuator: it is placed at the true tail of the
     prompt, after the last message, so the body before it is byte-identical
@@ -114,7 +116,7 @@ class HiddenEffortConfig:
         """The tail sentence of each effort level, lowest first."""
         if self.effort_sentences is not None:
             return list(self.effort_sentences)
-        return [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_HIGH_EFFORT_SENTENCE]
+        return [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_XHIGH_EFFORT_SENTENCE]
 
 
 @config
@@ -181,7 +183,11 @@ class ReasoningConfig:
     reasoning_end_str: str = ""
     """String forced when the thinking budget is exhausted."""
     dynamic_effort: DynamicEffortConfig | None = None
-    """Server defaults for `reasoning_effort: "dynamic"`; `None` rejects it."""
+    """Server defaults for `reasoning_effort: "dynamic"`; `None` rejects it.
+
+    Dynamic effort requires data-parallel size one because its routing memory
+    and shutdown persistence have one process owner.
+    """
 
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False
@@ -280,3 +286,11 @@ class ReasoningConfig:
                 "Ensure the strings are valid tokens in the model's vocabulary."
             )
         self._enabled = True
+
+    def verify_with_parallel_config(self, parallel_config: "ParallelConfig") -> None:
+        """Reject dynamic routing where each DP rank owns independent state."""
+        if self.dynamic_effort is not None and parallel_config.data_parallel_size > 1:
+            raise ValueError(
+                "dynamic effort is not supported with data parallelism; "
+                "use data_parallel_size=1"
+            )

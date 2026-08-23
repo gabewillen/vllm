@@ -54,7 +54,6 @@ def _scheduler(max_num_batched_tokens=2048, async_scheduling=None, **hidden_kw):
         min_entries=4,
         k=4,
         flush_every=0,
-        novelty_gate_q=1.0,
         probe_every=0,
     )
     kwargs.update(hidden_kw)
@@ -231,13 +230,24 @@ def test_tail_appended_and_no_budget_shipped():
 
     output = scheduler.schedule()
     vector = np.ones(HIDDEN, dtype=np.float16)
-    scheduler.update_from_output(output, _runner_output(output, {"a": vector}))
+    body_outputs = scheduler.update_from_output(
+        scheduler_output=output,
+        model_runner_output=_runner_output(
+            scheduler_output=output,
+            vectors={"a": vector},
+        ),
+    )
 
     assert not request.effort_decision_pending
     assert list(request.prompt_token_ids) == body + TAILS[2]
     assert list(request._all_token_ids) == body + TAILS[2]
     assert request.num_prompt_tokens == BODY + len(TAILS[2])
     assert scheduler._effort["a"].level == 2
+    prompt_update = body_outputs[0].outputs[0].routed_prompt_update
+    assert prompt_update is not None
+    assert prompt_update.revision == 1
+    assert prompt_update.prompt_token_ids == body + TAILS[2]
+    assert not hasattr(request, "routed_prompt_token_ids")
 
     # The tail prefills next, and only the tail: the body is already computed.
     # No thinking budget exists on this path - the level is the whole actuator.
@@ -245,6 +255,13 @@ def test_tail_appended_and_no_budget_shipped():
     assert tail_step.num_scheduled_tokens["a"] == len(TAILS[2])
     assert not hasattr(tail_step, "thinking_budget_updates")
     assert request.sampling_params.thinking_token_budget is None
+    scheduler.update_from_output(
+        scheduler_output=tail_step,
+        model_runner_output=_runner_output(
+            scheduler_output=tail_step,
+            sampled={"a": [START]},
+        ),
+    )
 
 
 def test_decision_unavailable_falls_back_to_the_default_level():
@@ -382,7 +399,6 @@ def test_split_survives_async_scheduling(async_scheduling):
         flush_every=0,
         q_mid=0.0,
         q_high=0.0,
-        novelty_gate_q=1.0,
         probe_every=0,
     )
     scheduler._effort_cfg = DynamicEffortConfig(hidden_effort=hidden)
@@ -447,42 +463,85 @@ def test_a_multi_chunk_body_is_decided_by_the_step_that_computed_it():
     assert "no-vector" not in scheduler._effort_default_reason
 
 
-def test_body_stops_at_a_cacheable_block_boundary_under_mamba_align():
-    """Qwen3.5 is hybrid, and "align" mode only caches SSM state on a block
-    boundary, so a body whose seam is mid-block would deadlock the scheduler:
-    the aligned chunk shrinks to zero and the request is never admitted.
-
-    The scheduler therefore stops the body at the last cacheable boundary at or
-    before the frontend's seam, and the tokens in between ride at the head of
-    every tail - they are the same in every variant.
+def test_mamba_align_prefills_the_default_prompt_and_resubmits_the_tail():
+    """Under "align" mode a non-final chunk may only stop on a cacheable block
+    boundary, which would put the vector up to a block before the prompt's
+    end - the newest message, on an agent turn. So the whole default-level
+    prompt prefills as one final chunk, the vector is its true last row, and a
+    non-default decision resubmits the request with the chosen tail; the
+    prefix cache serves every full block up to the seam.
     """
-    scheduler = _scheduler(q_mid=0.0, q_high=0.0)
+    scheduler = _scheduler(q_mid=0.0, q_high=0.0)  # everything routes to 2
     _fill_memory(scheduler)
-    # The test scheduler builds a full-attention KV spec; the served profile is
-    # hybrid GDN with an MTP drafter, which is what sets these two.
     scheduler.need_mamba_block_aligned_split = True
     scheduler.use_eagle = True
 
     seam = 90  # not a multiple of the 16-token block
     request = _add(scheduler, "a", body_len=seam)
     prompt = list(request.prompt_token_ids)
-    boundary = request.effort_body_len
-    assert boundary % BLOCK == 0 and boundary <= seam
-    assert boundary == min(seam, len(prompt) - len(prompt) % BLOCK) // BLOCK * BLOCK
-    for tail, variant in zip(request.effort_tail_variants, TAILS):
-        assert tail == prompt[boundary:seam] + variant
+    assert request.effort_seam == seam
+    assert request.effort_body_len == len(prompt)
+    assert request.effort_tail_variants == TAILS
 
-    output = scheduler.schedule()
-    assert output.num_scheduled_tokens["a"] == boundary
+    # The align split may stop an intermediate chunk on a cacheable boundary;
+    # the final chunk ends at the prompt's true end and carries the capture.
+    total = 0
+    while True:
+        output = scheduler.schedule()
+        total += output.num_scheduled_tokens["a"]
+        if output.effort_prefill_capture:
+            break
+        scheduler.update_from_output(output, _runner_output(output))
+    assert total == len(prompt)
     assert output.effort_prefill_capture == ["a"]
-    scheduler.update_from_output(
-        output, _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)})
+    # Held: the decision has not landed, so no decode step is scheduled.
+    assert "a" not in scheduler.schedule().num_scheduled_tokens
+    outs = scheduler.update_from_output(
+        output,
+        _runner_output(
+            output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}
+        ),
     )
+    # The default rendering's sampled token is dropped with it.
     assert list(request.prompt_token_ids) == prompt[:seam] + TAILS[2]
-    # And the rest of the prompt still prefills.
-    assert scheduler.schedule().num_scheduled_tokens["a"] == (seam - boundary) + len(
-        TAILS[2]
+    assert list(request._all_token_ids) == prompt[:seam] + TAILS[2]
+    assert len(request.output_token_ids) == 0
+    assert request.num_computed_tokens == 0
+    assert outs[0].outputs[0].routed_prompt_update.prompt_token_ids == (
+        prompt[:seam] + TAILS[2]
     )
+    # Re-admitted as new: the cache serves the full blocks before the seam
+    # and only the sub-block tail is recomputed.
+    step = scheduler.schedule()
+    cached = seam - seam % BLOCK
+    assert step.num_scheduled_tokens["a"] == (seam - cached) + len(TAILS[2])
+    assert request.num_computed_tokens == seam + len(TAILS[2])
+
+
+def test_mamba_align_default_decision_keeps_the_prefill():
+    """A default-level verdict costs nothing: the prompt is already prefilled
+    and the sampled token is the first output token."""
+    scheduler = _scheduler(q_mid=1.0, q_high=1.0)  # everything routes to 0
+    _fill_memory(scheduler)
+    scheduler.need_mamba_block_aligned_split = True
+    request = _add(scheduler, "a", body_len=90)
+    prompt = list(request.prompt_token_ids)
+    while True:
+        output = scheduler.schedule()
+        if output.effort_prefill_capture:
+            break
+        scheduler.update_from_output(output, _runner_output(output))
+    outs = scheduler.update_from_output(
+        output,
+        _runner_output(
+            output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}
+        ),
+    )
+    assert list(request.prompt_token_ids) == prompt
+    assert list(request.output_token_ids) == [START]
+    assert outs[0].outputs[0].routed_prompt_update is None
+    assert not request.effort_hold_prefill
+    assert scheduler.schedule().num_scheduled_tokens["a"] >= 1
 
 
 def test_no_usable_seam_keeps_the_default_level():

@@ -53,6 +53,60 @@ SESSION_CAP_DIVISOR = 64
 """At most `memory_size / SESSION_CAP_DIVISOR` entries per session id, so one
 long conversation cannot evict the memory."""
 
+CALIBRATION_BINS = 8
+"""Novelty-rank bins the estimate is calibrated in. Resolution, not a cut."""
+
+
+class _Calibration:
+    """Online least squares of realised difficulty on the kNN estimate.
+
+    One per novelty bin. `apply` maps an estimate to `a + b * estimate`; with
+    no predictive value in the neighbours `b` goes to 0 and every estimate
+    collapses to the mean realised difficulty, which for ranks is the middle.
+    """
+
+    __slots__ = ("n", "sx", "sy", "sxx", "sxy")
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.sx = self.sy = self.sxx = self.sxy = 0.0
+
+    def add(self, x: float, y: float) -> None:
+        self.n += 1
+        self.sx += x
+        self.sy += y
+        self.sxx += x * x
+        self.sxy += x * y
+
+    def fit(self) -> tuple[float, float] | None:
+        if self.n < 2:
+            return None
+        mx, my = self.sx / self.n, self.sy / self.n
+        var = self.sxx / self.n - mx * mx
+        if var <= 1e-9:
+            return my, 0.0
+        slope = (self.sxy / self.n - mx * my) / var
+        slope = min(max(slope, 0.0), 2.0)
+        return my - slope * mx, slope
+
+    def apply(self, x: float) -> float:
+        fit = self.fit()
+        if fit is None:
+            return x
+        a, b = fit
+        return min(max(a + b * x, 0.0), 1.0)
+
+    def to_dict(self) -> dict[str, float]:
+        return {"n": self.n, "sx": self.sx, "sy": self.sy, "sxx": self.sxx, "sxy": self.sxy}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, float]) -> "_Calibration":
+        c = cls()
+        c.n = int(d.get("n", 0))
+        c.sx, c.sy = float(d.get("sx", 0.0)), float(d.get("sy", 0.0))
+        c.sxx, c.sxy = float(d.get("sxx", 0.0)), float(d.get("sxy", 0.0))
+        return c
+
 
 @dataclass(frozen=True)
 class MemoryQuery:
@@ -126,6 +180,8 @@ class EffortMemory:
         self._spend_digest = TDigest(compression=cfg.digest_compression)
         self._level_digests: dict[int, TDigest] = {}
         self._probe_clock = 0
+        self._calibration = [_Calibration() for _ in range(CALIBRATION_BINS)]
+        self._calibration_all = _Calibration()
 
     # ---------------------------------------------------------------- state
 
@@ -155,6 +211,8 @@ class EffortMemory:
         close_kind: str,
         session_id: str | None = None,
         level: int = 0,
+        estimate: float | None = None,
+        novelty_rank: float | None = None,
     ) -> None:
         """Record one finished request.
 
@@ -166,6 +224,8 @@ class EffortMemory:
                 enter as keys with no value.
             session_id: conversation key for the per-session eviction cap.
             level: effort level the prefill decision chose.
+            estimate: the raw kNN estimate the decision saw, if any.
+            novelty_rank: the novelty rank the decision saw, if any.
         """
         key = _unit(vec)
         if key.shape[0] != self.hidden_size:
@@ -182,7 +242,12 @@ class EffortMemory:
         self._sessions[slot] = session_id
         self._levels_used[slot] = np.int8(max(-128, min(127, level)))
         if valued:
-            self._absorb_spend(int(level), float(self._values[slot]))
+            log_spend = float(self._values[slot])
+            if estimate is not None and novelty_rank is not None:
+                realised = self._difficulty(int(level), log_spend)
+                self._calibration[self._bin(novelty_rank)].add(estimate, realised)
+                self._calibration_all.add(estimate, realised)
+            self._absorb_spend(int(level), log_spend)
         if session_id is not None:
             self._by_session.setdefault(session_id, deque()).append(slot)
         self._inserts += 1
@@ -215,6 +280,24 @@ class EffortMemory:
             return False
         self._probe_clock = (self._probe_clock + 1) % every
         return self._probe_clock == 0
+
+    @staticmethod
+    def _bin(novelty_rank: float) -> int:
+        return min(CALIBRATION_BINS - 1, max(0, int(novelty_rank * CALIBRATION_BINS)))
+
+    def calibrate(self, estimate: float, novelty_rank: float | None) -> float:
+        """Map a raw estimate through the calibration of its novelty bin.
+
+        The bin must hold `k` closes before it speaks; until then the pooled
+        fit stands in, and before that the estimate passes through."""
+        k = int(self.cfg.k)
+        if novelty_rank is not None:
+            cal = self._calibration[self._bin(novelty_rank)]
+            if cal.n >= k:
+                return cal.apply(estimate)
+        if self._calibration_all.n >= k:
+            return self._calibration_all.apply(estimate)
+        return estimate
 
     def _claim_slot(self, session_id: str | None) -> int:
         """FIFO ring, with a per-session cap that reuses the session's oldest."""
@@ -294,12 +377,15 @@ class EffortMemory:
         return result
 
     def ranks(self, q: MemoryQuery) -> tuple[float | None, float | None, float | None]:
-        """`(estimate, novelty rank, spread rank)`, then absorb them.
+        """`(calibrated estimate, novelty rank, spread rank)`, then absorb.
 
-        The estimate is already a difficulty percentile and is passed through;
-        its digest is kept for reporting only."""
-        est_rank = q.estimate
+        The estimate is a difficulty percentile; it is passed through the
+        calibration of its novelty bin, so neighbours that have not predicted
+        anything at that distance pull it to the mean instead of deciding."""
         nov_rank = self._novelty_digest.rank(q.novelty)
+        est_rank = (
+            None if q.estimate is None else self.calibrate(q.estimate, nov_rank)
+        )
         spread_rank = None if q.spread is None else self._spread_digest.rank(q.spread)
         if q.estimate is not None:
             self._est_digest.add(q.estimate)
@@ -330,6 +416,8 @@ class EffortMemory:
                 for level, digest in self._level_digests.items()
             },
             "probe_clock": self._probe_clock,
+            "calibration": [c.to_dict() for c in self._calibration],
+            "calibration_all": self._calibration_all.to_dict(),
         }
 
     def save(self) -> None:
@@ -402,6 +490,12 @@ class EffortMemory:
         self._novelty_digest = TDigest.from_dict(meta["novelty_digest"])
         self._spread_digest = TDigest.from_dict(meta["spread_digest"])
         self._probe_clock = int(meta.get("probe_clock", 0))
+        cal = meta.get("calibration")
+        if cal and len(cal) == CALIBRATION_BINS:
+            self._calibration = [_Calibration.from_dict(c) for c in cal]
+            self._calibration_all = _Calibration.from_dict(
+                meta.get("calibration_all", {})
+            )
         if "level_digests" in meta:
             self._est_digest = TDigest.from_dict(meta["est_digest"])
             self._spend_digest = TDigest.from_dict(meta["spend_digest"])
@@ -440,13 +534,14 @@ def decide_effort_level(
     """The quantile map, low-resting (§13.5).
 
     Low is the resting level; the memory has to earn anything above it. The
-    estimate is the neighbours' within-level difficulty (0..1), so the cuts
-    apply to it directly: at or above `q_high` the top level, at or above
-    `q_mid` the middle one, otherwise low. A novel prompt - the nearest entry
-    is farther than `novelty_gate_q` of what the server has seen - carries no
-    evidence either way and gets `default_level`. A `probe` decision renders
-    one level below the map's verdict, so every neighbourhood keeps receiving
-    samples at the cheaper level and can be pulled down by them.
+    estimate is the neighbours' within-level difficulty (0..1), calibrated
+    against what requests at that novelty actually turned out to need, so the
+    cuts apply to it directly: at or above `q_high` the top level, at or
+    above `q_mid` the middle one, otherwise low. A prompt whose neighbours
+    have never predicted anything is pulled to the mean by the calibration,
+    not gated by a constant. A `probe` decision renders one level below the
+    map's verdict, so every neighbourhood keeps receiving samples at the
+    cheaper level and can be pulled down by them.
 
     Args:
         query: the kNN result, or `None` when the memory could not answer.
@@ -462,8 +557,6 @@ def decide_effort_level(
     estimate, nov_rank, spread_rank = ranks
     if query is None or estimate is None:
         return LevelDecision(default, "no-estimate", estimate, nov_rank, spread_rank)
-    if nov_rank is not None and nov_rank > cfg.novelty_gate_q:
-        return LevelDecision(default, "novel", estimate, nov_rank, spread_rank)
     if estimate >= cfg.q_high:
         level, reason = min(2, top_level), "q>=q_high"
     elif estimate >= cfg.q_mid:

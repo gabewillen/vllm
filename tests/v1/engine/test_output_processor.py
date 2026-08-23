@@ -5,6 +5,11 @@ import math
 import time
 
 import pytest
+import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import PreTrainedTokenizerFast
 
 from tests.v1.engine.utils import (
     NUM_PROMPT_LOGPROBS_UNDER_TEST,
@@ -19,15 +24,19 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tracing import SpanAttributes
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreRequest,
     FinishReason,
+    RoutedPromptUpdate,
 )
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
-from vllm.v1.metrics.stats import IterationStats, SchedulerStats
+from vllm.v1.metrics.stats import IterationStats, PrefillStats, SchedulerStats
+from vllm.v1.outputs import LogprobsTensors
 
 
 def _ref_convert_id_to_token(
@@ -139,6 +148,207 @@ def test_incremental_detokenization(
 
     assert output_processor.get_num_unfinished_requests() == 0
     assert not output_processor.has_unfinished_requests()
+
+
+def test_routed_prompt_updates_frontend_consumers_before_first_output(monkeypatch):
+    backend = Tokenizer(
+        WordLevel(
+            {
+                "<unk>": 0,
+                "body": 1,
+                "old": 2,
+                "routed": 3,
+                "tail": 4,
+                "answer": 5,
+            },
+            unk_token="<unk>",
+        )
+    )
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="<unk>",
+    )
+    original_prompt_ids = [1, 2]
+    routed_prompt_ids = [1, 3, 4]
+    generated_token_id = 5
+    prompt_logprobs = LogprobsTensors(
+        logprob_token_ids=torch.tensor([[3, 0], [4, 0]]),
+        logprobs=torch.tensor([[-0.1, -1.0], [-0.2, -1.1]]),
+        selected_token_ranks=torch.tensor([1, 1]),
+    )
+
+    def make_request(request_id: str, prompt_token_ids: list[int]) -> EngineCoreRequest:
+        return EngineCoreRequest(
+            request_id=request_id,
+            external_req_id=f"{request_id}-external",
+            prompt_token_ids=prompt_token_ids,
+            mm_features=None,
+            arrival_time=1.0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            sampling_params=SamplingParams(
+                prompt_logprobs=NUM_PROMPT_LOGPROBS_UNDER_TEST
+            ),
+            pooling_params=None,
+        )
+
+    def make_output(request_id: str) -> EngineCoreOutput:
+        prefill_stats = PrefillStats()
+        prefill_stats.set(
+            num_prompt_tokens=len(routed_prompt_ids),
+            num_local_cached_tokens=0,
+            num_external_cached_tokens=0,
+        )
+        return EngineCoreOutput(
+            request_id=request_id,
+            new_token_ids=[generated_token_id],
+            new_prompt_logprobs_tensors=prompt_logprobs,
+            finish_reason=FinishReason.LENGTH,
+            events=[
+                EngineCoreEvent.new_event(
+                    event_type=EngineCoreEventType.QUEUED,
+                    timestamp=1.1,
+                ),
+                EngineCoreEvent.new_event(
+                    event_type=EngineCoreEventType.SCHEDULED,
+                    timestamp=1.2,
+                ),
+            ],
+            prefill_stats=prefill_stats,
+        )
+
+    reference = OutputProcessor(tokenizer=tokenizer, log_stats=False)
+    reference.add_request(
+        request=make_request(
+            request_id="reference",
+            prompt_token_ids=list(routed_prompt_ids),
+        ),
+        prompt=tokenizer.decode(routed_prompt_ids),
+    )
+    reference_output = reference.process_outputs(
+        engine_core_outputs=[make_output(request_id="reference")]
+    ).request_outputs[0]
+
+    spans = []
+    monkeypatch.setattr(
+        "vllm.v1.engine.output_processor.instrument_manual",
+        lambda **kwargs: spans.append(kwargs),
+    )
+    processor = OutputProcessor(
+        tokenizer=tokenizer,
+        log_stats=True,
+        tracing_enabled=True,
+    )
+    processor.add_request(
+        request=make_request(
+            request_id="routed",
+            prompt_token_ids=original_prompt_ids,
+        ),
+        prompt=tokenizer.decode(original_prompt_ids),
+    )
+    iteration_stats = IterationStats()
+    iteration_stats.iteration_timestamp = 2.0
+    update_outputs = processor.process_outputs(
+        engine_core_outputs=[
+            EngineCoreOutput(
+                request_id="routed",
+                new_token_ids=[],
+                routed_prompt_update=RoutedPromptUpdate(
+                    revision=1, prompt_token_ids=routed_prompt_ids
+                ),
+            )
+        ],
+        engine_core_timestamp=1.4,
+        iteration_stats=iteration_stats,
+    )
+    assert update_outputs.request_outputs == []
+    duplicate_outputs = processor.process_outputs(
+        engine_core_outputs=[
+            EngineCoreOutput(
+                request_id="routed",
+                new_token_ids=[],
+                routed_prompt_update=RoutedPromptUpdate(
+                    revision=1,
+                    prompt_token_ids=routed_prompt_ids,
+                ),
+            )
+        ]
+    )
+    assert duplicate_outputs.request_outputs == []
+    with pytest.raises(ValueError, match="standalone"):
+        processor.process_outputs(
+            engine_core_outputs=[
+                EngineCoreOutput(
+                    request_id="routed",
+                    new_token_ids=[generated_token_id],
+                    routed_prompt_update=RoutedPromptUpdate(
+                        revision=2,
+                        prompt_token_ids=routed_prompt_ids,
+                    ),
+                )
+            ]
+        )
+    with pytest.raises(ValueError, match="contiguous"):
+        processor.process_outputs(
+            engine_core_outputs=[
+                EngineCoreOutput(
+                    request_id="routed",
+                    new_token_ids=[],
+                    routed_prompt_update=RoutedPromptUpdate(
+                        revision=3,
+                        prompt_token_ids=routed_prompt_ids,
+                    ),
+                )
+            ]
+        )
+    request_output = processor.process_outputs(
+        engine_core_outputs=[make_output(request_id="routed")],
+        engine_core_timestamp=1.5,
+        iteration_stats=iteration_stats,
+    ).request_outputs[0]
+
+    assert request_output.prompt_token_ids == routed_prompt_ids
+    assert request_output.prompt == tokenizer.decode(routed_prompt_ids)
+    assert request_output.outputs[0].text == reference_output.outputs[0].text
+    assert request_output.prompt_logprobs == reference_output.prompt_logprobs
+    assert iteration_stats.finished_requests[0].num_prompt_tokens == len(
+        routed_prompt_ids
+    )
+    assert spans[0]["attributes"][SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] == len(
+        routed_prompt_ids
+    )
+
+    late = OutputProcessor(tokenizer=tokenizer, log_stats=False)
+    late.add_request(
+        request=make_request(
+            request_id="late",
+            prompt_token_ids=original_prompt_ids,
+        ),
+        prompt=tokenizer.decode(original_prompt_ids),
+    )
+    late.process_outputs(
+        engine_core_outputs=[
+            EngineCoreOutput(
+                request_id="late",
+                new_token_ids=[generated_token_id],
+            )
+        ]
+    )
+    with pytest.raises(ValueError, match="after prefill"):
+        late.process_outputs(
+            engine_core_outputs=[
+                EngineCoreOutput(
+                    request_id="late",
+                    new_token_ids=[],
+                    routed_prompt_update=RoutedPromptUpdate(
+                        revision=1,
+                        prompt_token_ids=routed_prompt_ids,
+                    ),
+                )
+            ]
+        )
 
 
 def test_request_stream_interval_raises_but_not_below_engine_default(

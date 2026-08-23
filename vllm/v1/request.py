@@ -201,6 +201,9 @@ class Request:
         # `prompt_token_ids` already carries the default-level tail, so a request whose
         # decision never lands runs exactly as it did before v3.
         self.effort_body_len = 0
+        # Full-default form: the whole default-level prompt is `effort_body_len`
+        # and the seam is where a non-default tail is spliced on resubmission.
+        self.effort_seam = 0
         self.effort_tail_variants: list[list[int]] | None = None
         self.effort_decision_pending = False
         # True only for the two-phase form: the prefill stops at

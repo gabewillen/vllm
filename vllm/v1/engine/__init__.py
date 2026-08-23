@@ -186,6 +186,17 @@ class EngineCoreEvent(msgspec.Struct):
         return cls(event_type, timestamp)
 
 
+class RoutedPromptUpdate(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    """One-shot completion message for a core-routed prompt."""
+
+    revision: int
+    prompt_token_ids: list[int]
+
+
 class EngineCoreOutput(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -226,6 +237,10 @@ class EngineCoreOutput(
     # {"level", "decided", "reasoning_tokens", "close_kind", "memory_entries",
     #  "neighbours"}.
     effort: dict[str, Any] | None = None
+
+    # A standalone core-side prompt-routing completion message. Appended last
+    # so `array_like` positional serialization stays backward compatible.
+    routed_prompt_update: RoutedPromptUpdate | None = None
 
     @property
     def finished(self) -> bool:
@@ -289,6 +304,8 @@ class EngineCoreRequestType(enum.Enum):
     EXECUTOR_FAILED = b"\x04"
     # Sentinel to wake up input_queue.get() during shutdown.
     WAKEUP = b"\x05"
+    # Typed internal event emitted by the signal boundary.
+    SHUTDOWN = b"\x06"
 
 
 class ReconfigureDistributedRequest(msgspec.Struct):

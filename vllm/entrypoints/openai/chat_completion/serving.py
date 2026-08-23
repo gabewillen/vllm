@@ -247,8 +247,13 @@ class OpenAIServingChat(GenerateBaseServing):
             return None
         if len(engine_inputs) != 1:
             return None
-        rendered = [self._extract_prompt_components(engine_inputs[0]).token_ids]
-        for messages in variants[1:]:
+        default_level = request._dynamic_effort["default_level"]
+        default_token_ids = self._extract_prompt_components(engine_inputs[0]).token_ids
+        rendered = []
+        for level, messages in enumerate(variants):
+            if level == default_level:
+                rendered.append(default_token_ids)
+                continue
             variant_request = copy(request)
             variant_request.messages = messages
             result = await self.render_chat_request(variant_request)

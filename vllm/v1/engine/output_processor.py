@@ -28,7 +28,12 @@ from vllm.tracing import (
     instrument_manual,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine import (
+    EngineCoreOutput,
+    EngineCoreRequest,
+    FinishReason,
+    RoutedPromptUpdate,
+)
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -172,6 +177,7 @@ class RequestState:
         self.n = n
         self.temperature = temperature
         self.is_prefilling = True
+        self.routed_prompt_revision = 0
         self.queue = queue
         self.num_cached_tokens = 0
         self.num_cache_creation_tokens = 0
@@ -211,6 +217,37 @@ class RequestState:
         if self.stats is not None:
             self.stats.arrival_time = update.arrival_time
         self.is_prefilling = True
+
+    def apply_routed_prompt(
+        self,
+        update: RoutedPromptUpdate,
+        tokenizer: TokenizerLike | None,
+    ) -> bool:
+        if update.revision == self.routed_prompt_revision:
+            if update.prompt_token_ids != self.prompt_token_ids:
+                raise ValueError(
+                    f"conflicting routed prompt revision {update.revision}"
+                )
+            return False
+        if update.revision != self.routed_prompt_revision + 1:
+            raise ValueError(
+                "routed prompt revisions must be contiguous: "
+                f"expected {self.routed_prompt_revision + 1}, "
+                f"got {update.revision}"
+            )
+        if not self.is_prefilling:
+            raise ValueError("routed prompt update arrived after prefill")
+        if self.detokenizer is not None and self.detokenizer.num_output_tokens() != 0:
+            raise ValueError("routed prompt update arrived after generation")
+
+        prompt_token_ids = update.prompt_token_ids
+        self.prompt_token_ids = list(prompt_token_ids)
+        self.prompt_len = len(prompt_token_ids)
+        self.prompt = None if tokenizer is None else tokenizer.decode(prompt_token_ids)
+        if self.detokenizer is not None:
+            self.detokenizer.update_prompt(prompt_token_ids)
+        self.routed_prompt_revision = update.revision
+        return True
 
     @classmethod
     def from_new_request(
@@ -628,10 +665,20 @@ class OutputProcessor:
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
         for engine_core_output in engine_core_outputs:
+            prompt_update = engine_core_output.routed_prompt_update
+            if prompt_update is not None:
+                self._validate_routed_prompt_output(engine_core_output)
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
             if req_state is None:
                 # Ignore output for already-aborted request.
+                continue
+
+            if prompt_update is not None:
+                req_state.apply_routed_prompt(
+                    update=prompt_update,
+                    tokenizer=self.tokenizer,
+                )
                 continue
 
             # 1) Compute stats for this iteration.
@@ -726,6 +773,29 @@ class OutputProcessor:
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
         )
+
+    @staticmethod
+    def _validate_routed_prompt_output(output: EngineCoreOutput) -> None:
+        ordinary_payload = (
+            bool(output.new_token_ids)
+            or output.new_logprobs is not None
+            or output.new_prompt_logprobs_tensors is not None
+            or output.pooling_output is not None
+            or output.finish_reason is not None
+            or output.stop_reason is not None
+            or output.events is not None
+            or output.kv_transfer_params is not None
+            or output.ec_transfer_params is not None
+            or output.trace_headers is not None
+            or output.prefill_stats is not None
+            or output.routed_experts is not None
+            or output.num_nans_in_logits != 0
+            or output.mm_cache_miss_hashes is not None
+            or output.new_sampling_mask is not None
+            or output.effort is not None
+        )
+        if ordinary_payload:
+            raise ValueError("routed prompt updates must be standalone outputs")
 
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id

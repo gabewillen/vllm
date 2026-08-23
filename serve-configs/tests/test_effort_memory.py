@@ -194,7 +194,7 @@ def _query(novelty=0.1, spread=0.1, estimate=1.0) -> MemoryQuery:
 
 
 def test_low_resting_map_leaves_low_only_on_difficulty():
-    cfg = _cfg(q_mid=0.35, q_high=0.60, novelty_gate_q=0.6, default_level=1)
+    cfg = _cfg(q_mid=0.35, q_high=0.60, default_level=1)
     top = 2
     q = _query()
 
@@ -207,12 +207,64 @@ def test_low_resting_map_leaves_low_only_on_difficulty():
     # Spread is reported, never cut on.
     assert decide_effort_level(q, (0.10, 0.10, None), cfg, top).level == 0
 
-    # A novel prompt carries no evidence either way: default_level.
-    novel = decide_effort_level(q, (0.99, 0.90, 0.10), cfg, top)
-    assert (novel.level, novel.reason) == (1, "novel")
-    assert decide_effort_level(q, (0.00, 0.61, 0.10), cfg, top).level == 1
-    # Exactly at the gate is still known territory.
-    assert decide_effort_level(q, (0.00, 0.60, 0.10), cfg, top).level == 0
+    # Novelty is not a gate: the calibrated estimate alone decides.
+    assert decide_effort_level(q, (0.99, 0.90, 0.10), cfg, top).level == 2
+    assert decide_effort_level(q, (0.00, 0.99, 0.10), cfg, top).level == 0
+
+
+def _calibration_memory(k=4, **kw):
+    cfg = _cfg(k=k, min_entries=k, memory_size=256, **kw)
+    memory = EffortMemory(8, cfg, levels=3)
+    # Warm the lane so realised difficulty is a meaningful rank.
+    rng = np.random.default_rng(99)
+    for tokens in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024):
+        memory.insert(rng.standard_normal(8), tokens, "natural", level=1)
+    return memory, cfg
+
+
+def test_uninformative_neighbours_calibrate_to_the_mean():
+    """When the estimate has not predicted realised difficulty at a given
+    novelty, calibration collapses it to the mean rank instead of letting a
+    meaningless neighbourhood pick the top or bottom level."""
+    memory, cfg = _calibration_memory()
+    rng = np.random.default_rng(0)
+    # Estimates and outcomes unrelated: high estimates close short and vice
+    # versa, at the same novelty bin.
+    for est, tokens in ((0.9, 5), (0.1, 500), (0.95, 8), (0.05, 400),
+                        (0.85, 6), (0.15, 450), (0.9, 4), (0.1, 480)):
+        memory.insert(rng.standard_normal(8), tokens, "natural", level=1,
+                      estimate=est, novelty_rank=0.3)
+    low = memory.calibrate(0.05, 0.3)
+    high = memory.calibrate(0.95, 0.3)
+    assert abs(high - low) < 0.15, (low, high)
+    assert 0.3 < low < 0.7 and 0.3 < high < 0.7
+
+
+def test_informative_neighbours_pass_through_calibration():
+    memory, cfg = _calibration_memory()
+    rng = np.random.default_rng(1)
+    for est, tokens in ((0.9, 500), (0.1, 5), (0.95, 480), (0.05, 8),
+                        (0.85, 450), (0.15, 6), (0.9, 400), (0.1, 4)):
+        memory.insert(rng.standard_normal(8), tokens, "natural", level=1,
+                      estimate=est, novelty_rank=0.3)
+    assert memory.calibrate(0.95, 0.3) > cfg.q_high
+    assert memory.calibrate(0.05, 0.3) < cfg.q_mid
+
+
+def test_calibration_is_per_novelty_bin_and_persists(tmp_path):
+    memory, cfg = _calibration_memory()
+    rng = np.random.default_rng(2)
+    for est, tokens in ((0.9, 5), (0.1, 500), (0.95, 8), (0.05, 400)):
+        memory.insert(rng.standard_normal(8), tokens, "natural", level=1,
+                      estimate=est, novelty_rank=0.9)
+    # The far bin is uninformative; the near bin has no fit yet and, with the
+    # pooled fit also at k, the pooled (uninformative) fit stands in.
+    assert abs(memory.calibrate(0.95, 0.9) - memory.calibrate(0.05, 0.9)) < 0.15
+    memory.cfg.memory_path = str(tmp_path / "m.npz")
+    memory.save()
+    again = EffortMemory(8, memory.cfg, levels=3)
+    assert again.load()
+    assert again.calibrate(0.95, 0.9) == memory.calibrate(0.95, 0.9)
 
 
 def test_probe_renders_one_level_below_the_verdict():

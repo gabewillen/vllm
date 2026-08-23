@@ -72,7 +72,12 @@ from vllm.v1.core.sched.utils import (
     check_stop,
     remove_all,
 )
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    RoutedPromptUpdate,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -2084,8 +2089,19 @@ class Scheduler(SchedulerInterface):
                 vector = (
                     effort_prefill_states.get(req_id) if effort_prefill_states else None
                 )
-                if self._resolve_effort_decision(request, vector):
+                routed_prompt_update = self._resolve_effort_decision(request, vector)
+                if routed_prompt_update is not None:
                     effort_requeued.add(request)
+                    outputs[request.client_index].append(
+                        EngineCoreOutput(
+                            request_id=req_id,
+                            new_token_ids=[],
+                            routed_prompt_update=routed_prompt_update,
+                        )
+                    )
+                    # Anything this step sampled belongs to the rendering just
+                    # replaced (nothing, in the two-phase form).
+                    continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
@@ -2777,8 +2793,8 @@ class Scheduler(SchedulerInterface):
         self._effort_memory = memory
         logger.info(
             "dynamic_effort: hidden-state level routing ON%s - memory %s (%d/%d "
-            "entries, min %d), k=%d, cuts q_mid=%.2f q_high=%.2f, downward "
-            "gates novelty<=%.2f spread<=%.2f",
+            "entries, min %d), k=%d, cuts q_mid=%.2f q_high=%.2f, estimate "
+            "calibrated per novelty bin, probe every %d",
             " (shadow)" if hidden.shadow else "",
             "warm" if warmed else "cold",
             memory.n_entries,
@@ -2787,8 +2803,7 @@ class Scheduler(SchedulerInterface):
             hidden.k,
             hidden.q_mid,
             hidden.q_high,
-            hidden.novelty_gate_q,
-            hidden.spread_gate_q,
+            hidden.probe_every,
         )
 
     def _maybe_add_effort_state(self, request: Request) -> None:
@@ -2817,27 +2832,49 @@ class Scheduler(SchedulerInterface):
                 and isinstance(body_len, int)
                 and 0 < body_len < request.num_prompt_tokens
             ):
-                boundary = self._effort_body_boundary(request, body_len)
-                if boundary and self._effort_split_worth_it(request, boundary):
-                    assert request.prompt_token_ids is not None
-                    # Tokens between the boundary and the frontend's seam are
-                    # the same in every variant, so they ride at the head of
-                    # every tail.
-                    middle = list(request.prompt_token_ids[boundary:body_len])
+                if self.need_mamba_block_aligned_split:
+                    # Full-default form: a non-final chunk may only stop on a
+                    # cacheable block boundary here, which would put the vector
+                    # up to a block before the prompt's end - the newest message,
+                    # on an agent turn. So the whole default-level prompt
+                    # prefills as a final chunk, the vector is its true last
+                    # row, and a non-default decision resubmits the request
+                    # with the other tail; the prefix cache serves every full
+                    # block up to the seam.
+                    boundary = request.num_prompt_tokens
                     request.effort_body_len = boundary
-                    request.effort_tail_variants = [middle + list(t) for t in tails]
+                    request.effort_seam = body_len
+                    request.effort_tail_variants = [list(t) for t in tails]
                     request.effort_hold_prefill = True
                     request.effort_decision_pending = True
+                else:
+                    boundary = self._effort_body_boundary(request, body_len)
+                    if boundary and self._effort_split_worth_it(request, boundary):
+                        assert request.prompt_token_ids is not None
+                        # Tokens between the boundary and the frontend's seam
+                        # are the same in every variant, so they ride at the
+                        # head of every tail.
+                        middle = list(request.prompt_token_ids[boundary:body_len])
+                        request.effort_body_len = boundary
+                        request.effort_tail_variants = [
+                            middle + list(t) for t in tails
+                        ]
+                        request.effort_hold_prefill = True
+                        request.effort_decision_pending = True
                 if self._effort_trace_budget > 0:
                     logger.info(
                         "dynamic_effort %s: seam at %d of %d prompt tokens, "
-                        "boundary %d, tails %s -> %s",
+                        "body %d, tails %s -> %s",
                         request.request_id,
                         body_len,
                         request.num_prompt_tokens,
                         boundary,
                         [len(t) for t in tails],
-                        "two-phase" if request.effort_hold_prefill else "default level",
+                        "full-default"
+                        if request.effort_seam
+                        else "two-phase"
+                        if request.effort_hold_prefill
+                        else "default level",
                     )
         if not request.effort_decision_pending:
             self._effort_level_total[state.level] = (
@@ -2869,7 +2906,7 @@ class Scheduler(SchedulerInterface):
 
     def _resolve_effort_decision(
         self, request: Request, vector: "np.ndarray | None"
-    ) -> bool:
+    ) -> RoutedPromptUpdate | None:
         """Choose the effort level from the body's pooled prefill state.
 
         The prompt already carries the default level's tail, so every failure
@@ -2883,10 +2920,10 @@ class Scheduler(SchedulerInterface):
             vector: the last body row, or `None` when there is none.
 
         Returns:
-            Whether the prompt changed and the request must be re-admitted.
+            A one-shot update when the prompt changed and must be re-admitted.
         """
         if not request.effort_decision_pending:
-            return False
+            return None
         request.effort_decision_pending = False
         request.effort_hold_prefill = False
         request.effort_decision_skips = 0
@@ -2924,6 +2961,8 @@ class Scheduler(SchedulerInterface):
                 )
                 if state is not None:
                     state.novelty = query.novelty
+                    state.novelty_rank = decision.novelty_rank
+                    state.estimate = query.estimate
                     state.spread = query.spread
                     state.neighbours = query.n_valued
                     state.memory_entries = query.n_entries
@@ -2955,11 +2994,57 @@ class Scheduler(SchedulerInterface):
         if state is not None:
             state.level = level
         if level == default_level or not tails:
-            return False
-        self._apply_effort_tail(request, tails[level])
-        return True
+            return None
+        if request.effort_seam:
+            return self._resubmit_effort_tail(request, tails[level])
+        return self._apply_effort_tail(
+            request=request,
+            tail=tails[level],
+        )
 
-    def _apply_effort_tail(self, request: Request, tail: list[int]) -> None:
+    def _resubmit_effort_tail(
+        self, request: Request, tail: list[int]
+    ) -> RoutedPromptUpdate:
+        """Full-default form: splice the chosen tail at the seam and re-admit
+        the request as new.
+
+        The default-level prompt is fully prefilled and may already carry
+        this step's sampled token and drafts, all of which belong to the
+        default rendering and are dropped. The blocks are freed the way a
+        preemption frees them; the prefix cache hands back every full block
+        up to the seam, so only the sub-block tail is recomputed.
+        """
+        seam = request.effort_seam
+        prompt = request.prompt_token_ids
+        assert prompt is not None
+        del prompt[seam:]
+        prompt.extend(tail)
+        del request._all_token_ids[seam:]
+        request._all_token_ids.extend(tail)
+        request._output_token_ids.clear()
+        request.num_prompt_tokens = len(prompt)
+        del request.block_hashes[seam // self.hash_block_size :]
+        request.update_block_hashes()
+        request.max_tokens = min(
+            request.max_tokens, max(self.max_model_len - request.num_prompt_tokens, 1)
+        )
+        self._free_request_blocks(request)
+        self.encoder_cache_manager.free(request)
+        self._inflight_prefills.discard(request)
+        request.num_computed_tokens = 0
+        request.num_output_placeholders = 0
+        request.draft_stale = False
+        if request.spec_token_ids:
+            request.spec_token_ids = []
+        request.status = RequestStatus.WAITING
+        return RoutedPromptUpdate(
+            revision=1,
+            prompt_token_ids=list(prompt),
+        )
+
+    def _apply_effort_tail(
+        self, request: Request, tail: list[int]
+    ) -> RoutedPromptUpdate:
         """Replace the default-level tail with the chosen one, in place.
 
         Only positions at or after `effort_body_len` change, and nothing at or
@@ -2980,6 +3065,10 @@ class Scheduler(SchedulerInterface):
             request.max_tokens, max(self.max_model_len - request.num_prompt_tokens, 1)
         )
         request.status = RequestStatus.WAITING
+        return RoutedPromptUpdate(
+            revision=1,
+            prompt_token_ids=list(prompt),
+        )
 
     def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
         """Record a finished request in the memory (§13.4).
@@ -3002,6 +3091,8 @@ class Scheduler(SchedulerInterface):
             close_kind,
             session_id=request.session_id,
             level=state.level,
+            estimate=state.estimate if state.decided else None,
+            novelty_rank=state.novelty_rank,
         )
         if memory.n_entries and memory.n_entries % 64 == 0:
             logger.info(
