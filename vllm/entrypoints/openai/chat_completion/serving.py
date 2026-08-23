@@ -312,6 +312,15 @@ class OpenAIServingChat(GenerateBaseServing):
                 if eos is not None:
                     stop_ids.add(int(eos))
             request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
+        if think_off_levels:
+            # Thinking off is the default rendering plus a closed think block:
+            # appended in place, no resubmission (measured identical to the
+            # template's own `<think>\n\n</think>\n\n` rendering).
+            tokenizer = self.renderer.tokenizer
+            if tokenizer is not None:
+                request._dynamic_effort["off_append"] = list(
+                    tokenizer.encode("</think>\n\n", add_special_tokens=False)
+                )
         request._dynamic_effort["body_len"] = body_len
         request._dynamic_effort["tails"] = tails
         return None

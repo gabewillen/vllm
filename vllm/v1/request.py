@@ -209,6 +209,7 @@ class Request:
         self.effort_custom_level: int | None = None
         self.effort_default_level = 0
         self.effort_force_custom = False
+        self.effort_off_append: list[int] | None = None
         self.effort_meta_tail: list[int] | None = None
         self.effort_custom_suffix: list[int] = []
         self.effort_meta_stop_ids: set[int] = set()

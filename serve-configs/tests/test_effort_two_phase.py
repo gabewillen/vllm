@@ -654,3 +654,54 @@ def test_custom_level_generates_a_hidden_note_and_splices_it():
     # And the real request prefills its new tail and runs.
     step = scheduler.schedule()
     assert step.num_scheduled_tokens["a"] > 0
+
+
+def test_think_off_extends_the_prefilled_prompt_in_place():
+    """An off verdict appends the closed think block to the default prompt
+    and continues: nothing is freed, only the appended tokens prefill."""
+    scheduler = _scheduler(
+        q_mid=1.0, q_high=1.0, think_off_level=True, custom_level=True, q_none=1.0, default_level=1
+    )  # off / default / custom; everything routes to 0 (off)
+    _fill_memory(scheduler)
+    scheduler.need_mamba_block_aligned_split = True
+    OFF = [880, 881]
+    params = SamplingParams(
+        max_tokens=60000,
+        extra_args={
+            "dynamic_effort": {
+                "default_level": 1,
+                "body_len": 90,
+                "tails": TAILS,
+                "off_append": OFF,
+            }
+        },
+    )
+    request = Request(
+        request_id="a",
+        prompt_token_ids=_prompt(7, TAILS[1]),
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=_block_hasher(),
+    )
+    scheduler.add_request(request)
+    assert request.effort_seam == 90 and request.effort_off_append == OFF
+    prompt = list(request.prompt_token_ids)
+    for _ in range(8):
+        output = scheduler.schedule()
+        if output.effort_prefill_capture:
+            break
+        scheduler.update_from_output(output, _runner_output(output))
+    assert output.effort_prefill_capture == ["a"]
+    outs = scheduler.update_from_output(
+        output,
+        _runner_output(
+            output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}
+        ),
+    )
+    assert scheduler._effort["a"].level == 0
+    assert list(request.prompt_token_ids) == prompt + OFF
+    assert len(request.output_token_ids) == 0
+    assert request.num_computed_tokens == len(prompt)  # nothing recomputed
+    assert outs[0].outputs[0].routed_prompt_update.prompt_token_ids == prompt + OFF
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens["a"] == len(OFF)

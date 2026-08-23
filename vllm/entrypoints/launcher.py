@@ -11,6 +11,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from vllm import envs
 from vllm.engine.protocol import EngineClient
@@ -107,11 +108,32 @@ async def serve_http(
     )
 
     shutdown_event = asyncio.Event()
+    app.state.draining = False
+
+    @app.middleware("http")
+    async def reject_while_draining(request, call_next):
+        # From the shutdown signal until the process exits, the engine client
+        # is being drained or is gone: a request that reaches it now fails
+        # with a 500. Tell clients to retry on the next process instead.
+        if app.state.draining:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "server is draining for restart; retry shortly",
+                        "type": "server_error",
+                        "code": 503,
+                    }
+                },
+                status_code=503,
+                headers={"Retry-After": "5"},
+            )
+        return await call_next(request)
 
     def signal_handler() -> None:
         if shutdown_event.is_set():
             return
         logger.info_once("[shutdown] API server: shutdown triggered")
+        app.state.draining = True
         shutdown_event.set()
 
     async def dummy_shutdown() -> None:

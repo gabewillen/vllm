@@ -2862,6 +2862,9 @@ class Scheduler(SchedulerInterface):
                     request.effort_hold_prefill = True
                     request.effort_decision_pending = True
                     request.effort_default_level = state.level
+                    off_append = overrides.get("off_append")
+                    if isinstance(off_append, list) and off_append:
+                        request.effort_off_append = [int(t) for t in off_append]
                     custom = overrides.get("custom_level")
                     meta_tail = overrides.get("meta_tail")
                     if isinstance(custom, int) and isinstance(meta_tail, list):
@@ -3038,6 +3041,16 @@ class Scheduler(SchedulerInterface):
             return None
         if request.effort_seam:
             if (
+                level == 0
+                and self._effort_cfg is not None
+                and self._effort_cfg.hidden_effort.think_off_level
+                and request.effort_off_append
+                and default_level == self._effort_cfg.hidden_effort.low_level
+            ):
+                # Thinking off = the default prompt plus a closed think block:
+                # extend the prefilled request in place, no blocks freed.
+                return self._extend_effort_prompt(request, request.effort_off_append)
+            if (
                 level == request.effort_custom_level
                 and request.effort_meta_tail is not None
             ):
@@ -3050,6 +3063,39 @@ class Scheduler(SchedulerInterface):
         return self._apply_effort_tail(
             request=request,
             tail=tails[level],
+        )
+
+    def _extend_effort_prompt(
+        self, request: Request, extra: list[int]
+    ) -> RoutedPromptUpdate:
+        """Append `extra` to a fully prefilled prompt and keep going.
+
+        The request's KV and recurrent state are current at the prompt's end,
+        so the new tokens are one more prefill chunk; the token sampled after
+        the default prompt is dropped. Nothing is freed or recomputed."""
+        prompt = request.prompt_token_ids
+        assert prompt is not None
+        body_len = len(prompt)
+        prompt.extend(extra)
+        del request._all_token_ids[body_len:]
+        request._all_token_ids.extend(extra)
+        request._output_token_ids.clear()
+        request.num_prompt_tokens = len(prompt)
+        del request.block_hashes[body_len // self.hash_block_size :]
+        request.update_block_hashes()
+        request.max_tokens = min(
+            request.max_tokens, max(self.max_model_len - request.num_prompt_tokens, 1)
+        )
+        request.num_output_placeholders = 0
+        if request.spec_token_ids:
+            request.spec_token_ids = []
+        request.drop_stale_output = True
+        request.num_stale_output_tokens = request.num_in_flight_tokens
+        request.status = RequestStatus.WAITING
+        request.effort_prompt_revision += 1
+        return RoutedPromptUpdate(
+            revision=request.effort_prompt_revision,
+            prompt_token_ids=list(prompt),
         )
 
     def _resubmit_effort_tail(
