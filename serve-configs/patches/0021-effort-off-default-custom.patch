@@ -428,3 +428,151 @@ index 934398753b..aec6da5710 100644
          self.effort_decision_pending = False
          # True only for the two-phase form: the prefill stops at
          # `effort_body_len` and the request is held until the level is chosen.
+diff --git a/vllm/entrypoints/launcher.py b/vllm/entrypoints/launcher.py
+index 80b2105163..de1fbfad32 100644
+--- a/vllm/entrypoints/launcher.py
++++ b/vllm/entrypoints/launcher.py
+@@ -11,6 +11,7 @@ from typing import Any
+ 
+ import uvicorn
+ from fastapi import FastAPI
++from fastapi.responses import JSONResponse
+ 
+ from vllm import envs
+ from vllm.engine.protocol import EngineClient
+@@ -107,11 +108,32 @@ async def serve_http(
+     )
+ 
+     shutdown_event = asyncio.Event()
++    app.state.draining = False
++
++    @app.middleware("http")
++    async def reject_while_draining(request, call_next):
++        # From the shutdown signal until the process exits, the engine client
++        # is being drained or is gone: a request that reaches it now fails
++        # with a 500. Tell clients to retry on the next process instead.
++        if app.state.draining:
++            return JSONResponse(
++                {
++                    "error": {
++                        "message": "server is draining for restart; retry shortly",
++                        "type": "server_error",
++                        "code": 503,
++                    }
++                },
++                status_code=503,
++                headers={"Retry-After": "5"},
++            )
++        return await call_next(request)
+ 
+     def signal_handler() -> None:
+         if shutdown_event.is_set():
+             return
+         logger.info_once("[shutdown] API server: shutdown triggered")
++        app.state.draining = True
+         shutdown_event.set()
+ 
+     async def dummy_shutdown() -> None:
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index eb3027d056..95c2f210bd 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -312,6 +312,15 @@ class OpenAIServingChat(GenerateBaseServing):
+                 if eos is not None:
+                     stop_ids.add(int(eos))
+             request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
++        if think_off_levels:
++            # Thinking off is the default rendering plus a closed think block:
++            # appended in place, no resubmission (measured identical to the
++            # template's own `<think>\n\n</think>\n\n` rendering).
++            tokenizer = self.renderer.tokenizer
++            if tokenizer is not None:
++                request._dynamic_effort["off_append"] = list(
++                    tokenizer.encode("</think>\n\n", add_special_tokens=False)
++                )
+         request._dynamic_effort["body_len"] = body_len
+         request._dynamic_effort["tails"] = tails
+         return None
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index bfbeb515e2..59238c6920 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2862,6 +2862,9 @@ class Scheduler(SchedulerInterface):
+                     request.effort_hold_prefill = True
+                     request.effort_decision_pending = True
+                     request.effort_default_level = state.level
++                    off_append = overrides.get("off_append")
++                    if isinstance(off_append, list) and off_append:
++                        request.effort_off_append = [int(t) for t in off_append]
+                     custom = overrides.get("custom_level")
+                     meta_tail = overrides.get("meta_tail")
+                     if isinstance(custom, int) and isinstance(meta_tail, list):
+@@ -3037,6 +3040,16 @@ class Scheduler(SchedulerInterface):
+         if level == default_level or not tails:
+             return None
+         if request.effort_seam:
++            if (
++                level == 0
++                and self._effort_cfg is not None
++                and self._effort_cfg.hidden_effort.think_off_level
++                and request.effort_off_append
++                and default_level == self._effort_cfg.hidden_effort.low_level
++            ):
++                # Thinking off = the default prompt plus a closed think block:
++                # extend the prefilled request in place, no blocks freed.
++                return self._extend_effort_prompt(request, request.effort_off_append)
+             if (
+                 level == request.effort_custom_level
+                 and request.effort_meta_tail is not None
+@@ -3052,6 +3065,39 @@ class Scheduler(SchedulerInterface):
+             tail=tails[level],
+         )
+ 
++    def _extend_effort_prompt(
++        self, request: Request, extra: list[int]
++    ) -> RoutedPromptUpdate:
++        """Append `extra` to a fully prefilled prompt and keep going.
++
++        The request's KV and recurrent state are current at the prompt's end,
++        so the new tokens are one more prefill chunk; the token sampled after
++        the default prompt is dropped. Nothing is freed or recomputed."""
++        prompt = request.prompt_token_ids
++        assert prompt is not None
++        body_len = len(prompt)
++        prompt.extend(extra)
++        del request._all_token_ids[body_len:]
++        request._all_token_ids.extend(extra)
++        request._output_token_ids.clear()
++        request.num_prompt_tokens = len(prompt)
++        del request.block_hashes[body_len // self.hash_block_size :]
++        request.update_block_hashes()
++        request.max_tokens = min(
++            request.max_tokens, max(self.max_model_len - request.num_prompt_tokens, 1)
++        )
++        request.num_output_placeholders = 0
++        if request.spec_token_ids:
++            request.spec_token_ids = []
++        request.drop_stale_output = True
++        request.num_stale_output_tokens = request.num_in_flight_tokens
++        request.status = RequestStatus.WAITING
++        request.effort_prompt_revision += 1
++        return RoutedPromptUpdate(
++            revision=request.effort_prompt_revision,
++            prompt_token_ids=list(prompt),
++        )
++
+     def _resubmit_effort_tail(
+         self, request: Request, tail: list[int]
+     ) -> RoutedPromptUpdate:
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index aec6da5710..2d8968ea29 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -209,6 +209,7 @@ class Request:
+         self.effort_custom_level: int | None = None
+         self.effort_default_level = 0
+         self.effort_force_custom = False
++        self.effort_off_append: list[int] | None = None
+         self.effort_meta_tail: list[int] | None = None
+         self.effort_custom_suffix: list[int] = []
+         self.effort_meta_stop_ids: set[int] = set()
