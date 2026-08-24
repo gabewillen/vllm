@@ -43,6 +43,9 @@ class IncrementalDetokenizer:
         self.token_ids.extend(new_token_ids)
         return None
 
+    def update_prompt(self, prompt_token_ids: list[int]) -> None:
+        del prompt_token_ids
+
     def get_next_output_text(self, finished: bool, delta: bool) -> str:
         return ""
 
@@ -208,6 +211,15 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
                 # No added tokens.
                 self.spaces_between_special_tokens = True
 
+    def update_prompt(self, prompt_token_ids: list[int]) -> None:
+        assert not self.token_ids and not self.output_text
+        self.stream = tokenizers.decoders.DecodeStream(
+            ids=prompt_token_ids,
+            skip_special_tokens=self.skip_special_tokens,
+        )
+        if not self.spaces_between_special_tokens:
+            self.last_special = False
+
     def decode_next(self, next_token_id: int) -> str:
         token = self._protected_step(next_token_id)
 
@@ -288,6 +300,18 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
     def num_output_tokens(self) -> int:
         return len(self.token_ids) - self.prompt_len
+
+    def update_prompt(self, prompt_token_ids: list[int]) -> None:
+        assert self.num_output_tokens() == 0 and not self.output_text
+        self.prompt_len = len(prompt_token_ids)
+        self.tokens, self.prefix_offset, self.read_offset = (
+            convert_prompt_ids_to_tokens(
+                tokenizer=self.tokenizer,
+                prompt_ids=prompt_token_ids,
+                skip_special_tokens=self.skip_special_tokens,
+            )
+        )
+        self.token_ids = list(prompt_token_ids)
 
     def decode_next(self, next_token_id: int) -> str:
         new_tokens, decoded_text, prefix_offset, read_offset = detokenize_incrementally(

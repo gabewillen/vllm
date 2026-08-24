@@ -4,18 +4,20 @@ import gc
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
 from logging import DEBUG
 from multiprocessing.queues import Queue
-from typing import Any, TypeVar, cast
+from typing import Any, Protocol, TypeVar, cast
 
 import msgspec
 import zmq
@@ -34,7 +36,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import MultiModalCacheMissError
 from vllm.tasks import POOLING_TASKS, SupportedTask
-from vllm.tracing import instrument, maybe_init_worker_tracer
+from vllm.tracing import instrument, instrument_manual, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.utils import numa_utils
 from vllm.utils.gc_utils import (
@@ -1000,9 +1002,257 @@ class EngineCore:
 
 
 class EngineShutdownState(IntEnum):
-    RUNNING = 0
-    REQUESTED = 1
-    SHUTTING_DOWN = 2
+    ROOT = 0
+    INITIAL = 1
+    RUNNING = 2
+    SHUTTING_DOWN = 3
+    CHOOSING_MODE = 4
+    DRAINING = 5
+    ABORTING = 6
+    TEARING_DOWN = 7
+    REPORTING = 8
+    FINAL = 9
+
+
+class EngineShutdownStateKind(IntEnum):
+    COMPOSITE = 0
+    INITIAL = 1
+    CHOICE = 2
+    ACTIVE = 3
+    FINAL = 4
+
+
+class EngineShutdownActivity(IntEnum):
+    PROCESS_ENGINE_WORK = 0
+    DRAIN_ENGINE_WORK = 1
+    ABORT_REQUESTS = 2
+    TEARDOWN_RESOURCES = 3
+    RECORD_TERMINAL_TELEMETRY = 4
+
+
+class EngineShutdownEventType(IntEnum):
+    INITIALIZED = 0
+    SHUTDOWN_REQUESTED = 1
+    MODE_SELECTION_COMPLETED = 2
+    WORK_DRAINED = 3
+    DEADLINE_EXPIRED = 4
+    ABORT_SUCCEEDED = 5
+    ABORT_FAILED = 6
+    ENGINE_FAILED = 7
+    TEARDOWN_SUCCEEDED = 8
+    TEARDOWN_FAILED = 9
+    REPORT_SUCCEEDED = 10
+    REPORT_FAILED = 11
+
+
+class EngineShutdownDisposition(IntEnum):
+    APPLIED = 0
+    IGNORED = 1
+    REJECTED = 2
+    TERMINAL = 3
+
+
+@dataclass(frozen=True)
+class EngineShutdownEvent:
+    event_type: EngineShutdownEventType
+    aborted_requests: int = 0
+
+
+@dataclass(frozen=True)
+class EngineShutdownStateDefinition:
+    parent: EngineShutdownState | None
+    kind: EngineShutdownStateKind
+    initial: EngineShutdownState | None = None
+    activity: EngineShutdownActivity | None = None
+    ignored_events: frozenset[EngineShutdownEventType] = frozenset()
+
+
+@dataclass(frozen=True)
+class EngineShutdownSnapshot:
+    state: EngineShutdownState
+    mode: str | None
+    deadline: float | None
+    outcome: str | None
+    aborted_requests: int
+    trace_start_ns: int | None
+
+
+@dataclass(frozen=True)
+class EngineShutdownTransition:
+    source: EngineShutdownState
+    event_type: EngineShutdownEventType
+    target: EngineShutdownState
+    effect: Callable[["EngineShutdownLifecycle", EngineShutdownEvent], None]
+    guard: Callable[["EngineShutdownLifecycle"], bool] | None = None
+
+
+class EngineShutdownLifecycle:
+    """Hierarchical lifecycle for one engine process shutdown."""
+
+    def __init__(
+        self,
+        *,
+        timeout: float,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+        wall_clock_ns: Callable[[], int] = time.time_ns,
+    ) -> None:
+        self.timeout = timeout
+        self.monotonic_clock = monotonic_clock
+        self.wall_clock_ns = wall_clock_ns
+        initial_state = _ENGINE_SHUTDOWN_STATES[EngineShutdownState.ROOT].initial
+        assert initial_state is not None
+        self._state = initial_state
+        self._mode: str | None = None
+        self._deadline: float | None = None
+        self._outcome: str | None = None
+        self._aborted_requests = 0
+        self._trace_start_ns: int | None = None
+        disposition = self.dispatch(
+            EngineShutdownEvent(event_type=EngineShutdownEventType.INITIALIZED)
+        )
+        assert disposition == EngineShutdownDisposition.APPLIED
+
+    def snapshot(self) -> EngineShutdownSnapshot:
+        return EngineShutdownSnapshot(
+            state=self._state,
+            mode=self._mode,
+            deadline=self._deadline,
+            outcome=self._outcome,
+            aborted_requests=self._aborted_requests,
+            trace_start_ns=self._trace_start_ns,
+        )
+
+    def activity(self) -> EngineShutdownActivity | None:
+        return _ENGINE_SHUTDOWN_STATES[self._state].activity
+
+    def dispatch(self, event: EngineShutdownEvent) -> EngineShutdownDisposition:
+        state_definition = _ENGINE_SHUTDOWN_STATES[self._state]
+        if state_definition.kind == EngineShutdownStateKind.FINAL:
+            return EngineShutdownDisposition.TERMINAL
+
+        transition = self._find_transition(event)
+        if transition is None:
+            if self._is_ignored(event.event_type):
+                return EngineShutdownDisposition.IGNORED
+            return EngineShutdownDisposition.REJECTED
+
+        transition.effect(self=self, event=event)
+        self._state = transition.target
+        self._resolve_transient_states(event)
+        return EngineShutdownDisposition.APPLIED
+
+    def _find_transition(
+        self, event: EngineShutdownEvent
+    ) -> EngineShutdownTransition | None:
+        source: EngineShutdownState | None = self._state
+        while source is not None:
+            for transition in _ENGINE_SHUTDOWN_TRANSITIONS:
+                if (
+                    transition.source == source
+                    and transition.event_type == event.event_type
+                    and (transition.guard is None or transition.guard(self))
+                ):
+                    return transition
+            source = _ENGINE_SHUTDOWN_STATES[source].parent
+        return None
+
+    def _resolve_transient_states(self, event: EngineShutdownEvent) -> None:
+        while True:
+            state_definition = _ENGINE_SHUTDOWN_STATES[self._state]
+            if state_definition.kind == EngineShutdownStateKind.COMPOSITE:
+                if state_definition.initial is None:
+                    return
+                self._state = state_definition.initial
+                continue
+            if state_definition.kind != EngineShutdownStateKind.CHOICE:
+                return
+            choice_event = EngineShutdownEvent(
+                event_type=EngineShutdownEventType.MODE_SELECTION_COMPLETED
+            )
+            candidates = [
+                transition
+                for transition in _ENGINE_SHUTDOWN_TRANSITIONS
+                if transition.source == self._state
+                and transition.event_type == choice_event.event_type
+            ]
+            guarded = [
+                transition
+                for transition in candidates
+                if transition.guard is not None and transition.guard(self=self)
+            ]
+            defaults = [
+                transition for transition in candidates if transition.guard is None
+            ]
+            if len(guarded) == 1:
+                transition = guarded[0]
+            elif not guarded and len(defaults) == 1:
+                transition = defaults[0]
+            else:
+                raise RuntimeError(
+                    f"shutdown choice {self._state.name} selected "
+                    f"{len(guarded)} guarded and {len(defaults)} default transitions"
+                )
+            transition.effect(self=self, event=choice_event)
+            self._state = transition.target
+
+    def _is_ignored(self, event_type: EngineShutdownEventType) -> bool:
+        state: EngineShutdownState | None = self._state
+        while state is not None:
+            if event_type in _ENGINE_SHUTDOWN_STATES[state].ignored_events:
+                return True
+            state = _ENGINE_SHUTDOWN_STATES[state].parent
+        return False
+
+    def _start_shutdown(self, event: EngineShutdownEvent) -> None:
+        del event
+        self._trace_start_ns = self.wall_clock_ns()
+
+    def _begin_drain(self, event: EngineShutdownEvent) -> None:
+        del event
+        self._mode = "drain"
+        self._deadline = self.monotonic_clock() + self.timeout
+
+    def _begin_abort(self, event: EngineShutdownEvent) -> None:
+        del event
+        self._mode = "abort"
+        self._outcome = "abort_requested"
+
+    def _complete_drain(self, event: EngineShutdownEvent) -> None:
+        del event
+        self._outcome = "drained"
+
+    def _expire_drain(self, event: EngineShutdownEvent) -> None:
+        del event
+        self._outcome = "deadline_expired"
+
+    def _complete_abort(self, event: EngineShutdownEvent) -> None:
+        self._aborted_requests = event.aborted_requests
+
+    def _fail_abort(self, event: EngineShutdownEvent) -> None:
+        del event
+        self._outcome = "abort_failed"
+
+    def _fail_engine(self, event: EngineShutdownEvent) -> None:
+        del event
+        if self._trace_start_ns is None:
+            self._trace_start_ns = self.wall_clock_ns()
+        self._mode = "failure"
+        self._outcome = "engine_failed"
+
+    def _complete_teardown(self, event: EngineShutdownEvent) -> None:
+        del event
+        if self._outcome is None:
+            self._outcome = "complete"
+
+    def _fail_teardown(self, event: EngineShutdownEvent) -> None:
+        del event
+        self._outcome = "teardown_failed"
+
+    def _no_effect(self, event: EngineShutdownEvent) -> None:
+        del event
+
+    def _abort_immediately(self) -> bool:
+        return self.timeout == 0
 
 
 class EngineCoreProc(EngineCore):
@@ -1023,6 +1273,8 @@ class EngineCoreProc(EngineCore):
         tensor_queue: Queue | None = None,
         *,
         engine_index: int = 0,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+        wall_clock_ns: Callable[[], int] = time.time_ns,
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
@@ -1033,7 +1285,11 @@ class EngineCoreProc(EngineCore):
         self.engine_index = engine_index
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
-        self.shutdown_state = EngineShutdownState.RUNNING
+        self.shutdown_lifecycle = EngineShutdownLifecycle(
+            timeout=vllm_config.shutdown_timeout,
+            monotonic_clock=monotonic_clock,
+            wall_clock_ns=wall_clock_ns,
+        )
 
         # Receiver for tensor IPC
         self.tensor_ipc_receiver: TensorIpcReceiver | None = None
@@ -1317,13 +1573,14 @@ class EngineCoreProc(EngineCore):
 
             assert engine_core is not None
 
-            def wakeup_engine():
-                # Wakes up idle engine via input_queue when shutdown is requested
+            def request_shutdown():
                 # Not safe in a signal handler - we may interrupt the main thread
                 # while it is holding the non-reentrant input_queue.mutex
-                engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+                engine_core.input_queue.put_nowait(
+                    (EngineCoreRequestType.SHUTDOWN, None)
+                )
 
-            signal_callback = SignalCallback(wakeup_engine)
+            signal_callback = SignalCallback(request_shutdown)
 
             def signal_handler(signum, frame):
                 signal_name = signal.Signals(signum).name
@@ -1331,7 +1588,6 @@ class EngineCoreProc(EngineCore):
                     "[shutdown] EngineCore: trigger received signal=%s",
                     signal_name,
                 )
-                engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
 
             signal.signal(signal.SIGTERM, signal_handler)
@@ -1350,12 +1606,16 @@ class EngineCoreProc(EngineCore):
                 engine_core._send_engine_dead()
             raise e
         finally:
+            active_error = sys.exception()
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             signal.signal(signal.SIGINT, signal.SIG_DFL)
             if signal_callback is not None:
                 signal_callback.stop()
             if engine_core is not None:
-                engine_core.shutdown()
+                _finish_engine_core_process(
+                    engine_core=engine_core,
+                    active_error=active_error,
+                )
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
@@ -1370,7 +1630,7 @@ class EngineCoreProc(EngineCore):
 
     def is_running(self) -> bool:
         """Returns true if shutdown has not been requested."""
-        return self.shutdown_state == EngineShutdownState.RUNNING
+        return self.shutdown_lifecycle.snapshot().state == EngineShutdownState.RUNNING
 
     @fault_tolerant_wrapper
     def run_busy_loop(self):
@@ -1378,6 +1638,8 @@ class EngineCoreProc(EngineCore):
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
+            if not self._handle_shutdown():
+                break
             # Publish request counts before and after GPU step to ensure freshness.
             self._maybe_publish_request_counts()
             # 2) Step the engine core and return the outputs.
@@ -1455,59 +1717,125 @@ class EngineCoreProc(EngineCore):
             callback(self)
 
     def _handle_shutdown(self) -> bool:
-        # Check if shutdown was requested and handle it
-        if self.shutdown_state == EngineShutdownState.RUNNING:
+        snapshot = self.shutdown_lifecycle.snapshot()
+        activity = self.shutdown_lifecycle.activity()
+        if activity == EngineShutdownActivity.PROCESS_ENGINE_WORK:
             return True
 
-        if self.shutdown_state == EngineShutdownState.REQUESTED:
-            shutdown_timeout = self.vllm_config.shutdown_timeout
-            mode = "abort" if shutdown_timeout == 0 else "drain"
-
-            logger.info(
-                "[shutdown] EngineCore: start mode=%s timeout=%ds",
-                mode,
-                shutdown_timeout,
+        if activity == EngineShutdownActivity.DRAIN_ENGINE_WORK:
+            assert snapshot.deadline is not None
+            event_type = (
+                EngineShutdownEventType.DEADLINE_EXPIRED
+                if self.shutdown_lifecycle.monotonic_clock() >= snapshot.deadline
+                else EngineShutdownEventType.WORK_DRAINED
+                if not self.has_work()
+                else None
             )
+            if event_type is not None:
+                self.shutdown_lifecycle.dispatch(
+                    EngineShutdownEvent(event_type=event_type)
+                )
+            snapshot = self.shutdown_lifecycle.snapshot()
+            activity = self.shutdown_lifecycle.activity()
 
-            if shutdown_timeout == 0:
-                num_requests = self.scheduler.get_num_unfinished_requests()
-                if num_requests > 0:
-                    logger.info(
-                        "[shutdown] EngineCore: aborting in-flight requests count=%d",
-                        num_requests,
-                    )
+        if activity == EngineShutdownActivity.ABORT_REQUESTS:
+            num_requests = self.scheduler.get_num_unfinished_requests()
+            if num_requests > 0:
+                logger.info(
+                    "[shutdown] EngineCore: aborting in-flight requests count=%d",
+                    num_requests,
+                )
+            try:
                 aborted_reqs = self.scheduler.finish_requests(
-                    None, RequestStatus.FINISHED_ABORTED
+                    request_ids=None,
+                    finished_status=RequestStatus.FINISHED_ABORTED,
                 )
                 self._send_abort_outputs(aborted_reqs)
-            else:
-                num_requests = self.scheduler.get_num_unfinished_requests()
-                if num_requests > 0:
-                    logger.info(
-                        "[shutdown] EngineCore: draining in-flight requests "
-                        "count=%d timeout=%ds",
-                        num_requests,
-                        shutdown_timeout,
-                    )
-
-            self.shutdown_state = EngineShutdownState.SHUTTING_DOWN
-
-        # Exit when no work remaining
-        if not self.has_work():
-            logger.info(
-                "[shutdown] EngineCore: request processing complete; "
-                "starting resource teardown"
+            except BaseException:
+                self.shutdown_lifecycle.dispatch(
+                    EngineShutdownEvent(event_type=EngineShutdownEventType.ABORT_FAILED)
+                )
+                raise
+            self.shutdown_lifecycle.dispatch(
+                EngineShutdownEvent(
+                    event_type=EngineShutdownEventType.ABORT_SUCCEEDED,
+                    aborted_requests=len(aborted_reqs),
+                )
             )
-            return False
+            snapshot = self.shutdown_lifecycle.snapshot()
+            activity = self.shutdown_lifecycle.activity()
 
-        return True
+        return activity != EngineShutdownActivity.TEARDOWN_RESOURCES
+
+    def finish_shutdown(self) -> None:
+        if self.shutdown_lifecycle.activity() != (
+            EngineShutdownActivity.TEARDOWN_RESOURCES
+        ):
+            self.shutdown_lifecycle.dispatch(
+                EngineShutdownEvent(event_type=EngineShutdownEventType.ENGINE_FAILED)
+            )
+        try:
+            self.shutdown()
+        except BaseException:
+            self.shutdown_lifecycle.dispatch(
+                EngineShutdownEvent(event_type=EngineShutdownEventType.TEARDOWN_FAILED)
+            )
+            self._record_shutdown_trace()
+            raise
+        self.shutdown_lifecycle.dispatch(
+            EngineShutdownEvent(event_type=EngineShutdownEventType.TEARDOWN_SUCCEEDED)
+        )
+        self._record_shutdown_trace()
+
+    def _record_shutdown_trace(self) -> None:
+        snapshot = self.shutdown_lifecycle.snapshot()
+        assert snapshot.state == EngineShutdownState.REPORTING
+        assert self.shutdown_lifecycle.activity() == (
+            EngineShutdownActivity.RECORD_TERMINAL_TELEMETRY
+        )
+        assert snapshot.trace_start_ns is not None
+        assert snapshot.mode is not None
+        assert snapshot.outcome is not None
+        try:
+            instrument_manual(
+                span_name="vllm.engine_core.shutdown",
+                start_time=snapshot.trace_start_ns,
+                end_time=self.shutdown_lifecycle.wall_clock_ns(),
+                attributes={
+                    "vllm.shutdown.aborted_requests": snapshot.aborted_requests,
+                    "vllm.shutdown.mode": snapshot.mode,
+                    "vllm.shutdown.outcome": snapshot.outcome,
+                },
+            )
+        except BaseException:
+            self.shutdown_lifecycle.dispatch(
+                EngineShutdownEvent(event_type=EngineShutdownEventType.REPORT_FAILED)
+            )
+            logger.exception("Failed to record EngineCore shutdown telemetry")
+            return
+        self.shutdown_lifecycle.dispatch(
+            EngineShutdownEvent(event_type=EngineShutdownEventType.REPORT_SUCCEEDED)
+        )
 
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         """Dispatch request from client."""
 
-        if request_type == EngineCoreRequestType.WAKEUP:
+        if request_type == EngineCoreRequestType.SHUTDOWN:
+            disposition = self.shutdown_lifecycle.dispatch(
+                EngineShutdownEvent(
+                    event_type=EngineShutdownEventType.SHUTDOWN_REQUESTED
+                )
+            )
+            if disposition == EngineShutdownDisposition.APPLIED:
+                snapshot = self.shutdown_lifecycle.snapshot()
+                logger.info(
+                    "[shutdown] EngineCore: start mode=%s timeout=%ds",
+                    snapshot.mode,
+                    self.vllm_config.shutdown_timeout,
+                )
+        elif request_type == EngineCoreRequestType.WAKEUP:
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
@@ -1538,7 +1866,7 @@ class EngineCoreProc(EngineCore):
             )
 
     def _reject_add_in_shutdown(self, request: Request) -> bool:
-        if self.shutdown_state == EngineShutdownState.RUNNING:
+        if self.is_running():
             return False
 
         logger.debug(
@@ -1551,7 +1879,7 @@ class EngineCoreProc(EngineCore):
     def _reject_utility_in_shutdown(
         self, client_idx: int, call_id: int, method_name: str
     ) -> bool:
-        if self.shutdown_state == EngineShutdownState.RUNNING:
+        if self.is_running():
             return False
 
         logger.warning(
@@ -1961,6 +2289,159 @@ class EngineCoreProc(EngineCore):
                 self._send_abort_outputs_to_client(list(req_ids), client_index)
 
 
+_SHUTDOWN_REQUEST_IGNORED = frozenset({EngineShutdownEventType.SHUTDOWN_REQUESTED})
+
+_ENGINE_SHUTDOWN_STATES = {
+    EngineShutdownState.ROOT: EngineShutdownStateDefinition(
+        parent=None,
+        kind=EngineShutdownStateKind.COMPOSITE,
+        initial=EngineShutdownState.INITIAL,
+    ),
+    EngineShutdownState.INITIAL: EngineShutdownStateDefinition(
+        parent=EngineShutdownState.ROOT,
+        kind=EngineShutdownStateKind.INITIAL,
+    ),
+    EngineShutdownState.RUNNING: EngineShutdownStateDefinition(
+        parent=EngineShutdownState.ROOT,
+        kind=EngineShutdownStateKind.ACTIVE,
+        activity=EngineShutdownActivity.PROCESS_ENGINE_WORK,
+    ),
+    EngineShutdownState.SHUTTING_DOWN: EngineShutdownStateDefinition(
+        parent=EngineShutdownState.ROOT,
+        kind=EngineShutdownStateKind.COMPOSITE,
+        initial=EngineShutdownState.CHOOSING_MODE,
+        ignored_events=_SHUTDOWN_REQUEST_IGNORED,
+    ),
+    EngineShutdownState.CHOOSING_MODE: EngineShutdownStateDefinition(
+        parent=EngineShutdownState.SHUTTING_DOWN,
+        kind=EngineShutdownStateKind.CHOICE,
+    ),
+    EngineShutdownState.DRAINING: EngineShutdownStateDefinition(
+        parent=EngineShutdownState.SHUTTING_DOWN,
+        kind=EngineShutdownStateKind.ACTIVE,
+        activity=EngineShutdownActivity.DRAIN_ENGINE_WORK,
+    ),
+    EngineShutdownState.ABORTING: EngineShutdownStateDefinition(
+        parent=EngineShutdownState.SHUTTING_DOWN,
+        kind=EngineShutdownStateKind.ACTIVE,
+        activity=EngineShutdownActivity.ABORT_REQUESTS,
+    ),
+    EngineShutdownState.TEARING_DOWN: EngineShutdownStateDefinition(
+        parent=EngineShutdownState.SHUTTING_DOWN,
+        kind=EngineShutdownStateKind.ACTIVE,
+        activity=EngineShutdownActivity.TEARDOWN_RESOURCES,
+    ),
+    EngineShutdownState.REPORTING: EngineShutdownStateDefinition(
+        parent=EngineShutdownState.SHUTTING_DOWN,
+        kind=EngineShutdownStateKind.ACTIVE,
+        activity=EngineShutdownActivity.RECORD_TERMINAL_TELEMETRY,
+    ),
+    EngineShutdownState.FINAL: EngineShutdownStateDefinition(
+        parent=EngineShutdownState.SHUTTING_DOWN,
+        kind=EngineShutdownStateKind.FINAL,
+    ),
+}
+
+_ENGINE_SHUTDOWN_TRANSITIONS = (
+    EngineShutdownTransition(
+        source=EngineShutdownState.INITIAL,
+        event_type=EngineShutdownEventType.INITIALIZED,
+        target=EngineShutdownState.RUNNING,
+        effect=EngineShutdownLifecycle._no_effect,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.RUNNING,
+        event_type=EngineShutdownEventType.SHUTDOWN_REQUESTED,
+        target=EngineShutdownState.SHUTTING_DOWN,
+        effect=EngineShutdownLifecycle._start_shutdown,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.CHOOSING_MODE,
+        event_type=EngineShutdownEventType.MODE_SELECTION_COMPLETED,
+        target=EngineShutdownState.ABORTING,
+        effect=EngineShutdownLifecycle._begin_abort,
+        guard=EngineShutdownLifecycle._abort_immediately,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.CHOOSING_MODE,
+        event_type=EngineShutdownEventType.MODE_SELECTION_COMPLETED,
+        target=EngineShutdownState.DRAINING,
+        effect=EngineShutdownLifecycle._begin_drain,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.DRAINING,
+        event_type=EngineShutdownEventType.WORK_DRAINED,
+        target=EngineShutdownState.TEARING_DOWN,
+        effect=EngineShutdownLifecycle._complete_drain,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.DRAINING,
+        event_type=EngineShutdownEventType.DEADLINE_EXPIRED,
+        target=EngineShutdownState.ABORTING,
+        effect=EngineShutdownLifecycle._expire_drain,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.ABORTING,
+        event_type=EngineShutdownEventType.ABORT_SUCCEEDED,
+        target=EngineShutdownState.TEARING_DOWN,
+        effect=EngineShutdownLifecycle._complete_abort,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.ABORTING,
+        event_type=EngineShutdownEventType.ABORT_FAILED,
+        target=EngineShutdownState.TEARING_DOWN,
+        effect=EngineShutdownLifecycle._fail_abort,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.ROOT,
+        event_type=EngineShutdownEventType.ENGINE_FAILED,
+        target=EngineShutdownState.TEARING_DOWN,
+        effect=EngineShutdownLifecycle._fail_engine,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.TEARING_DOWN,
+        event_type=EngineShutdownEventType.TEARDOWN_SUCCEEDED,
+        target=EngineShutdownState.REPORTING,
+        effect=EngineShutdownLifecycle._complete_teardown,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.TEARING_DOWN,
+        event_type=EngineShutdownEventType.TEARDOWN_FAILED,
+        target=EngineShutdownState.REPORTING,
+        effect=EngineShutdownLifecycle._fail_teardown,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.REPORTING,
+        event_type=EngineShutdownEventType.REPORT_SUCCEEDED,
+        target=EngineShutdownState.FINAL,
+        effect=EngineShutdownLifecycle._no_effect,
+    ),
+    EngineShutdownTransition(
+        source=EngineShutdownState.REPORTING,
+        event_type=EngineShutdownEventType.REPORT_FAILED,
+        target=EngineShutdownState.FINAL,
+        effect=EngineShutdownLifecycle._no_effect,
+    ),
+)
+
+
+class _EngineCoreShutdown(Protocol):
+    def finish_shutdown(self) -> None: ...
+
+
+def _finish_engine_core_process(
+    *,
+    engine_core: _EngineCoreShutdown,
+    active_error: BaseException | None,
+) -> None:
+    try:
+        engine_core.finish_shutdown()
+    except BaseException:
+        if active_error is None or isinstance(active_error, SystemExit):
+            raise
+        logger.exception("EngineCore teardown failed while handling another error")
+
+
 class DPEngineCoreProc(EngineCoreProc):
     """ZMQ-wrapper for running EngineCore in background process
     in a data parallel context."""
@@ -2152,6 +2633,8 @@ class DPEngineCoreProc(EngineCoreProc):
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
+            if not self._handle_shutdown():
+                break
             # Publish request counts before and after GPU step to ensure freshness.
             self._maybe_publish_request_counts()
 

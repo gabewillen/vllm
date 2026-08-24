@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
 import subprocess
 import tempfile
 import time
@@ -9,9 +10,67 @@ import pytest
 import requests
 import urllib3
 
+from vllm.benchmarks.lib.endpoint_request_func import (
+    RequestFuncInput,
+    async_request_openai_completions,
+)
+
 from ..utils import RemoteOpenAIServer
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+
+
+class _FakeContent:
+    async def iter_any(self):
+        yield b": keepalive"
+        yield b"\n"
+        yield b"\n"
+        yield b'data: {"choices":[{"text":"hello"}]}'
+        yield b"\n"
+        yield b"\n"
+        yield b"data: [DONE]"
+        yield b"\n"
+        yield b"\n"
+
+
+class _FakeResponse:
+    status = 200
+    reason = "OK"
+
+    def __init__(self) -> None:
+        self.content = _FakeContent()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeSession:
+    def post(self, *, url: str, json: dict, headers: dict):
+        del url, json, headers
+        return _FakeResponse()
+
+
+def test_completion_stream_preserves_keepalive_separator() -> None:
+    request = RequestFuncInput(
+        prompt="prompt",
+        api_url="http://localhost:8000/v1/completions",
+        prompt_len=1,
+        output_len=1,
+        model="model",
+    )
+
+    output = asyncio.run(
+        async_request_openai_completions(
+            request_func_input=request,
+            session=_FakeSession(),
+        )
+    )
+
+    assert output.success is True
+    assert output.generated_text == "hello"
 
 
 def generate_self_signed_cert(cert_dir: Path) -> tuple[Path, Path]:

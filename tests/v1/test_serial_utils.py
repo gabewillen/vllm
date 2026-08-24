@@ -452,6 +452,37 @@ def _logprobs_outputs(num_reqs: int, num_prompt_tokens: int):
     return EngineCoreOutputs(outputs=outputs)
 
 
+def test_engine_core_output_round_trips_routed_prompt_ids():
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, RoutedPromptUpdate
+
+    encoder = MsgpackEncoder()
+    decoder = MsgpackDecoder(EngineCoreOutputs)
+    outputs = EngineCoreOutputs(
+        outputs=[
+            EngineCoreOutput(
+                request_id="request",
+                new_token_ids=[],
+                routed_prompt_update=RoutedPromptUpdate(
+                    revision=1,
+                    prompt_token_ids=[1, 2, 3, 4],
+                ),
+            )
+        ]
+    )
+
+    decoded = decoder.decode(encoder.encode(outputs))
+
+    assert decoded.outputs[0].routed_prompt_update is not None
+    assert decoded.outputs[0].routed_prompt_update.revision == 1
+    assert decoded.outputs[0].routed_prompt_update.prompt_token_ids == [1, 2, 3, 4]
+
+    legacy_shape = EngineCoreOutputs(
+        outputs=[EngineCoreOutput(request_id="legacy", new_token_ids=[8])]
+    )
+    decoded_legacy = decoder.decode(encoder.encode(legacy_shape))
+    assert decoded_legacy.outputs[0].routed_prompt_update is None
+
+
 def test_payload_buffer_reuse_does_not_corrupt_in_flight_messages():
     """The engine core recycles the msgpack payload buffer across messages
     (`MsgpackEncoder.encode_into`). It may only do so once zmq has finished

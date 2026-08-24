@@ -11,6 +11,7 @@ verifies with its unquantized head, so the output distribution is unchanged.
 
 import torch
 import torch.nn as nn
+
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -32,6 +33,7 @@ logger = init_logger(__name__)
 
 MARLIN_GROUP_SIZE = 128
 MARLIN_WEIGHT_TYPE = scalar_types.uint4b8
+INT4_DRAFT_HEAD_CHUNK_SIZE = 4096
 
 
 class _Fp8DraftHeadMethod:
@@ -98,6 +100,57 @@ def _pack_rows_gptq(q_w: torch.Tensor, num_bits: int) -> torch.Tensor:
     return packed
 
 
+def _quantize_int4_gptq_chunked(
+    w: torch.Tensor,
+    *,
+    chunk_size: int = INT4_DRAFT_HEAD_CHUNK_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an ``[N, K]`` weight without a full-size float copy."""
+    if w.ndim != 2:
+        raise ValueError(f"w must be 2D, got {w.ndim} dimensions")
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    chunk_size = min(chunk_size, INT4_DRAFT_HEAD_CHUNK_SIZE)
+
+    size_n, size_k = w.shape
+    if size_n == 0:
+        raise ValueError("N must be positive")
+    if size_k == 0:
+        raise ValueError("K must be positive")
+    if size_k % MARLIN_GROUP_SIZE:
+        raise ValueError(
+            f"K={size_k} is not a multiple of group size {MARLIN_GROUP_SIZE}"
+        )
+
+    packed = torch.empty(
+        (size_k // get_pack_factor(MARLIN_WEIGHT_TYPE.size_bits), size_n),
+        dtype=torch.int32,
+        device=w.device,
+    )
+    scales = torch.empty(
+        (size_k // MARLIN_GROUP_SIZE, size_n),
+        dtype=torch.float32,
+        device=w.device,
+    )
+    start = 0
+    while start < size_n:
+        end = min(start + chunk_size, size_n)
+        w_chunk = w[start:end].t().contiguous().float()
+        w_ref, q_w, chunk_scales, _ = quantize_weights(
+            w=w_chunk,
+            quant_type=MARLIN_WEIGHT_TYPE,
+            group_size=MARLIN_GROUP_SIZE,
+        )
+        packed[:, start:end] = _pack_rows_gptq(
+            q_w=q_w,
+            num_bits=MARLIN_WEIGHT_TYPE.size_bits,
+        )
+        scales[:, start:end] = chunk_scales
+        del w_chunk, w_ref, q_w, chunk_scales
+        start = end
+    return packed, scales
+
+
 class QuantizedDraftLMHead(nn.Module):
     """Quantized (fp8 per-channel or int4 group-128) copy of the target lm_head
     shard, used only by the drafter. Everything except the weights delegates
@@ -147,14 +200,10 @@ class QuantizedDraftLMHead(nn.Module):
         # Round-to-nearest symmetric group quantization ([K, N] layout), then
         # the same GPTQ pack -> Marlin repack path the GPTQ-Marlin loader uses.
         size_n, size_k = w.shape
-        _, q_w, scales, _ = quantize_weights(
-            w=w.t().contiguous().float(),
-            quant_type=MARLIN_WEIGHT_TYPE,
-            group_size=MARLIN_GROUP_SIZE,
-        )
+        packed_qweight, scales = _quantize_int4_gptq_chunked(w=w)
         empty = torch.empty(0, dtype=torch.int32, device=w.device)
         self.marlin_qweight = ops.gptq_marlin_repack(
-            b_q_weight=_pack_rows_gptq(q_w=q_w, num_bits=MARLIN_WEIGHT_TYPE.size_bits),
+            b_q_weight=packed_qweight,
             perm=empty,
             size_k=size_k,
             size_n=size_n,

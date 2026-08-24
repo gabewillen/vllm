@@ -13,9 +13,9 @@ ExecStartPre=/bin/sh -c "rm -f /dev/shm/vllm_offload_*.mmap"
 ExecStart=/shared/vllm/.venv-qwen38/bin/vllm serve --config /shared/vllm/serve-configs/qwen3_8_27b_fp8_mtp_latency.yaml
 # Model load + inductor compile + graph capture can take several minutes.
 TimeoutStartSec=1800
-# Cgroup kill (default control-group) tears down all TP workers with the
-# parent, so no stale /dev/shm psm_* segments are left to wedge the next
-# start (manual SIGKILLs were the only source of those).
+KillMode=mixed
+# Send SIGTERM only to MainPID so EngineCore can drain with its TP workers.
+# Timeout escalation still SIGKILLs the cgroup and prevents stale workers.
 TimeoutStopSec=330
 Restart=on-failure
 RestartSec=15

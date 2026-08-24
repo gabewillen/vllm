@@ -1075,6 +1075,9 @@ class VllmConfig:
 
             self.parallel_config.is_moe_model = self.model_config.is_moe
 
+        if self.reasoning_config is not None:
+            self.reasoning_config.verify_with_parallel_config(self.parallel_config)
+
         if (
             self.model_config is not None
             and self.model_config.enable_return_routed_experts

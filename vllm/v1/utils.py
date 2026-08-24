@@ -28,6 +28,7 @@ from torch.autograd.profiler import record_function
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.tracing import instrument_manual
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils.network_utils import get_open_zmq_ipc_path, get_tcp_uri
 from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
@@ -43,6 +44,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 T = TypeVar("T")
+
+PROCESS_SHUTDOWN_CLEANUP_GRACE_S = 5.0
 
 
 class ConstantList(Generic[T], Sequence):
@@ -591,62 +594,102 @@ def wait_for_completion_or_failure(
 # Note(rob): shutdown function cannot be a bound method,
 # else the gc cannot collect the object.
 def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
-    """Shutdown processes with timeout.
+    """Terminate owned processes within one shared deadline.
 
     Args:
-        procs: List of processes to shutdown
-        timeout: Maximum time in seconds to wait for graceful shutdown
+        procs: Processes owned by the caller. Each live process receives SIGTERM.
+        timeout: Request-drain budget in seconds. ``None``, zero, and negative
+            values request immediate drain expiry. A fixed process-cleanup grace
+            follows before surviving process trees are force-killed.
+
+    Raises:
+        BaseException: Any process inspection, signal, join, or force-kill error
+            is propagated after the OTEL outcome is recorded. Earlier processes
+            may already have received SIGTERM or been killed.
+
+    Side Effects:
+        Mutates process lifetime. The total wait is one shared nonnegative drain
+        budget plus ``PROCESS_SHUTDOWN_CLEANUP_GRACE_S``; it is not a per-process
+        timeout. The function returns after all processes exit or remaining
+        process trees have been force-killed.
     """
     # `timeout` is the request-drain budget; a SIGTERMed process still needs a
     # few seconds of its own to run `EngineCore.shutdown` (executor teardown,
     # scheduler state such as the effort memory). Floor it like
     # `_shutdown_subprocesses` does, so timeout=0 means "abort requests now",
     # not "SIGKILL before the handler runs".
-    timeout = max(timeout or 0.0, 5.0)
+    drain_timeout = timeout or 0.0
+    if drain_timeout < 0:
+        drain_timeout = 0.0
+    timeout = drain_timeout + PROCESS_SHUTDOWN_CLEANUP_GRACE_S
+    trace_start_ns = time.time_ns()
+    outcome = "complete"
+    force_killed_count = 0
 
-    logger.debug(
-        "[shutdown] Process manager: start process_count=%d timeout=%ss names=%s",
-        len(procs),
-        timeout,
-        (",").join([proc.name for proc in procs]),
-    )
+    try:
+        logger.debug(
+            "[shutdown] Process manager: start process_count=%d timeout=%ss names=%s",
+            len(procs),
+            timeout,
+            (",").join([proc.name for proc in procs]),
+        )
 
-    # Shutdown the process.
-    for proc in procs:
-        if proc.is_alive():
-            logger.info(
-                "[shutdown] Process manager: send sigterm to process %s", proc.name
+        # Shutdown the process.
+        for proc in procs:
+            if proc.is_alive():
+                logger.info(
+                    "[shutdown] Process manager: send sigterm to process %s", proc.name
+                )
+                proc.terminate()
+
+        # Allow time for remaining procs to terminate.
+        deadline = time.monotonic() + timeout
+        for proc in procs:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if proc.is_alive():
+                proc.join(remaining)
+
+        remaining_procs = [
+            (proc.pid, proc.name)
+            for proc in procs
+            if proc.is_alive() and proc.pid is not None
+        ]
+        force_killed_count = len(remaining_procs)
+        if remaining_procs:
+            outcome = "force_killed"
+            logger.warning(
+                "[shutdown] Process manager: force killing remaining processes "
+                "count=%d",
+                force_killed_count,
             )
-            proc.terminate()
+        for pid, proc_name in remaining_procs:
+            logger.warning(
+                "[shutdown] Process manager: force killing remaining process %s pid %d",
+                proc_name,
+                pid,
+            )
+            kill_process_tree(pid)
 
-    # Allow time for remaining procs to terminate.
-    deadline = time.monotonic() + timeout
-    for proc in procs:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        if proc.is_alive():
-            proc.join(remaining)
-
-    remaining_procs = [
-        (proc.pid, proc.name)
-        for proc in procs
-        if proc.is_alive() and proc.pid is not None
-    ]
-    if remaining_procs:
-        logger.warning(
-            "[shutdown] Process manager: force killing remaining processes count=%d",
-            len(remaining_procs),
-        )
-    for pid, proc_name in remaining_procs:
-        logger.warning(
-            "[shutdown] Process manager: force killing remaining process %s pid %d",
-            proc_name,
-            pid,
-        )
-        kill_process_tree(pid)
-
-    logger.debug_once("[shutdown] Process manager: complete")
+        logger.debug_once("[shutdown] Process manager: complete")
+    except BaseException:
+        outcome = "error"
+        raise
+    finally:
+        try:
+            instrument_manual(
+                span_name="vllm.process_manager.shutdown",
+                start_time=trace_start_ns,
+                end_time=time.time_ns(),
+                attributes={
+                    "vllm.shutdown.force_killed_processes": force_killed_count,
+                    "vllm.shutdown.outcome": outcome,
+                    "vllm.shutdown.process_count": len(procs),
+                },
+            )
+        except BaseException:
+            logger.exception("Failed to record process-manager shutdown telemetry")
 
 
 def copy_slice(
