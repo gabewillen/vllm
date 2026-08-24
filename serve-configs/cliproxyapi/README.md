@@ -26,3 +26,20 @@ create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at
 allows only: host :8012 (vLLM), DNS to 192.168.2.1, and WAN. All other host
 ports and RFC1918 ranges are dropped. Verified 2026-08-24 from a curl container
 on the network: 8012 200; host 8317/22, router, LAN peer blocked; github 200.
+
+## CPA Manager Plus (observability dashboard)
+
+Added 2026-08-24, full mode (separate service + SQLite, not the lightweight
+panel). Persistent request history / cost analytics on top of CPA's
+management API.
+
+    docker run -d --name cpa-manager-plus --restart unless-stopped \
+      --network cliproxy-net -p 127.0.0.1:18317:18317 \
+      -v cpa-manager-plus-data:/data seakee/cpa-manager-plus:latest
+
+Bound to localhost only, not exposed via cloudflared. UI at
+http://127.0.0.1:18317/management.html. First-run wizard needs:
+- Admin key: from `docker logs cpa-manager-plus` (grep "admin key generated"),
+  also stashed in `serve-configs/cliproxyapi.env` as `CPAMP_ADMIN_KEY`.
+- CPA URL: `http://cliproxyapi:8317` (container DNS name on `cliproxy-net`).
+- CPA management key: `CLIPROXY_MGMT_KEY` in `serve-configs/cliproxyapi.env`.
