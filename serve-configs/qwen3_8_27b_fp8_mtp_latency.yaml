@@ -199,7 +199,7 @@ reasoning-parser: qwen3
 # implementation (VulcanBench itertools) - the model's voice is effort-only.
 # default_level 2 = medium (undecided prompts stay byte-identical); the
 # memory restarts cold for the new lane semantics.
-reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "think_off_level": true, "q_none": 0.30, "q_mid": 0.60, "q_high": 0.60, "default_level": 2, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
+reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "effort_aliases": {"high": "xhigh"}, "hidden_effort": {"enabled": true, "think_off_level": true, "q_none": 0.30, "q_mid": 0.60, "q_high": 0.60, "default_level": 2, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B

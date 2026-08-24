@@ -70,12 +70,18 @@ def apply_default_effort(
     """Fill in `reasoning_effort` when the client omitted it entirely.
 
     Only an *absent* value is filled: an explicit level, including `"none"`,
-    is left exactly as the client sent it. With `default_effort` unset the
-    request is untouched and the chat template picks its own default.
+    is left as the client sent it, except for a configured
+    `effort_aliases` rewrite. With `default_effort` unset the request is
+    untouched and the chat template picks its own default.
     """
-    if request.reasoning_effort is not None:
+    if cfg is None:
         return
-    if cfg is None or not cfg.default_effort:
+    if request.reasoning_effort is not None:
+        alias = cfg.effort_aliases.get(request.reasoning_effort)
+        if alias is not None:
+            request.reasoning_effort = alias  # type: ignore[assignment]
+        return
+    if not cfg.default_effort:
         return
     request.reasoning_effort = cfg.default_effort  # type: ignore[assignment]
 

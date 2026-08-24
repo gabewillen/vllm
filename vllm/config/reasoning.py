@@ -189,6 +189,10 @@ class DynamicEffortConfig:
     `"dynamic"` makes the omitted case route itself instead. An explicit
     `reasoning_effort` on the request is never overridden, including `"none"`.
     A deployment that wants the template default back sets it to `None`."""
+    effort_aliases: dict[str, str] = field(default_factory=dict)
+    """Client `reasoning_effort` values rewritten before anything reads them,
+    e.g. `{"high": "xhigh"}` for a proxy that normalises levels to the OpenAI
+    set on the way through. Applied to explicit values only."""
     render_effort: str = "medium"
     """`reasoning_effort` value handed to the chat template for dynamic
     requests, so block 0 of the prompt is identical for every level and the
@@ -202,6 +206,13 @@ class DynamicEffortConfig:
                 f"dynamic_effort.default_effort must be null or one of "
                 f"{sorted(VALID_REASONING_EFFORTS)}, got {self.default_effort!r}"
             )
+        for src, dst in self.effort_aliases.items():
+            if dst not in VALID_REASONING_EFFORTS or dst in self.effort_aliases:
+                raise ValueError(
+                    f"dynamic_effort.effort_aliases[{src!r}] must map to one of "
+                    f"{sorted(VALID_REASONING_EFFORTS)} that is not itself "
+                    f"aliased, got {dst!r}"
+                )
 
     @property
     def level_sentences(self) -> list[str | None]:

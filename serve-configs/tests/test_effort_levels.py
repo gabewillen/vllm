@@ -356,6 +356,19 @@ def test_an_explicit_effort_is_never_overridden(effort):
     assert request._dynamic_effort_variant_messages is None
 
 
+def test_an_explicit_effort_alias_is_rewritten_before_the_template():
+    """A proxy that normalises `xhigh` to `high` still reaches the template."""
+    cfg = _cfg(default_effort="dynamic", effort_aliases={"high": "xhigh"})
+    request = _bare(reasoning_effort="high")
+    apply_default_effort(request, cfg)
+    assert request.reasoning_effort == "xhigh"
+    request = _bare(reasoning_effort="low")
+    apply_default_effort(request, cfg)
+    assert request.reasoning_effort == "low"
+    with pytest.raises(ValueError, match="effort_aliases"):
+        _cfg(effort_aliases={"high": "bogus"})
+
+
 def test_an_explicit_dynamic_routes_even_with_the_knob_off():
     cfg = _cfg()
     request = _bare(reasoning_effort="dynamic")
