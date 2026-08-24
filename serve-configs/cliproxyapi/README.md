@@ -41,6 +41,20 @@ generation (~198s) that reliably 524'd before now completes cleanly. See
 detour building a from-scratch Gin middleware fork before finding this
 existing config flag — reverted, not needed).
 
+## Cloudflare Tunnel: QUIC stalls on large responses (fixed 2026-08-24)
+
+cpamp.willen.dev (a 5.6 MB management.html) intermittently hung for external
+clients while small API calls through cpa.willen.dev worked. cloudflared's
+journal showed every "stream canceled by remote with error code 0" on ONE of
+its four edge connections (connIndex=2: 576 errors vs ~80 on the others), and
+a restart just moved the problem to the new connIndex=2 — i.e. a QUIC/UDP
+path problem from this LXC (path-MTU black-hole), not a bad edge server.
+Fix: `protocol: http2` at the top of /etc/cloudflared/config.yml (TCP
+transport), then `systemctl restart cloudflared`. Verified: 5.6 MB page
+0.18-0.35 s through the tunnel, zero cancels. Note a cloudflared restart
+drops in-flight cpa.willen.dev requests (pi retries 530s, but 10 consecutive
+failures end a pi session), so restart it only between benchmark runs.
+
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
 create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at
