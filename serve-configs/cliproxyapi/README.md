@@ -19,6 +19,28 @@ Rotating the vLLM key: edit /etc/vllm/qwen38.env, restart vllm-qwen38, update
 api-key in /etc/cliproxyapi/config.yaml (file watcher reloads it live).
 Replaced the LiteLLM proxy (litellm.willen.dev) on 2026-08-24.
 
+## Cloudflare Tunnel 125s timeout on slow /v1/responses calls
+
+2026-08-24: DeepSWE-via-pier tasks (routed through https://cpa.willen.dev)
+were dying with HTTP 524 at exactly 125s (Cloudflare Tunnel's non-Enterprise
+Proxy Read Timeout, not configurable via originRequest knobs). Root-caused by
+tracing the full stack: vLLM's own [[cloudflare-524-keepalive]] middleware
+works fine and CPA proxies fine locally, but CPA's non-streaming
+/v1/responses path (OpenAICompatExecutor) reads+translates the *entire*
+upstream response before writing anything to its own client, so it produces
+zero response bytes for the full duration of a slow call — CPA already has a
+first-party fix for exactly this (`StartNonStreamingKeepAlive`, wired into
+the responses handler), it's just **off by default**. Fixed by adding to
+config.yaml:
+
+    nonstream-keepalive-interval: 15
+
+Verified end-to-end through the real tunnel: an 8000-word/16k-token
+generation (~198s) that reliably 524'd before now completes cleanly. See
+[[cloudflare-tunnel-125s-limit]] for the full investigation (including a
+detour building a from-scratch Gin middleware fork before finding this
+existing config flag — reverted, not needed).
+
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
 create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at
