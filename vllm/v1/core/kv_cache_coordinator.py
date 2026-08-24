@@ -109,6 +109,11 @@ class KVCacheCoordinator(ABC):
         # Conservatively fall back to flag all groups when no group is flagged.
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+        # Tag cached blocks with the tokens the drafter consumed past their
+        # boundary so a hit whose continuation matches keeps its tail block
+        # instead of dropping it (see FullAttentionManager.find_longest_cache_hit).
+        if enable_caching and self.eagle_group_ids:
+            self.block_pool.draft_lookahead = max(1, num_prefill_lookahead)
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
         # token past the chunk boundary is combined with the final hidden state
@@ -863,6 +868,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 )
                 if drop_eagle_block:
                     eagle_verified.add(idx)
+                    if _new_hit_length > curr_hit_length:
+                        # The margin block hit and the tail tag matched, so no
+                        # drop happened: land on the candidate anyway (its tail
+                        # is followed by a hit block, hence draft-complete).
+                        _new_hit_length = curr_hit_length
+                        num_blocks = cdiv(curr_hit_length, group_block_size)
+                        for blocks in hit_blocks:
+                            del blocks[num_blocks:]
                 elif _new_hit_length < curr_hit_length:
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()

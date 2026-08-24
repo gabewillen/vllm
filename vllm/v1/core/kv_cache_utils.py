@@ -140,6 +140,11 @@ class KVCacheBlock:
     # Cached by a request whose drafter had skipped some of its tokens, so the
     # drafter's KV in this block is incomplete (see SpeculativeConfig.lazy_draft).
     draft_stale: bool = False
+    # Tokens the drafter consumed past this block's hash boundary when it wrote
+    # the block's tail KV (EAGLE/MTP shift the draft input by one token, so the
+    # last position's drafter KV depends on the next `draft_lookahead` tokens).
+    # None when unknown; see BlockPool.draft_tail_blocks.
+    draft_next_tokens: tuple[int, ...] | None = None
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -165,6 +170,7 @@ class KVCacheBlock:
         self._block_hash = None
         self._block_hash_num_tokens = None
         self.draft_stale = False
+        self.draft_next_tokens = None
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__

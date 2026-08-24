@@ -1,0 +1,1896 @@
+diff --git a/tests/entrypoints/openai/chat_completion/test_effort_tails.py b/tests/entrypoints/openai/chat_completion/test_effort_tails.py
+new file mode 100644
+index 0000000000..8913261986
+--- /dev/null
++++ b/tests/entrypoints/openai/chat_completion/test_effort_tails.py
+@@ -0,0 +1,373 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The tail-only tokenization of dynamic-effort variants must produce the
++same ids as rendering every variant through the full chat path."""
++
++import asyncio
++import glob
++import os
++import random
++from dataclasses import dataclass, field
++from types import SimpleNamespace
++from typing import Any
++from unittest.mock import MagicMock
++
++import pytest
++
++from vllm.config import MultiModalConfig
++from vllm.config.reasoning import (
++    DynamicEffortConfig,
++    HiddenEffortConfig,
++)
++from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
++    apply_dynamic_effort,
++)
++from vllm.entrypoints.openai.chat_completion.effort_tails import (
++    special_token_cut,
++    tokenize_variant_tails,
++)
++from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
++from vllm.entrypoints.openai.engine.protocol import ErrorResponse
++from vllm.entrypoints.openai.models.serving import (
++    BaseModelPath,
++    OpenAIServingModels,
++)
++from vllm.renderers.hf import HfRenderer
++from vllm.renderers.online_renderer import OnlineRenderer
++from vllm.tokenizers.registry import cached_tokenizer_from_config
++
++_QWEN3_SNAPSHOTS = [
++    os.path.expanduser("~/.cache/huggingface/hub/models--RedHatAI--Qwen3.8-27B-INT4"),
++    os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B-FP8"),
++    os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B"),
++]
++
++
++def _local_qwen3_path() -> str | None:
++    for repo in _QWEN3_SNAPSHOTS:
++        for snap in sorted(glob.glob(os.path.join(repo, "snapshots", "*"))):
++            if os.path.exists(os.path.join(snap, "tokenizer_config.json")):
++                return snap
++    return None
++
++
++QWEN3_PATH = _local_qwen3_path()
++MODEL_NAME = "qwen3-effort-test"
++BASE_MODEL_PATHS = [BaseModelPath(name=MODEL_NAME, model_path=MODEL_NAME)]
++
++
++@dataclass
++class MockHFConfig:
++    model_type: str = "any"
++
++
++@dataclass
++class MockModelConfig:
++    task = "generate"
++    runner_type = "generate"
++    model = QWEN3_PATH
++    tokenizer = QWEN3_PATH
++    trust_remote_code = False
++    tokenizer_mode = "auto"
++    max_model_len = 262144
++    tokenizer_revision = None
++    multimodal_config = MultiModalConfig()
++    hf_config = MockHFConfig()
++    hf_text_config = MockHFConfig()
++    logits_processors: list[str] | None = None
++    diff_sampling_param: dict | None = None
++    allowed_local_media_path: str = ""
++    allowed_media_domains: list[str] | None = None
++    encoder_config = None
++    generation_config: str = "auto"
++    override_generation_config: dict[str, Any] = field(default_factory=dict)
++    media_io_kwargs: dict[str, dict[str, Any]] = field(default_factory=dict)
++    skip_tokenizer_init: bool = False
++    is_encoder_decoder: bool = False
++    is_multimodal_model: bool = False
++    renderer_num_workers: int = 1
++    enable_prompt_embeds: bool = False
++
++    def get_diff_sampling_param(self):
++        return self.diff_sampling_param or {}
++
++
++@dataclass
++class MockParallelConfig:
++    _api_process_rank: int = 0
++
++
++@dataclass
++class MockVllmConfig:
++    model_config: MockModelConfig
++    parallel_config: MockParallelConfig
++
++
++@dataclass
++class MockEngine:
++    model_config: MockModelConfig = field(default_factory=MockModelConfig)
++    input_processor: MagicMock = field(default_factory=MagicMock)
++    renderer: Any = None
++    vllm_config: Any = None
++    errored: bool = False
++
++
++TOOLS = [
++    {
++        "type": "function",
++        "function": {
++            "name": "read_file",
++            "description": "Read a file",
++            "parameters": {
++                "type": "object",
++                "properties": {"path": {"type": "string"}},
++                "required": ["path"],
++            },
++        },
++    }
++]
++
++
++def agent_conversation(turns: int, words_per_tool_result: int, seed: int = 0):
++    """A multi-turn agent transcript: tool calls, tool results, user follow-ups."""
++    rng = random.Random(seed)
++    words = ["def", "return", "self", "kv", "cache", "{", "}", "=", "0x1f", "\n"]
++
++    def blob(n: int) -> str:
++        return " ".join(rng.choice(words) for _ in range(n))
++
++    msgs: list[dict] = [
++        {"role": "system", "content": "You are a coding agent. " + blob(40)},
++        {"role": "user", "content": "Fix the scheduler bug. " + blob(30)},
++    ]
++    for i in range(1, turns + 1):
++        msgs.append(
++            {
++                "role": "assistant",
++                "content": "Let me look. " + blob(10),
++                "reasoning_content": "thinking " + blob(15),
++                "tool_calls": [
++                    {
++                        "id": f"call_{i}",
++                        "type": "function",
++                        "function": {
++                            "name": "read_file",
++                            "arguments": f'{{"path": "/x/{i}.py"}}',
++                        },
++                    }
++                ],
++            }
++        )
++        msgs.append(
++            {
++                "role": "tool",
++                "content": blob(words_per_tool_result),
++                "tool_call_id": f"call_{i}",
++            }
++        )
++        if i % 3 == 0:
++            msgs.append({"role": "assistant", "content": "Progress: " + blob(10)})
++            msgs.append({"role": "user", "content": "Continue. " + blob(8)})
++    return msgs
++
++
++def _effort_config(**hidden) -> DynamicEffortConfig:
++    return DynamicEffortConfig(
++        default_effort="dynamic",
++        hidden_effort=HiddenEffortConfig(enabled=True, **hidden),
++    )
++
++
++def _build_qwen3_serving_chat(cfg: DynamicEffortConfig) -> OpenAIServingChat:
++    model_config = MockModelConfig()
++    engine = MockEngine(
++        model_config=model_config,
++        renderer=HfRenderer(
++            MockVllmConfig(model_config, MockParallelConfig()),
++            cached_tokenizer_from_config(model_config),
++        ),
++        vllm_config=SimpleNamespace(
++            reasoning_config=SimpleNamespace(dynamic_effort=cfg)
++        ),
++    )
++    models = OpenAIServingModels(
++        engine_client=engine, base_model_paths=BASE_MODEL_PATHS
++    )
++    online_renderer = OnlineRenderer(
++        model_config=model_config,
++        renderer=engine.renderer,
++        request_logger=None,
++        chat_template=None,
++        chat_template_content_format="auto",
++        enable_auto_tools=True,
++        tool_parser="qwen3_coder",
++    )
++    return OpenAIServingChat(
++        engine,
++        models,
++        response_role="assistant",
++        online_renderer=online_renderer,
++        chat_template=None,
++        chat_template_content_format="auto",
++        request_logger=None,
++        enable_auto_tools=True,
++        tool_parser="qwen3_coder",
++    )
++
++
++async def _effort_overrides(
++    serving: OpenAIServingChat,
++    cfg: DynamicEffortConfig,
++    messages: list[dict],
++    *,
++    full_render: bool,
++    chat_template_kwargs: dict | None = None,
++    vllm_xargs: dict | None = None,
++) -> tuple[dict, list[int]]:
++    request = ChatCompletionRequest(
++        model=BASE_MODEL_PATHS[0].name,
++        messages=messages,
++        tools=TOOLS,
++        reasoning_effort="dynamic",
++        chat_template_kwargs=chat_template_kwargs,
++        vllm_xargs=vllm_xargs,
++    )
++    apply_dynamic_effort(request, cfg)
++    result = await serving.render_chat_request(request)
++    assert not isinstance(result, ErrorResponse), result
++    _, engine_inputs = result
++    original = serving._tokenize_effort_variants
++    fast_results: list = []
++
++    async def observed(*args, **kwargs):
++        if full_render:
++            return None
++        out = await original(*args, **kwargs)
++        fast_results.append(out)
++        return out
++
++    serving._tokenize_effort_variants = observed  # type: ignore[method-assign]
++    try:
++        error = await serving._attach_effort_tails(request, engine_inputs)
++    finally:
++        serving._tokenize_effort_variants = original  # type: ignore[method-assign]
++    assert error is None
++    if not full_render:
++        assert fast_results and fast_results[0] is not None, "tail path fell back"
++    assert request._dynamic_effort is not None
++    return request._dynamic_effort, list(engine_inputs[0]["prompt_token_ids"])
++
++
++_CASES = {
++    "prod-off-vote": dict(
++        hidden=dict(think_off_level=True, default_level=2), kwargs=None
++    ),
++    "no-think-off": dict(hidden=dict(default_level=1), kwargs=None),
++    "forced-think-off-default": dict(
++        hidden=dict(think_off_level=True, default_level=1),
++        kwargs=None,
++        xargs={"dynamic_effort_level": 1},
++    ),
++    "preserve-thinking-false": dict(
++        hidden=dict(think_off_level=True, default_level=2),
++        kwargs={"preserve_thinking": False},
++    ),
++}
++
++
++@pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
++@pytest.mark.parametrize("case", sorted(_CASES))
++def test_tail_tokenization_matches_full_render(case: str):
++    """Tail-only ids equal full-render ids for every variant, seam included."""
++    asyncio.run(_check_tail_tokenization(_CASES[case]))
++
++
++async def _check_tail_tokenization(spec: dict):
++    cfg = _effort_config(**spec["hidden"])
++    serving = _build_qwen3_serving_chat(cfg)
++    messages = agent_conversation(turns=7, words_per_tool_result=120)
++    fast, default_ids = await _effort_overrides(
++        serving,
++        cfg,
++        messages,
++        full_render=False,
++        chat_template_kwargs=spec["kwargs"],
++        vllm_xargs=spec.get("xargs"),
++    )
++    slow, _ = await _effort_overrides(
++        serving,
++        cfg,
++        messages,
++        full_render=True,
++        chat_template_kwargs=spec["kwargs"],
++        vllm_xargs=spec.get("xargs"),
++    )
++    assert fast["body_len"] == slow["body_len"]
++    assert fast["tails"] == slow["tails"]
++    assert fast.get("meta_tail") == slow.get("meta_tail")
++    assert fast.get("off_append") == slow.get("off_append")
++    assert fast.get("meta_stop_ids") == slow.get("meta_stop_ids")
++    assert fast["body_len"] < len(default_ids)
++    assert (
++        default_ids[: fast["body_len"]] + fast["tails"][cfg.hidden_effort.default_level]
++        == default_ids
++    )
++
++
++@pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
++def test_variants_use_the_tail_path():
++    """The fast path is what actually runs: it produces ids, not None."""
++    asyncio.run(_check_tail_path_taken())
++
++
++async def _check_tail_path_taken():
++    cfg = _effort_config(think_off_level=True, default_level=2)
++    serving = _build_qwen3_serving_chat(cfg)
++    request = ChatCompletionRequest(
++        model=BASE_MODEL_PATHS[0].name,
++        messages=agent_conversation(turns=2, words_per_tool_result=20),
++        tools=TOOLS,
++        reasoning_effort="dynamic",
++    )
++    apply_dynamic_effort(request, cfg)
++    result = await serving.render_chat_request(request)
++    assert not isinstance(result, ErrorResponse)
++    _, engine_inputs = result
++    variants = request._dynamic_effort_variant_messages
++    assert variants is not None
++    requests = []
++    for level, msgs in enumerate(variants):
++        if level == cfg.hidden_effort.default_level:
++            requests.append(None)
++            continue
++        variant = request.model_copy()
++        variant.messages = msgs
++        if level == 0:
++            variant.chat_template_kwargs = {"enable_thinking": False}
++        requests.append(variant)
++    rendered = await serving._tokenize_effort_variants(
++        request, engine_inputs[0], requests
++    )
++    assert rendered is not None
++    assert len(rendered) == len(variants)
++
++
++def test_tokenize_variant_tails_rejects_unproven_boundary():
++    """A default tail that does not re-encode to its own ids means fallback."""
++    special = ["<|s|>"]
++    encode = lambda text: [ord(c) for c in text]  # noqa: E731
++    default_text = "abc<|s|>xyz"
++    assert special_token_cut([default_text, "abc<|s|>xy!"], special) == 3
++    ids = encode(default_text)
++    out = tokenize_variant_tails(
++        encode, default_text, ids, [default_text, "abc<|s|>q"], special
++    )
++    assert out == [ids, encode("abc") + encode("<|s|>q")]
++    assert (
++        tokenize_variant_tails(
++            encode, default_text, ids[:-1], [default_text, "abc<|s|>q"], special
++        )
++        is None
++    )
++    assert special_token_cut(["abc", "abd"], special) is None
+diff --git a/tests/v1/core/test_effort_resubmission.py b/tests/v1/core/test_effort_resubmission.py
+new file mode 100644
+index 0000000000..a706d84dbc
+--- /dev/null
++++ b/tests/v1/core/test_effort_resubmission.py
+@@ -0,0 +1,352 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Dynamic effort, full-default form: what a resubmission recomputes.
++
++A non-default level (and the think-off vote) splices another tail at the seam
++and re-admits the request. Its prefix hit can only resume at a mamba-align
++chunk end, so the decision prefill must end a chunk at the last aligned
++boundary before the seam, and the vote must not pay that resubmission once
++per vote.
++"""
++
++import math
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
++from vllm.config.reasoning import DynamicEffortConfig, HiddenEffortConfig
++from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MambaSpec,
++)
++from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
++from vllm.v1.request import Request, RequestStatus
++from vllm.v1.structured_output import StructuredOutputManager
++
++from .utils import create_requests, create_scheduler
++
++pytestmark = pytest.mark.cpu_test
++
++BLOCK_SIZE = 16
++
++
++def _run_step(scheduler: Scheduler, request: Request, sampled: list[int]):
++    output = scheduler.schedule()
++    runner_output = ModelRunnerOutput(
++        req_ids=[request.request_id],
++        req_id_to_index={request.request_id: 0},
++        sampled_token_ids=[sampled],
++        logprobs=None,
++        prompt_logprobs_dict={},
++        pooler_output=[],
++    )
++    scheduler.update_from_output(output, runner_output)
++    return output
++
++
++def _requeue(scheduler: Scheduler, request: Request) -> None:
++    """What `update_from_output` does with an effort-requeued request."""
++    scheduler.running.remove(request)
++    scheduler.waiting.prepend_request(request)
++
++
++def _create_hybrid_align_scheduler() -> Scheduler:
++    model_config = ModelConfig(
++        model="facebook/opt-125m",
++        trust_remote_code=True,
++        dtype="float16",
++        seed=42,
++        skip_tokenizer_init=True,
++    )
++    vllm_config = VllmConfig(
++        scheduler_config=SchedulerConfig(
++            max_num_seqs=4,
++            max_num_batched_tokens=8192,
++            max_model_len=8192,
++            enable_chunked_prefill=True,
++            is_encoder_decoder=False,
++            watermark=0.0,
++        ),
++        model_config=model_config,
++        cache_config=CacheConfig(
++            block_size=BLOCK_SIZE,
++            enable_prefix_caching=True,
++            mamba_cache_mode="align",
++        ),
++    )
++    vllm_config.cache_config.num_gpu_blocks = 100
++    kv_cache_config = KVCacheConfig(
++        num_blocks=100,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["fa"],
++                FullAttentionSpec(
++                    block_size=BLOCK_SIZE,
++                    num_kv_heads=1,
++                    head_size=1,
++                    dtype=torch.float32,
++                ),
++            ),
++            KVCacheGroupSpec(
++                ["mamba"],
++                MambaSpec(
++                    block_size=BLOCK_SIZE,
++                    shapes=((1, 1),),
++                    dtypes=(torch.float32,),
++                    mamba_cache_mode="align",
++                ),
++            ),
++        ],
++    )
++    register_all_kvcache_specs(vllm_config)
++    return Scheduler(
++        vllm_config=vllm_config,
++        kv_cache_config=kv_cache_config,
++        structured_output_manager=StructuredOutputManager(vllm_config),
++        block_size=BLOCK_SIZE,
++        hash_block_size=BLOCK_SIZE,
++        log_stats=True,
++    )
++
++
++def _hold_full_default(request: Request, seam: int, tails: list[list[int]]) -> None:
++    """Mark `request` as the full-default form held for its decision."""
++    request.effort_body_len = request.num_prompt_tokens
++    request.effort_seam = seam
++    request.effort_tail_variants = tails
++    request.effort_hold_prefill = True
++    request.effort_default_level = len(tails) - 1
++
++
++def test_decision_prefill_ends_chunk_at_seam_boundary():
++    """The held prefill stops at the last aligned boundary before the seam,
++    on top of the eagle back-off stop, so that state gets cached."""
++    prompt_len = 6 * BLOCK_SIZE + 5
++    seam = 6 * BLOCK_SIZE + 3
++    [request] = create_requests(
++        num_requests=1, num_tokens=prompt_len, block_size=BLOCK_SIZE
++    )
++    stub = SimpleNamespace(
++        cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
++        use_eagle=True,
++        max_num_scheduled_tokens=8192,
++        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
++        mamba_partial_cache_hit=False,
++        hash_block_size=BLOCK_SIZE,
++    )
++
++    def chunks() -> list[int]:
++        request.num_computed_tokens = 0
++        sizes = []
++        while request.num_computed_tokens < prompt_len:
++            num_new = Scheduler._mamba_block_aligned_split(
++                stub, request, prompt_len - request.num_computed_tokens
++            )
++            sizes.append(num_new)
++            request.num_computed_tokens += num_new
++        return sizes
++
++    assert chunks() == [5 * BLOCK_SIZE, BLOCK_SIZE + 5]
++    _hold_full_default(request, seam, [[7], [8]])
++    assert chunks() == [5 * BLOCK_SIZE, BLOCK_SIZE, 5]
++    request.effort_hold_prefill = False
++    assert chunks() == [5 * BLOCK_SIZE, BLOCK_SIZE + 5]
++
++
++@pytest.mark.parametrize("stop_at_seam", [True, False])
++def test_resubmission_resumes_at_seam_boundary_on_hybrid_align(stop_at_seam: bool):
++    """Re-admission after `_resubmit_effort_tail` reuses every cached block up
++    to the aligned boundary before the seam - the FA blocks and the mamba
++    state the decision prefill left there - so only the seam's partial block
++    and the new tail are scheduled. Without a chunk end at that boundary
++    (`stop_at_seam=False` prefills as the plain split would) the mamba group
++    has no state to resume from and the whole prompt is recomputed."""
++    scheduler = _create_hybrid_align_scheduler()
++    prompt_len = 100
++    seam = 70
++    keep = seam // BLOCK_SIZE * BLOCK_SIZE
++    [request] = create_requests(
++        num_requests=1, num_tokens=prompt_len, max_tokens=8, block_size=BLOCK_SIZE
++    )
++    default_tail = list(request.prompt_token_ids[seam:])
++    low_tail = [200, 201, 202, 203, 204]
++    _hold_full_default(request, seam if stop_at_seam else 0, [low_tail, default_tail])
++    scheduler.add_request(request)
++
++    chunks = []
++    while request.num_computed_tokens < prompt_len:
++        output = _run_step(scheduler, request, [])
++        chunks.append(output.num_scheduled_tokens[request.request_id])
++    assert chunks == ([keep, 96 - keep, 4] if stop_at_seam else [96, 4])
++    assert _mamba_state_cached(scheduler, request, keep) == stop_at_seam
++    _run_step(scheduler, request, [42])
++    assert request.num_computed_tokens == prompt_len
++
++    request.effort_hold_prefill = False
++    request.effort_seam = seam
++    scheduler._resubmit_effort_tail(request, low_tail)
++    _requeue(scheduler, request)
++    assert request.status == RequestStatus.WAITING
++    assert request.num_computed_tokens == 0
++    assert list(request.prompt_token_ids) == (
++        list(request.prompt_token_ids[:seam]) + low_tail
++    )
++
++    new_len = seam + len(low_tail)
++    recomputed = 0
++    while request.num_computed_tokens < new_len:
++        output = _run_step(scheduler, request, [])
++        recomputed += output.num_scheduled_tokens[request.request_id]
++    assert recomputed == new_len - (keep if stop_at_seam else 0)
++
++
++def _mamba_state_cached(scheduler: Scheduler, request: Request, num_tokens: int):
++    """Whether the prefix cache holds the mamba state after `num_tokens`."""
++    block_pool = scheduler.kv_cache_manager.block_pool
++    block_hash = request.block_hashes[num_tokens // BLOCK_SIZE - 1]
++    return block_pool.get_cached_block(block_hash, [1]) is not None
++
++
++def _vote_request(scheduler: Scheduler, off_votes: int = 3) -> Request:
++    [request] = create_requests(
++        num_requests=1, num_tokens=100, max_tokens=8, block_size=BLOCK_SIZE
++    )
++    seam = 70
++    default_tail = list(request.prompt_token_ids[seam:])
++    _hold_full_default(request, seam, [[], [300, 301], default_tail])
++    request.effort_off_append = [400]
++    request.effort_meta_tail = [500, 501, 502]
++    request.effort_meta_stop_ids = {3}
++    request.effort_yes_ids = {1}
++    request.effort_no_ids = {2}
++    request.effort_off_votes = off_votes
++    request.effort_meta_max_tokens = 8
++    scheduler.add_request(request)
++    _run_step(scheduler, request, [42])
++    assert request.num_computed_tokens == 100
++    request.effort_hold_prefill = False
++    return request
++
++
++def _count_resubmissions(scheduler: Scheduler) -> list[list[int]]:
++    tails: list[list[int]] = []
++    original = scheduler._resubmit_effort_tail
++
++    def counting(request: Request, tail: list[int]):
++        tails.append(list(tail))
++        return original(request, tail)
++
++    scheduler._resubmit_effort_tail = counting  # type: ignore[method-assign]
++    return tails
++
++
++def _vote_step(scheduler: Scheduler, request: Request, entries: dict[int, float]):
++    """Run the gate's step: the sampled token plus its top logprobs."""
++    output = scheduler.schedule()
++    assert output.num_scheduled_tokens[request.request_id] > 0
++    token_ids = [next(iter(entries))] + list(entries)
++    scores = [math.log(entries[t]) for t in token_ids]
++    runner_output = ModelRunnerOutput(
++        req_ids=[request.request_id],
++        req_id_to_index={request.request_id: 0},
++        sampled_token_ids=[[token_ids[0]]],
++        logprobs=LogprobsLists(
++            logprob_token_ids=np.array([token_ids]),
++            logprobs=np.array([scores], dtype=np.float32),
++            sampled_token_ranks=np.array([0]),
++        ),
++        prompt_logprobs_dict={},
++        pooler_output=[],
++    )
++    return scheduler.update_from_output(output, runner_output)
++
++
++@pytest.mark.parametrize("off", [True, False])
++def test_off_vote_is_one_resubmission(off: bool):
++    """All votes come from one step's logprobs: the gate resubmits once for
++    the question and once for the verdict, not once per vote."""
++    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
++    scheduler._effort_cfg = DynamicEffortConfig(
++        hidden_effort=HiddenEffortConfig(
++            enabled=True, think_off_level=True, default_level=2
++        )
++    )
++    request = _vote_request(scheduler)
++    params = request.sampling_params
++    assert params is not None
++    client_sampling = (params.temperature, params.seed, params.logprobs)
++    tails = _count_resubmissions(scheduler)
++
++    update = scheduler._start_effort_off_vote(request)
++    assert update is not None
++    _requeue(scheduler, request)
++    assert tails == [request.effort_meta_tail]
++    assert params.logprobs == 20 and params.temperature == 0.7
++
++    # Every entry is a yes (or a no): the draws are certain either way.
++    entries = {1: 1.0} if off else {2: 1.0}
++    outputs = _vote_step(scheduler, request, entries)
++    [engine_output] = outputs[0].outputs
++    assert engine_output.new_token_ids == []
++    assert engine_output.routed_prompt_update is not None
++
++    assert request.effort_meta_votes == [off] * 3
++    assert len(tails) == 2
++    seam_prefix = list(request.prompt_token_ids[:70])
++    expected_tail = list(request.effort_tail_variants[2]) + [400] if off else [300, 301]
++    assert tails[1] == expected_tail
++    assert list(request.prompt_token_ids) == seam_prefix + expected_tail
++    assert request.status == RequestStatus.WAITING
++    assert (params.temperature, params.seed, params.logprobs) == client_sampling
++    assert not request.effort_meta_phase
++
++
++def test_off_vote_without_logprobs_samples_each_vote():
++    """A runner that returns no logprobs keeps the sampled-walk gate: one
++    resubmission per vote."""
++    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
++    scheduler._effort_cfg = DynamicEffortConfig(
++        hidden_effort=HiddenEffortConfig(
++            enabled=True, think_off_level=True, default_level=2
++        )
++    )
++    request = _vote_request(scheduler)
++    tails = _count_resubmissions(scheduler)
++    scheduler._start_effort_off_vote(request)
++    _requeue(scheduler, request)
++    for _ in range(3):
++        _run_step(scheduler, request, [1])
++    assert request.effort_meta_votes == [True, True, True]
++    assert [len(t) for t in tails] == [
++        3,
++        3,
++        3,
++        len(request.effort_tail_variants[2]) + 1,
++    ]
++
++
++def test_vote_probability_is_tempered_top_logprob_mass():
++    scheduler = create_scheduler(block_size=BLOCK_SIZE)
++    [request] = create_requests(num_requests=1, num_tokens=8, block_size=BLOCK_SIZE)
++    request.effort_yes_ids = {1, 5}
++    logprobs = LogprobsLists(
++        logprob_token_ids=np.array([[1, 1, 2, 5, 7]]),
++        logprobs=np.array(
++            [[math.log(0.5), math.log(0.5), math.log(0.3), math.log(0.1), -np.inf]],
++            dtype=np.float32,
++        ),
++        sampled_token_ranks=np.array([0]),
++    )
++    p_yes = scheduler._effort_vote_yes_probability(request, logprobs)
++    assert p_yes is not None
++    weights = {t: p ** (1 / 0.7) for t, p in {1: 0.5, 2: 0.3, 5: 0.1}.items()}
++    expected = (weights[1] + weights[5]) / sum(weights.values())
++    assert p_yes == pytest.approx(expected, rel=1e-5)
+diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
+index 13ed7c7b9d..1747b7012c 100644
+--- a/tests/v1/core/test_prefix_caching.py
++++ b/tests/v1/core/test_prefix_caching.py
+@@ -642,7 +642,9 @@ def test_prefill_hybrid_model_eagle():
+         4,
+     )
+ 
+-    # Evict the last block of full attention, reduces the hit length to 4.
++    # Evict the last block of full attention, reduces the hit length to 5:
++    # the request continues with the same token the cached tail block was
++    # tagged with, so eagle keeps the tail instead of dropping it.
+     _test_partial_request_hit(
+         manager,
+         block_size,
+@@ -650,7 +652,7 @@ def test_prefill_hybrid_model_eagle():
+         "5",
+         all_token_ids,
+         [make_block_hash_with_group_id(block_hashes[-1], 0)],
+-        4,
++        5,
+     )
+ 
+     # Since the last block of full attention is dropped for eagle, evict
+@@ -678,10 +680,9 @@ def test_prefill_hybrid_model_eagle():
+     )
+ 
+     # Evict different set of blocks for full attention and sliding window.
+-    # Full loses its last block so it drops to 4 full blocks after the eagle
+-    # pop; SWA lost block 0 (outside the sliding window of the final hit),
+-    # which is not required for the K+1 anchor at position 4. Coordinated
+-    # single-drop aligns both groups at hit=4.
++    # Full loses its last block and keeps 5 (its tail tag matches the
++    # request); SWA lost block 0 (outside the sliding window of the final hit),
++    # hits its 6th block and drops back to 5. Both groups align at hit=5.
+     _test_partial_request_hit(
+         manager,
+         block_size,
+@@ -693,7 +694,7 @@ def test_prefill_hybrid_model_eagle():
+             make_block_hash_with_group_id(block_hashes[0], 1),
+             make_block_hash_with_group_id(block_hashes[0], 2),
+         ],
+-        4,
++        5,
+     )
+ 
+ 
+@@ -2581,9 +2582,27 @@ def test_emit_cached_block_events_zero_cached():
+     assert pool.take_events() == []
+ 
+ 
+-def test_eagle_enabled_removes_last_block():
+-    """Verify Eagle does NOT remove blocks when request
+-    length is divisible by block size."""
++def _prime_cache(manager: KVCacheManager, request_id: str, token_ids: list[int]):
++    """Prefill `token_ids` end to end and release the request."""
++    req = make_request(request_id, token_ids, 16, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    manager.allocate_slots(
++        req, len(token_ids) - num_computed, num_computed, computed_blocks
++    )
++    manager.free(req)
++    return req
++
++
++def _eagle_hit(manager: KVCacheManager, request_id: str, token_ids: list[int]):
++    req = make_request(request_id, token_ids, 16, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    return computed_blocks, num_computed
++
++
++def test_eagle_full_hit_recomputes_one_token():
++    """A drafting request whose continuation matches the cached tail block's
++    `draft_next_tokens` tag keeps every full block: only the last prompt token
++    (needed for logits) is recomputed, not a whole block."""
+     block_size = 16
+     manager = make_kv_cache_manager(
+         make_kv_cache_config(block_size, num_blocks=10),
+@@ -2592,31 +2611,49 @@ def test_eagle_enabled_removes_last_block():
+         use_eagle=True,
+         hash_block_size=block_size,
+     )
++    assert manager.block_pool.draft_lookahead == 1
++    token_ids = list(range(3 * block_size + 1))
++    _prime_cache(manager, "prime", token_ids)
++    tail = manager.block_pool.blocks[3]
++    assert tail.draft_next_tokens == (token_ids[3 * block_size],)
+ 
+-    # Request with 3 full blocks (48 tokens)
+-    token_ids = [0] * (3 * block_size)
+-    req = make_request("divisible_request", token_ids, block_size, sha256)
++    computed_blocks, num_computed = _eagle_hit(manager, "same", token_ids)
++    assert len(computed_blocks.blocks[0]) == 3
++    assert num_computed == 3 * block_size
++    assert len(token_ids) - num_computed == 1
+ 
+-    # Prime the cache
+-    computed_blocks, _, _ = manager.get_computed_blocks(req)
+-    manager.allocate_slots(
+-        req, len(token_ids), len(computed_blocks.blocks[0]) * 16, computed_blocks
++
++def test_eagle_drops_tail_block_when_continuation_differs():
++    """The producer's drafter wrote the tail block's last position with its own
++    next token; a request that continues differently must recompute it, so the
++    tail block (or hash unit) is still dropped."""
++    block_size = 16
++    manager = make_kv_cache_manager(
++        make_kv_cache_config(block_size, num_blocks=10),
++        max_model_len=8192,
++        enable_caching=True,
++        use_eagle=True,
++        hash_block_size=block_size,
+     )
+-    manager.free(req)
++    token_ids = list(range(3 * block_size + 1))
++    _prime_cache(manager, "prime", token_ids)
+ 
+-    # New request with same tokens + Eagle enabled
+-    req_eagle = make_request("eagle_divisible", token_ids, block_size, sha256)
+-    computed_blocks, num_tokens, _ = manager.get_computed_blocks(req_eagle)
++    other = token_ids[: 3 * block_size] + [999]
++    computed_blocks, num_computed = _eagle_hit(manager, "other", other)
++    assert len(computed_blocks.blocks[0]) == 2
++    assert num_computed == 2 * block_size
+ 
+-    # Should retain 1 block:
+-    # 1. Original 3 blocks → pop last hash → 2 matched blocks
+-    # 2. drop last matched block → 1 remaining block
+-    assert len(computed_blocks.blocks[0]) == 1
+-    assert num_tokens == 1 * block_size  # 16 tokens
++    # Length divisible by the block size: the last block is unreachable
++    # (max hit is num_tokens - 1); the tail then is block 1, whose tag matches.
++    exact = token_ids[: 3 * block_size]
++    computed_blocks, num_computed = _eagle_hit(manager, "exact", exact)
++    assert num_computed == 2 * block_size
+ 
+ 
+-def test_eagle_with_partial_blocks():
+-    """Test Eagle behavior with requests containing partial blocks."""
++def test_eagle_prefers_duplicate_with_matching_continuation():
++    """After a differently-continued request recomputes the tail block, both
++    copies are cached under the same hash; lookups pick the copy whose tag
++    matches, so either continuation gets the full hit."""
+     block_size = 16
+     manager = make_kv_cache_manager(
+         make_kv_cache_config(block_size, num_blocks=10),
+@@ -2625,23 +2662,123 @@ def test_eagle_with_partial_blocks():
+         use_eagle=True,
+         hash_block_size=block_size,
+     )
+-    # 2 full blocks + 5 tokens (non-divisible length)
+-    token_ids = [0] * (2 * block_size + 5)
+-    req = make_request("partial_block_test", token_ids, block_size, sha256)
++    token_ids = list(range(3 * block_size + 1))
++    other = token_ids[: 3 * block_size] + [999]
++    _prime_cache(manager, "prime", token_ids)
++    _prime_cache(manager, "other", other)
+ 
+-    # Prime the cache
+-    computed_blocks, _, _ = manager.get_computed_blocks(req)
+-    manager.allocate_slots(
+-        req, len(token_ids), len(computed_blocks.blocks[0]) * 16, computed_blocks
++    for rid, ids in (("a", token_ids), ("b", other)):
++        computed_blocks, num_computed = _eagle_hit(manager, rid, ids)
++        assert num_computed == 3 * block_size
++        assert computed_blocks.blocks[0][-1].draft_next_tokens == (ids[-1],)
++
++
++def test_eagle_tag_is_filled_in_after_sampling():
++    """A block ending at the request's current end is cached before its next
++    token is sampled; the tag is filled in by the next allocation (decode) or,
++    for a request that finishes right there, on free."""
++    block_size = 16
++    manager = make_kv_cache_manager(
++        make_kv_cache_config(block_size, num_blocks=10),
++        max_model_len=8192,
++        enable_caching=True,
++        use_eagle=True,
++        hash_block_size=block_size,
+     )
++    prompt = list(range(2 * block_size))
++    req = make_request("gen", prompt, block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    manager.allocate_slots(req, len(prompt), num_computed, computed_blocks)
++    tail = manager.block_pool.blocks[2]
++    assert tail.block_hash is not None and tail.draft_next_tokens is None
++
++    # Decode step: the sampled token is committed, the next allocation tags.
++    req.append_output_token_ids(7)
++    req.num_computed_tokens = len(prompt)
++    manager.allocate_slots(req, 1, 0)
++    assert tail.draft_next_tokens == (7,)
++    req.append_output_token_ids(8)
++    req.num_computed_tokens += 1
+     manager.free(req)
+ 
+-    # New request with Eagle enabled
+-    req_eagle = make_request("partial_eagle", token_ids, block_size, sha256)
+-    computed_blocks, num_tokens, _ = manager.get_computed_blocks(req_eagle)
+-    # Original match: 2 full blocks → Eagle removes 1 → 1 remaining
+-    assert len(computed_blocks.blocks[0]) == 1
+-    assert num_tokens == 1 * block_size
++    computed_blocks, num_computed = _eagle_hit(manager, "next", prompt + [7, 8])
++    assert num_computed == 2 * block_size
++
++    # Finish exactly at a block boundary: free() tags the last full block.
++    prompt2 = [500 + i for i in range(2 * block_size)]
++    req2 = make_request("fin", prompt2, block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req2)
++    manager.allocate_slots(req2, len(prompt2), num_computed, computed_blocks)
++    req2.append_output_token_ids(9)
++    req2.num_computed_tokens = len(prompt2)
++    manager.free(req2)
++    computed_blocks, num_computed = _eagle_hit(manager, "next2", prompt2 + [9])
++    assert num_computed == 2 * block_size
++
++
++def test_eagle_full_hit_hybrid_mamba_align():
++    """Hybrid full-attention + Mamba (align mode, attention block size forced to
++    the Mamba block): a drafting request with a matching continuation keeps the
++    block-aligned hit for both groups (the Mamba state at the boundary does not
++    depend on the next token) and recomputes only the prompt tail past it."""
++    block_size = 16
++    manager = make_kv_cache_manager(
++        _make_hybrid_kv_cache_config(block_size, 30, ["full", "mamba_align"]),
++        max_model_len=8192,
++        enable_caching=True,
++        use_eagle=True,
++        hash_block_size=block_size,
++    )
++    assert not manager.coordinator.enable_partial_hash_hits
++    token_ids = list(range(3 * block_size + 5))
++
++    # Prefill the way the align-mode scheduler splits it: block-aligned chunks
++    # (a Mamba state is stored at each chunk end), then the tail.
++    req = make_request("prime", token_ids, block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    assert num_computed == 0
++    for num_new in (2 * block_size, block_size, 5):
++        assert manager.allocate_slots(req, num_new, 0, computed_blocks)
++        computed_blocks = None
++        req.num_computed_tokens += num_new
++    manager.free(req)
++
++    computed_blocks, num_computed = _eagle_hit(manager, "same", token_ids)
++    assert num_computed == 3 * block_size
++    assert len(computed_blocks.blocks[0]) == 3
++    mamba_blocks = computed_blocks.blocks[1]
++    assert len(mamba_blocks) == 3 and not mamba_blocks[-1].is_null
++    assert len(token_ids) - num_computed == 5
++
++    other = token_ids[: 3 * block_size] + [999] * 5
++    computed_blocks, num_computed = _eagle_hit(manager, "other", other)
++    assert num_computed == 2 * block_size
++    assert len(computed_blocks.blocks[0]) == 2
++
++
++def test_eagle_multi_token_lookahead_tag():
++    """Multi-module MTP consumes `num_prefill_lookahead` tokens past the
++    boundary; the tag covers all of them and any difference drops the tail."""
++    block_size = 16
++    manager = make_kv_cache_manager(
++        make_kv_cache_config(block_size, num_blocks=10),
++        max_model_len=8192,
++        enable_caching=True,
++        use_eagle=True,
++        hash_block_size=block_size,
++        num_prefill_lookahead=2,
++    )
++    assert manager.block_pool.draft_lookahead == 2
++    token_ids = list(range(2 * block_size + 3))
++    _prime_cache(manager, "prime", token_ids)
++    assert manager.block_pool.blocks[2].draft_next_tokens == tuple(
++        token_ids[2 * block_size : 2 * block_size + 2]
++    )
++    _, num_computed = _eagle_hit(manager, "same", token_ids)
++    assert num_computed == 2 * block_size
++    other = token_ids[: 2 * block_size + 1] + [999, 999]
++    _, num_computed = _eagle_hit(manager, "other", other)
++    assert num_computed == block_size
+ 
+ 
+ def test_eagle_with_sliding_window():
+diff --git a/vllm/entrypoints/openai/chat_completion/effort_tails.py b/vllm/entrypoints/openai/chat_completion/effort_tails.py
+new file mode 100644
+index 0000000000..8c736c0093
+--- /dev/null
++++ b/vllm/entrypoints/openai/chat_completion/effort_tails.py
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tokenize dynamic-effort level variants without re-tokenizing the body.
++
++Every level variant of a dynamic-effort request (§13.3) is the same
++conversation with a different tail: the level sentence, the think-off block or
++the hidden off-vote question. Tokenizing the whole prompt once per level costs
++~0.1 s each at agent-sized prompts, so only the default level goes through the
++full renderer; the other levels reuse its token ids up to a cut and tokenize the
++few hundred characters after it.
++
++The cut is the start of the last special token (`<|im_start|>` and friends)
++inside the variants' common text prefix. HF tokenizers split added special
++tokens out before BPE, so a text cut at one is a hard tokenization boundary:
++`encode(a + b) == encode(a) + encode(b)` whenever `b` starts with a special
++token. The default variant proves the boundary on the way (its full-render ids
++must end with the re-encoded tail); if anything does not line up the caller
++falls back to a full render.
++"""
++
++from collections.abc import Iterable, Sequence
++
++
++def common_prefix_len(texts: Sequence[str]) -> int:
++    """Length of the longest character prefix shared by every text."""
++    if not texts:
++        return 0
++    common = min(len(t) for t in texts)
++    first = texts[0]
++    for text in texts[1:]:
++        # Binary search on slice equality: each probe is one C-level compare,
++        # so a 300k-character prompt costs ~20 compares, not a Python loop.
++        lo, hi = 0, min(common, len(text))
++        while lo < hi:
++            mid = (lo + hi + 1) // 2
++            if text[:mid] == first[:mid]:
++                lo = mid
++            else:
++                hi = mid - 1
++        common = lo
++    return common
++
++
++def special_token_cut(
++    texts: Sequence[str], special_tokens: Iterable[str]
++) -> int | None:
++    """Start of the last special token wholly inside the texts' common prefix."""
++    common = common_prefix_len(texts)
++    if common == 0:
++        return None
++    first = texts[0]
++    cut = max(
++        (first.rfind(tok, 0, common) for tok in special_tokens if tok),
++        default=-1,
++    )
++    return cut if cut > 0 else None
++
++
++def tokenize_variant_tails(
++    encode,
++    default_text: str,
++    default_ids: Sequence[int],
++    variant_texts: Sequence[str],
++    special_tokens: Iterable[str],
++) -> list[list[int]] | None:
++    """Token ids of each variant, tokenizing only the text after the cut.
++
++    Args:
++        encode: `text -> list[int]` without special-token insertion.
++        default_text: the rendered text of the variant already tokenized.
++        default_ids: the full-render token ids of `default_text`.
++        variant_texts: rendered text of every variant, `default_text` included.
++        special_tokens: added tokens the tokenizer splits before BPE.
++
++    Returns:
++        One id list per entry of `variant_texts`, or `None` when no cut proves
++        exact - the caller then tokenizes each variant in full.
++    """
++    cut = special_token_cut([default_text, *variant_texts], special_tokens)
++    if cut is None:
++        return None
++    default_tail = encode(default_text[cut:])
++    body_len = len(default_ids) - len(default_tail)
++    if body_len <= 0 or list(default_ids[body_len:]) != list(default_tail):
++        return None
++    body = list(default_ids[:body_len])
++    return [
++        body + (default_tail if text == default_text else encode(text[cut:]))
++        for text in variant_texts
++    ]
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index fbc4c11baa..6aa084ba38 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -32,6 +32,9 @@ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+     off_vote_variant,
+     split_body_and_tails,
+ )
++from vllm.entrypoints.openai.chat_completion.effort_tails import (
++    tokenize_variant_tails,
++)
+ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionLogProb,
+     ChatCompletionLogProbs,
+@@ -67,10 +70,12 @@ from vllm.logprobs import Logprob
+ from vllm.outputs import RequestOutput
+ from vllm.parser import ParserManager
+ from vllm.parser.abstract_parser import Parser
++from vllm.renderers import merge_kwargs
+ from vllm.renderers.online_renderer import OnlineRenderer
+ from vllm.sampling_params import BeamSearchParams, SamplingParams
+ from vllm.tokenizers import TokenizerLike
+ from vllm.utils.collection_utils import as_list
++from vllm.utils.mistral import is_mistral_tokenizer
+ from vllm.utils.serial_utils import numpy2base64
+ 
+ logger = init_logger(__name__)
+@@ -229,6 +234,111 @@ class OpenAIServingChat(GenerateBaseServing):
+ 
+         return await self.online_renderer.render_chat(request)
+ 
++    async def _render_effort_variants_full(
++        self,
++        default_input: EngineInput,
++        variant_requests: list[ChatCompletionRequest | None],
++    ) -> list[list[int] | None] | ErrorResponse | None:
++        """Token ids of every level, each through the full renderer."""
++        default_ids = self._extract_prompt_components(default_input).token_ids
++        rendered: list[list[int] | None] = []
++        for variant_request in variant_requests:
++            if variant_request is None:
++                rendered.append(default_ids)
++                continue
++            result = await self.render_chat_request(variant_request)
++            if isinstance(result, ErrorResponse):
++                return result
++            _, variant_inputs = result
++            if len(variant_inputs) != 1:
++                return None
++            rendered.append(
++                self._extract_prompt_components(variant_inputs[0]).token_ids
++            )
++        return rendered
++
++    async def _tokenize_effort_variants(
++        self,
++        request: ChatCompletionRequest,
++        default_input: EngineInput,
++        variant_requests: list[ChatCompletionRequest | None],
++    ) -> list[list[int]] | None:
++        """Token ids of every level from one tokenization of the conversation.
++
++        Each non-default level is run through the chat template only (no
++        tokenization); its ids are the default level's ids up to the last
++        special token the rendered texts share, plus the tokenized remainder.
++        Texts that diverge earlier than the last message (e.g.
++        `preserve_thinking=false` with a think-off level) just get a longer
++        tail. `None` when exactness cannot be proven - multimodal or truncated
++        prompts, a non-HF tokenizer, no shared special token, or a default
++        tail that does not re-tokenize to its own ids.
++        """
++        tokenizer = self.renderer.tokenizer
++        if (
++            tokenizer is None
++            or is_mistral_tokenizer(tokenizer)
++            or self.model_config.enable_prompt_embeds
++            or request.truncate_prompt_tokens is not None
++        ):
++            return None
++        components = self._extract_prompt_components(default_input)
++        default_text, default_ids = components.text, components.token_ids
++        if (
++            not isinstance(default_text, str)
++            or default_ids is None
++            or not isinstance(default_input, dict)
++            or "multi_modal_data" in default_input
++        ):
++            return None
++        variant_texts: list[str] = []
++        for variant_request in variant_requests:
++            if variant_request is None:
++                variant_texts.append(default_text)
++                continue
++            text = await self._render_effort_variant_text(variant_request)
++            if text is None:
++                return None
++            variant_texts.append(text)
++        return tokenize_variant_tails(
++            lambda text: tokenizer.encode(text, add_special_tokens=False),
++            default_text,
++            default_ids,
++            variant_texts,
++            tokenizer.all_special_tokens,
++        )
++
++    async def _render_effort_variant_text(
++        self, request: ChatCompletionRequest
++    ) -> str | None:
++        """The chat template's output for `request`, exactly as
++        `OnlineRenderer.preprocess_chat` would build it, but not tokenized."""
++        online = self.online_renderer
++        if request.tools is None or (
++            request.tool_choice == "none" and online.exclude_tools_when_tool_choice_none
++        ):
++            tool_dicts = None
++        else:
++            tool_dicts = [tool.model_dump() for tool in request.tools]
++        mm_config = self.model_config.multimodal_config
++        chat_params = request.build_chat_params(
++            online.chat_template, online.chat_template_content_format
++        ).with_defaults(
++            merge_kwargs(
++                online.default_chat_template_kwargs,
++                dict(tools=tool_dicts, tokenize=False),
++            ),
++            default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
++            default_mm_processor_kwargs=request.mm_processor_kwargs,
++        )
++        _, prompt = await online.renderer.render_messages_async(
++            request.messages, chat_params
++        )
++        if not isinstance(prompt, dict) or "multi_modal_data" in prompt:
++            return None
++        text = prompt.get("prompt")
++        return text if isinstance(text, str) else None
++
+     async def _attach_effort_tails(
+         self,
+         request: ChatCompletionRequest,
+@@ -236,11 +346,11 @@ class OpenAIServingChat(GenerateBaseServing):
+     ) -> ErrorResponse | None:
+         """Render the other levels and record the §13.3 body/tail seam.
+ 
+-        The prompt already submitted is the default-level variant. Rendering the rest
+-        costs one chat-template pass and one tokenization each; the engine only
+-        ever prefills the body once, because the body is identical across levels.
+-        Anything unexpected (multiple prompts, an empty seam) silently leaves
+-        the request on today's single-level path.
++        The prompt already submitted is the default-level variant. The rest
++        cost one chat-template pass each and tokenize only their tail; the
++        engine only ever prefills the body once, because the body is identical
++        across levels. Anything unexpected (multiple prompts, an empty seam)
++        silently leaves the request on today's single-level path.
+         """
+         variants = request._dynamic_effort_variant_messages
+         request._dynamic_effort_variant_messages = None
+@@ -254,11 +364,10 @@ class OpenAIServingChat(GenerateBaseServing):
+         if len(engine_inputs) != 1:
+             return None
+         default_level = request._dynamic_effort["default_level"]
+-        default_token_ids = self._extract_prompt_components(engine_inputs[0]).token_ids
+-        rendered = []
++        variant_requests: list[ChatCompletionRequest | None] = []
+         for level, messages in enumerate(variants):
+             if level == default_level:
+-                rendered.append(default_token_ids)
++                variant_requests.append(None)
+                 continue
+             variant_request = copy(request)
+             variant_request.messages = messages
+@@ -268,16 +377,17 @@ class OpenAIServingChat(GenerateBaseServing):
+                     **(request.chat_template_kwargs or {}),
+                     "enable_thinking": False,
+                 }
+-            result = await self.render_chat_request(variant_request)
+-            if isinstance(result, ErrorResponse):
+-                return result
+-            _, variant_inputs = result
+-            if len(variant_inputs) != 1:
+-                return None
+-            rendered.append(
+-                self._extract_prompt_components(variant_inputs[0]).token_ids
++            variant_requests.append(variant_request)
++        rendered = await self._tokenize_effort_variants(
++            request, engine_inputs[0], variant_requests
++        )
++        if rendered is None:
++            rendered = await self._render_effort_variants_full(
++                engine_inputs[0], variant_requests
+             )
+-        if any(ids is None for ids in rendered):
++        if isinstance(rendered, ErrorResponse):
++            return rendered
++        if rendered is None or any(ids is None for ids in rendered):
+             return None
+         split = split_body_and_tails([list(ids) for ids in rendered])  # type: ignore[arg-type]
+         if split is None:
+@@ -300,10 +410,16 @@ class OpenAIServingChat(GenerateBaseServing):
+                 if eos is not None:
+                     stop_ids.add(int(eos))
+                 for text, bucket in (
+-                    ("yes", yes_ids), ("Yes", yes_ids), ("YES", yes_ids),
+-                    (" yes", yes_ids), (" Yes", yes_ids),
+-                    ("no", no_ids), ("No", no_ids), ("NO", no_ids),
+-                    (" no", no_ids), (" No", no_ids),
++                    ("yes", yes_ids),
++                    ("Yes", yes_ids),
++                    ("YES", yes_ids),
++                    (" yes", yes_ids),
++                    (" Yes", yes_ids),
++                    ("no", no_ids),
++                    ("No", no_ids),
++                    ("NO", no_ids),
++                    (" no", no_ids),
++                    (" No", no_ids),
+                 ):
+                     ids = tokenizer.encode(text, add_special_tokens=False)
+                     if len(ids) == 1:
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 8e60993a21..0234063205 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -85,6 +85,18 @@ class BlockHashToBlockMap:
+         self._unexpected_blocks_type(blocks)
+         return None
+ 
++    def iter_blocks(self, key: BlockHashWithGroupId) -> Iterable[KVCacheBlock]:
++        """All blocks cached under `key` (duplicates included)."""
++        blocks = self._cache.get(key)
++        if blocks is None:
++            return ()
++        if isinstance(blocks, KVCacheBlock):
++            return (blocks,)
++        if isinstance(blocks, dict):
++            return blocks.values()
++        self._unexpected_blocks_type(blocks)
++        return ()
++
+     def contain(self, key: BlockHashWithGroupId, block_id: int) -> bool:
+         """
+         Checks whether the key maps to the given block ID.
+@@ -188,6 +200,13 @@ class BlockPool:
+         # Set for the duration of a prefix-cache lookup that must not reuse
+         # blocks with incomplete drafter KV (see KVCacheManager).
+         self.require_draft_complete = False
++        # Number of tokens past a hash boundary that the drafter's KV at the
++        # boundary depends on (0 when no EAGLE/MTP drafter has a KV group).
++        self.draft_lookahead = 0
++        # Token ids of the request being looked up, set for the duration of a
++        # prefix-cache lookup so the eagle tail check can compare them against
++        # `KVCacheBlock.draft_next_tokens`.
++        self.lookup_token_ids: Sequence[int] | None = None
+         # All kv-cache blocks.
+         self.blocks: list[KVCacheBlock] = [
+             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+@@ -239,6 +258,79 @@ class BlockPool:
+             cached_blocks.append(block)
+         return cached_blocks
+ 
++    def _draft_tag(self, request: Request, num_tokens: int) -> tuple[int, ...] | None:
++        """The `draft_lookahead` committed tokens following `num_tokens`.
++
++        None when tagging is off or the tokens are not committed yet (a block
++        whose boundary is the request's current end, or async placeholders).
++        """
++        lookahead = self.draft_lookahead
++        if lookahead == 0:
++            return None
++        end = num_tokens + lookahead
++        if end > request.num_tokens - request.num_output_placeholders:
++            return None
++        return tuple(request.all_token_ids[num_tokens:end])
++
++    def tag_draft_tail(
++        self, request: Request, block: KVCacheBlock, num_tokens: int
++    ) -> None:
++        """Late-tag a cached block whose next tokens were unknown at cache
++        time (the block ended exactly at the request's committed end)."""
++        if (
++            self.draft_lookahead == 0
++            or block.draft_next_tokens is not None
++            or block.is_null
++            or block.block_hash_num_tokens != num_tokens
++        ):
++            return
++        block.draft_next_tokens = self._draft_tag(request, num_tokens)
++
++    def draft_tail_blocks(
++        self, blocks: list[KVCacheBlock], num_tokens: int
++    ) -> list[KVCacheBlock] | None:
++        """Resolve the tail blocks of a `num_tokens`-long hit to ones whose
++        drafter KV is valid for the request being looked up.
++
++        A hit block's drafter KV at its last position was written with the
++        producer's next tokens (`draft_next_tokens`). It serves the looked-up
++        request as is when those tokens match the request's own; otherwise a
++        duplicate under the same hash with matching tokens is substituted.
++        Returns None (caller drops the tail) when any group cannot be
++        resolved or the tokens are unknown on either side.
++        """
++        tokens = self.lookup_token_ids
++        if tokens is None or self.draft_lookahead == 0:
++            return None
++        end = num_tokens + self.draft_lookahead
++        if end > len(tokens):
++            return None
++        expected = tuple(tokens[num_tokens:end])
++        resolved: list[KVCacheBlock] = []
++        for block in blocks:
++            if (
++                block.block_hash_num_tokens == num_tokens
++                and block.draft_next_tokens == expected
++            ):
++                resolved.append(block)
++                continue
++            key = block.block_hash
++            if key is None:
++                return None
++            match = None
++            for candidate in self.cached_block_hash_to_block.iter_blocks(key):
++                if (
++                    candidate.block_hash_num_tokens == num_tokens
++                    and candidate.draft_next_tokens == expected
++                    and not (self.require_draft_complete and candidate.draft_stale)
++                ):
++                    match = candidate
++                    break
++            if match is None:
++                return None
++            resolved.append(match)
++        return resolved
++
+     def cache_full_blocks(
+         self,
+         request: Request,
+@@ -313,6 +405,7 @@ class BlockPool:
+                 num_tokens=num_hash_tokens,
+             )
+             blk.draft_stale = request.draft_stale
++            blk.draft_next_tokens = self._draft_tag(request, num_hash_tokens)
+             if new_hashes is not None:
+                 new_hashes.append(maybe_convert_block_hash(block_hash))
+ 
+@@ -528,6 +621,9 @@ class BlockPool:
+             block,
+             num_tokens=num_hash_blocks * self.hash_block_size,
+         )
++        block.draft_next_tokens = self._draft_tag(
++            request, num_hash_blocks * self.hash_block_size
++        )
+         if self.enable_kv_cache_events and not already_cached:
+             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
+                 request, num_tokens
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 89546d71b1..8ffbbd22e3 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -109,6 +109,11 @@ class KVCacheCoordinator(ABC):
+         # Conservatively fall back to flag all groups when no group is flagged.
+         if use_eagle and not self.eagle_group_ids:
+             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
++        # Tag cached blocks with the tokens the drafter consumed past their
++        # boundary so a hit whose continuation matches keeps its tail block
++        # instead of dropping it (see FullAttentionManager.find_longest_cache_hit).
++        if enable_caching and self.eagle_group_ids:
++            self.block_pool.draft_lookahead = max(1, num_prefill_lookahead)
+ 
+         # During chunked prefill with EAGLE, the single next prefill lookahead
+         # token past the chunk boundary is combined with the final hidden state
+@@ -863,6 +868,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 )
+                 if drop_eagle_block:
+                     eagle_verified.add(idx)
++                    if _new_hit_length > curr_hit_length:
++                        # The margin block hit and the tail tag matched, so no
++                        # drop happened: land on the candidate anyway (its tail
++                        # is followed by a hit block, hence draft-complete).
++                        _new_hit_length = curr_hit_length
++                        num_blocks = cdiv(curr_hit_length, group_block_size)
++                        for blocks in hit_blocks:
++                            del blocks[num_blocks:]
+                 elif _new_hit_length < curr_hit_length:
+                     # length shrunk; invalidate previous eagle verifications
+                     eagle_verified.clear()
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index a4d2c0c309..cda19910c1 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -266,6 +266,7 @@ class KVCacheManager:
+         # could slightly improve performance in the future.
+         max_cache_hit_length = request.num_tokens - 1
+         self.block_pool.require_draft_complete = require_draft_complete
++        self.block_pool.lookup_token_ids = request.all_token_ids
+         try:
+             computed_blocks, num_new_computed_tokens, num_uncached = (
+                 self.coordinator.find_longest_cache_hit(
+@@ -274,6 +275,7 @@ class KVCacheManager:
+             )
+         finally:
+             self.block_pool.require_draft_complete = False
++            self.block_pool.lookup_token_ids = None
+ 
+         # When kv_cache_report_mode is "full", emit BlockStored events
+         # for the reused prefix cache blocks so that external consumers
+@@ -339,9 +341,13 @@ class KVCacheManager:
+             return self.empty_kv_cache_blocks, 0, 0, False
+ 
+         fa_group_id = coordinator.full_attention_group_id
+-        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+-            request.block_hashes, request.num_tokens - 1
+-        )
++        self.block_pool.lookup_token_ids = request.all_token_ids
++        try:
++            computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
++                request.block_hashes, request.num_tokens - 1
++            )
++        finally:
++            self.block_pool.lookup_token_ids = None
+         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
+             # A lagging group hit deeper than full attention means its
+             # full-attention blocks were evicted; use the reconciled boundary
+@@ -594,6 +600,12 @@ class KVCacheManager:
+         pins = self._partial_tail_pins.pop(request.request_id, None)
+         if pins:
+             self.block_pool.free_blocks(pins)
++        if self.block_pool.draft_lookahead:
++            # A finishing request's last full block may still lack its tag.
++            for manager in self.coordinator.single_type_managers:
++                manager.tag_draft_tail(
++                    request, manager.num_cached_block.get(request.request_id, 0)
++                )
+         self.coordinator.free(request.request_id)
+ 
+     def remove_skipped_blocks(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index b451cab0a9..5372aee8f4 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -140,6 +140,11 @@ class KVCacheBlock:
+     # Cached by a request whose drafter had skipped some of its tokens, so the
+     # drafter's KV in this block is incomplete (see SpeculativeConfig.lazy_draft).
+     draft_stale: bool = False
++    # Tokens the drafter consumed past this block's hash boundary when it wrote
++    # the block's tail KV (EAGLE/MTP shift the draft input by one token, so the
++    # last position's drafter KV depends on the next `draft_lookahead` tokens).
++    # None when unknown; see BlockPool.draft_tail_blocks.
++    draft_next_tokens: tuple[int, ...] | None = None
+ 
+     @property
+     def block_hash(self) -> BlockHashWithGroupId | None:
+@@ -165,6 +170,7 @@ class KVCacheBlock:
+         self._block_hash = None
+         self._block_hash_num_tokens = None
+         self.draft_stale = False
++        self.draft_next_tokens = None
+ 
+     def __repr__(self) -> str:
+         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 86fbe37c53..3be4ba9878 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3,6 +3,7 @@
+ import itertools
+ import math
+ import time
++import zlib
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+ from dataclasses import replace
+@@ -81,7 +82,12 @@ from vllm.v1.engine import (
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
++from vllm.v1.outputs import (
++    DraftTokenIds,
++    KVConnectorOutput,
++    LogprobsLists,
++    ModelRunnerOutput,
++)
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+ from vllm.v1.sample.effort_signals import EffortTelemetrySink
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+@@ -97,6 +103,15 @@ before it gives up and runs at the default level. Purely a liveness bound: the
+ request is simply not scheduled while it waits, and the vector normally arrives
+ on the first step after the body prefill."""
+ 
++EFFORT_OFF_VOTE_TEMPERATURE = 0.7
++"""Sampling temperature of the think-off gate's yes/no votes."""
++
++EFFORT_OFF_VOTE_LOGPROBS = 20
++"""Top logprobs requested for the gate's first token. All `off_votes` votes are
++drawn from that one tempered distribution, so the gate costs a single
++resubmission instead of one per vote; mass outside the top entries counts as
++no, like any token that is not a clean yes."""
++
+ 
+ def adaptive_num_spec_tokens(
+     emas: list[float | None],
+@@ -545,6 +560,14 @@ class Scheduler(SchedulerInterface):
+             start + (request.shared_prefix_boundary - start) // block_size * block_size
+             if start < request.shared_prefix_boundary < end
+             else 0,
++            # Full-default effort form: a non-default level resubmits the
++            # request with another tail spliced at the seam, and its prefix
++            # hit can only resume where a chunk ended. End one at the last
++            # aligned boundary at or before the seam, so the resubmission
++            # recomputes the seam's partial block alone.
++            request.effort_seam // block_size * block_size
++            if request.effort_hold_prefill and request.effort_seam
++            else 0,
+         )
+         # Stop at the earliest mandatory position strictly inside the chunk.
+         end = min((s for s in stops if start < s < end), default=end)
+@@ -2178,7 +2201,14 @@ class Scheduler(SchedulerInterface):
+ 
+             if request.effort_meta_phase and not output_is_stale:
+                 # Hidden guidance generation: keep the tokens, show none.
+-                update = self._step_effort_meta(request, new_token_ids, stopped)
++                meta_logprobs = (
++                    logprobs.slice_request(req_index, len(new_token_ids))
++                    if logprobs and new_token_ids
++                    else None
++                )
++                update = self._step_effort_meta(
++                    request, new_token_ids, stopped, meta_logprobs
++                )
+                 if update is not None:
+                     effort_requeued.add(request)
+                     outputs[request.client_index].append(
+@@ -2877,15 +2907,11 @@ class Scheduler(SchedulerInterface):
+                         request.effort_no_ids = {
+                             int(i) for i in overrides.get("no_ids") or []
+                         }
+-                        request.effort_off_votes = int(
+-                            overrides.get("off_votes") or 0
+-                        )
++                        request.effort_off_votes = int(overrides.get("off_votes") or 0)
+                         request.effort_meta_max_tokens = int(
+                             overrides.get("off_vote_max_tokens") or 8
+                         )
+-                        request.effort_force_off = bool(
+-                            overrides.get("force_off")
+-                        )
++                        request.effort_force_off = bool(overrides.get("force_off"))
+                 else:
+                     boundary = self._effort_body_boundary(request, body_len)
+                     if boundary and self._effort_split_worth_it(request, boundary):
+@@ -2895,9 +2921,7 @@ class Scheduler(SchedulerInterface):
+                         # head of every tail.
+                         middle = list(request.prompt_token_ids[boundary:body_len])
+                         request.effort_body_len = boundary
+-                        request.effort_tail_variants = [
+-                            middle + list(t) for t in tails
+-                        ]
++                        request.effort_tail_variants = [middle + list(t) for t in tails]
+                         request.effort_hold_prefill = True
+                         request.effort_decision_pending = True
+                 if self._effort_trace_budget > 0:
+@@ -3172,19 +3196,34 @@ class Scheduler(SchedulerInterface):
+         )
+ 
+     def _start_effort_off_vote(self, request: Request) -> RoutedPromptUpdate:
+-        """Resubmit the hidden yes/no question for the first off-gate vote.
++        """Resubmit the hidden yes/no question for the off-gate votes.
+ 
+         The question's prompt shares every block with the default prompt up to
+-        the seam, so the resubmission decodes over a warm cache. Votes are
+-        sampled at temperature 0.7 with the vote index as seed - independent
+-        enough for a quorum even when the client asked for greedy - and the
+-        client's sampling is restored before the real request resumes.
++        the seam, so the resubmission decodes over a warm cache. The step also
++        returns the top logprobs of the question's first token; every vote is
++        a draw from that distribution at the vote temperature, which is what
++        sampling the token `off_votes` times would do, without paying the
++        seam's recompute per vote. Without logprobs (a runner that returns
++        none) the votes fall back to one sampled walk each, seeded by vote
++        index. The client's sampling is restored before the request resumes.
+         """
+         params = request.sampling_params
+         assert params is not None
+-        request.effort_saved_sampling = (params.temperature, params.seed)
+-        params.temperature = 0.7
++        request.effort_saved_sampling = (
++            params.temperature,
++            params.seed,
++            params.logprobs,
++        )
++        params.temperature = EFFORT_OFF_VOTE_TEMPERATURE
+         params.seed = 1
++        max_logprobs = self.vllm_config.model_config.max_logprobs
++        num_logprobs = (
++            EFFORT_OFF_VOTE_LOGPROBS
++            if max_logprobs < 0
++            else min(EFFORT_OFF_VOTE_LOGPROBS, max_logprobs)
++        )
++        if num_logprobs > 0:
++            params.logprobs = num_logprobs
+         request.effort_meta_phase = True
+         request.effort_meta_tokens = []
+         request.effort_meta_votes = []
+@@ -3197,7 +3236,9 @@ class Scheduler(SchedulerInterface):
+         """Restore the client's sampling and render the gate's verdict."""
+         params = request.sampling_params
+         if params is not None and request.effort_saved_sampling is not None:
+-            params.temperature, params.seed = request.effort_saved_sampling
++            params.temperature, params.seed, params.logprobs = (
++                request.effort_saved_sampling
++            )
+             request.effort_saved_sampling = None
+         request.effort_meta_phase = False
+         tails = request.effort_tail_variants or []
+@@ -3226,16 +3267,38 @@ class Scheduler(SchedulerInterface):
+         return self._resubmit_effort_tail(request, tail)
+ 
+     def _step_effort_meta(
+-        self, request: Request, new_token_ids: list[int], stopped: bool
++        self,
++        request: Request,
++        new_token_ids: list[int],
++        stopped: bool,
++        logprobs: LogprobsLists | None = None,
+     ) -> RoutedPromptUpdate | None:
+         """Advance the off gate by one step.
+ 
+-        A vote ends at its first yes/no token, at a stop id, at
++        With the first token's logprobs at hand, all `off_votes` votes are
++        drawn at once from its tempered distribution (a yes is a token in
++        `yes_ids`; everything else is no) and the gate ends in this step.
++        Otherwise a vote ends at its first yes/no token, at a stop id, at
+         `off_vote_max_tokens`, or if the request itself stopped; anything but
+         a clean yes counts as no. Any no ends the gate at the resting low
+         level; `off_votes` unanimous yeses confirm think-off.
+         """
+         tokens = request.effort_meta_tokens
++        if (
++            logprobs is not None
++            and not tokens
++            and not request.effort_meta_votes
++            and (p_yes := self._effort_vote_yes_probability(request, logprobs))
++            is not None
++        ):
++            rng = np.random.default_rng(zlib.crc32(request.request_id.encode()))
++            draws = rng.random(request.effort_off_votes)
++            votes = [bool(draw < p_yes) for draw in draws]
++            if stopped:
++                # check_stop marked the request finished; it is not.
++                request.status = RequestStatus.RUNNING
++            request.effort_meta_votes = votes
++            return self._finish_effort_off_vote(request, off=all(votes))
+         vote: bool | None = None
+         done = stopped
+         for tok in new_token_ids:
+@@ -3269,6 +3332,40 @@ class Scheduler(SchedulerInterface):
+         assert request.effort_meta_tail is not None
+         return self._resubmit_effort_tail(request, request.effort_meta_tail)
+ 
++    def _effort_vote_yes_probability(
++        self, request: Request, logprobs: LogprobsLists
++    ) -> float | None:
++        """P(first gate token is a yes) at the vote temperature.
++
++        Renormalises the returned entries (the sampled token and the top
++        logprobs, which double as its support) after tempering; raw modes
++        need the temperature applied here, processed ones already carry it.
++        None when the step returned no usable entries.
++        """
++        if len(logprobs.logprobs) == 0:
++            return None
++        scores: dict[int, float] = {}
++        for token_id, score in zip(
++            logprobs.logprob_token_ids[0].tolist(), logprobs.logprobs[0].tolist()
++        ):
++            if math.isfinite(score):
++                scores[int(token_id)] = float(score)
++        if not scores:
++            return None
++        mode = self.vllm_config.model_config.logprobs_mode
++        inv_temperature = (
++            1.0 / EFFORT_OFF_VOTE_TEMPERATURE if mode.startswith("raw") else 1.0
++        )
++        top = max(scores.values())
++        total = 0.0
++        yes = 0.0
++        for token_id, score in scores.items():
++            weight = math.exp((score - top) * inv_temperature)
++            total += weight
++            if token_id in request.effort_yes_ids:
++                yes += weight
++        return yes / total
++
+     def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
+         """Record a finished request in the memory (§13.4).
+ 
+@@ -3284,9 +3381,7 @@ class Scheduler(SchedulerInterface):
+             # An abort or a max_tokens cap truncates the thinking, so the
+             # length the request would have spent is unknown.
+             close_kind = CLOSE_CLIENT_LIMIT
+-        think_off = (
+-            memory.cfg.think_off_level and state.level == 0 and state.decided
+-        )
++        think_off = memory.cfg.think_off_level and state.level == 0 and state.decided
+         memory.insert(
+             vector,
+             state.reasoning_tokens,
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 1e65801c2c..9f4e9bcdb5 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -454,6 +454,7 @@ class SingleTypeKVCacheManager(ABC):
+         """
+         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+         num_full_blocks = num_tokens // self.block_size
++        self.tag_draft_tail(request, num_cached_blocks)
+ 
+         if num_cached_blocks >= num_full_blocks:
+             return
+@@ -486,6 +487,22 @@ class SingleTypeKVCacheManager(ABC):
+ 
+         self.num_cached_block[request.request_id] = num_full_blocks
+ 
++    def tag_draft_tail(self, request: Request, num_cached_blocks: int) -> None:
++        """Fill in `draft_next_tokens` on the request's last cached block once
++        the tokens past its boundary are committed (they are not yet when the
++        block is cached at the request's current end, e.g. by the step that
++        samples them)."""
++        if num_cached_blocks == 0 or self.block_pool.draft_lookahead == 0:
++            return
++        blocks = self.req_to_blocks.get(request.request_id)
++        if not blocks or num_cached_blocks > len(blocks):
++            return
++        self.block_pool.tag_draft_tail(
++            request,
++            blocks[num_cached_blocks - 1],
++            num_cached_blocks * self.block_size,
++        )
++
+     @classmethod
+     def reachable_block_mask(
+         cls,
+@@ -800,12 +817,22 @@ class FullAttentionManager(SingleTypeKVCacheManager):
+                 hit_length = (fine_idx + 1) * alignment_tokens
+                 break
+ 
+-        # Eagle needs the tokens right before the generation point recomputed:
++        # EAGLE/MTP shift the draft input by one token, so the drafter's KV at
++        # the hit's last position was written with the producer's next
++        # token(s). Keep the full hit when the tail blocks carry a matching
++        # `draft_next_tokens` tag (or a tagged duplicate exists); otherwise
+         # drop one hash unit when fine-grained (the tail block's KV is
+         # append-only, so it still covers the reduced length), else one cache
+-        # block.
++        # block, so those positions are recomputed.
+         if drop_eagle_block and hit_length > 0:
+-            hit_length -= min(alignment_tokens, block_size)
++            tails = block_pool.draft_tail_blocks(
++                [computed[-1] for computed in computed_blocks], hit_length
++            )
++            if tails is None:
++                hit_length -= min(alignment_tokens, block_size)
++            else:
++                for computed, tail in zip(computed_blocks, tails):
++                    computed[-1] = tail
+         # Round down to the alignment; a no-op when fine-grained (hits land on
+         # hash boundaries by construction) and when alignment_tokens ==
+         # block_size. Then trim blocks past the new tail.
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index c2e9e67702..fca1735b1e 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -219,7 +219,7 @@ class Request:
+         self.effort_meta_phase = False
+         self.effort_meta_tokens: list[int] = []
+         self.effort_meta_votes: list[bool] = []
+-        self.effort_saved_sampling: tuple[float, int | None] | None = None
++        self.effort_saved_sampling: tuple[float, int | None, int | None] | None = None
+         self.effort_prompt_revision = 0
+         self.effort_decision_pending = False
+         # True only for the two-phase form: the prefill stops at

@@ -219,7 +219,7 @@ class Request:
         self.effort_meta_phase = False
         self.effort_meta_tokens: list[int] = []
         self.effort_meta_votes: list[bool] = []
-        self.effort_saved_sampling: tuple[float, int | None] | None = None
+        self.effort_saved_sampling: tuple[float, int | None, int | None] | None = None
         self.effort_prompt_revision = 0
         self.effort_decision_pending = False
         # True only for the two-phase form: the prefill stops at

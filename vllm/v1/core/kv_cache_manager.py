@@ -266,6 +266,7 @@ class KVCacheManager:
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
         self.block_pool.require_draft_complete = require_draft_complete
+        self.block_pool.lookup_token_ids = request.all_token_ids
         try:
             computed_blocks, num_new_computed_tokens, num_uncached = (
                 self.coordinator.find_longest_cache_hit(
@@ -274,6 +275,7 @@ class KVCacheManager:
             )
         finally:
             self.block_pool.require_draft_complete = False
+            self.block_pool.lookup_token_ids = None
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -339,9 +341,13 @@ class KVCacheManager:
             return self.empty_kv_cache_blocks, 0, 0, False
 
         fa_group_id = coordinator.full_attention_group_id
-        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
-            request.block_hashes, request.num_tokens - 1
-        )
+        self.block_pool.lookup_token_ids = request.all_token_ids
+        try:
+            computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+                request.block_hashes, request.num_tokens - 1
+            )
+        finally:
+            self.block_pool.lookup_token_ids = None
         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
             # A lagging group hit deeper than full attention means its
             # full-attention blocks were evicted; use the reconciled boundary
@@ -594,6 +600,12 @@ class KVCacheManager:
         pins = self._partial_tail_pins.pop(request.request_id, None)
         if pins:
             self.block_pool.free_blocks(pins)
+        if self.block_pool.draft_lookahead:
+            # A finishing request's last full block may still lack its tag.
+            for manager in self.coordinator.single_type_managers:
+                manager.tag_draft_tail(
+                    request, manager.num_cached_block.get(request.request_id, 0)
+                )
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(

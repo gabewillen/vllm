@@ -642,7 +642,9 @@ def test_prefill_hybrid_model_eagle():
         4,
     )
 
-    # Evict the last block of full attention, reduces the hit length to 4.
+    # Evict the last block of full attention, reduces the hit length to 5:
+    # the request continues with the same token the cached tail block was
+    # tagged with, so eagle keeps the tail instead of dropping it.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -650,7 +652,7 @@ def test_prefill_hybrid_model_eagle():
         "5",
         all_token_ids,
         [make_block_hash_with_group_id(block_hashes[-1], 0)],
-        4,
+        5,
     )
 
     # Since the last block of full attention is dropped for eagle, evict
@@ -678,10 +680,9 @@ def test_prefill_hybrid_model_eagle():
     )
 
     # Evict different set of blocks for full attention and sliding window.
-    # Full loses its last block so it drops to 4 full blocks after the eagle
-    # pop; SWA lost block 0 (outside the sliding window of the final hit),
-    # which is not required for the K+1 anchor at position 4. Coordinated
-    # single-drop aligns both groups at hit=4.
+    # Full loses its last block and keeps 5 (its tail tag matches the
+    # request); SWA lost block 0 (outside the sliding window of the final hit),
+    # hits its 6th block and drops back to 5. Both groups align at hit=5.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -693,7 +694,7 @@ def test_prefill_hybrid_model_eagle():
             make_block_hash_with_group_id(block_hashes[0], 1),
             make_block_hash_with_group_id(block_hashes[0], 2),
         ],
-        4,
+        5,
     )
 
 
@@ -2581,9 +2582,27 @@ def test_emit_cached_block_events_zero_cached():
     assert pool.take_events() == []
 
 
-def test_eagle_enabled_removes_last_block():
-    """Verify Eagle does NOT remove blocks when request
-    length is divisible by block size."""
+def _prime_cache(manager: KVCacheManager, request_id: str, token_ids: list[int]):
+    """Prefill `token_ids` end to end and release the request."""
+    req = make_request(request_id, token_ids, 16, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    manager.allocate_slots(
+        req, len(token_ids) - num_computed, num_computed, computed_blocks
+    )
+    manager.free(req)
+    return req
+
+
+def _eagle_hit(manager: KVCacheManager, request_id: str, token_ids: list[int]):
+    req = make_request(request_id, token_ids, 16, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    return computed_blocks, num_computed
+
+
+def test_eagle_full_hit_recomputes_one_token():
+    """A drafting request whose continuation matches the cached tail block's
+    `draft_next_tokens` tag keeps every full block: only the last prompt token
+    (needed for logits) is recomputed, not a whole block."""
     block_size = 16
     manager = make_kv_cache_manager(
         make_kv_cache_config(block_size, num_blocks=10),
@@ -2592,31 +2611,22 @@ def test_eagle_enabled_removes_last_block():
         use_eagle=True,
         hash_block_size=block_size,
     )
+    assert manager.block_pool.draft_lookahead == 1
+    token_ids = list(range(3 * block_size + 1))
+    _prime_cache(manager, "prime", token_ids)
+    tail = manager.block_pool.blocks[3]
+    assert tail.draft_next_tokens == (token_ids[3 * block_size],)
 
-    # Request with 3 full blocks (48 tokens)
-    token_ids = [0] * (3 * block_size)
-    req = make_request("divisible_request", token_ids, block_size, sha256)
-
-    # Prime the cache
-    computed_blocks, _, _ = manager.get_computed_blocks(req)
-    manager.allocate_slots(
-        req, len(token_ids), len(computed_blocks.blocks[0]) * 16, computed_blocks
-    )
-    manager.free(req)
-
-    # New request with same tokens + Eagle enabled
-    req_eagle = make_request("eagle_divisible", token_ids, block_size, sha256)
-    computed_blocks, num_tokens, _ = manager.get_computed_blocks(req_eagle)
-
-    # Should retain 1 block:
-    # 1. Original 3 blocks → pop last hash → 2 matched blocks
-    # 2. drop last matched block → 1 remaining block
-    assert len(computed_blocks.blocks[0]) == 1
-    assert num_tokens == 1 * block_size  # 16 tokens
+    computed_blocks, num_computed = _eagle_hit(manager, "same", token_ids)
+    assert len(computed_blocks.blocks[0]) == 3
+    assert num_computed == 3 * block_size
+    assert len(token_ids) - num_computed == 1
 
 
-def test_eagle_with_partial_blocks():
-    """Test Eagle behavior with requests containing partial blocks."""
+def test_eagle_drops_tail_block_when_continuation_differs():
+    """The producer's drafter wrote the tail block's last position with its own
+    next token; a request that continues differently must recompute it, so the
+    tail block (or hash unit) is still dropped."""
     block_size = 16
     manager = make_kv_cache_manager(
         make_kv_cache_config(block_size, num_blocks=10),
@@ -2625,23 +2635,150 @@ def test_eagle_with_partial_blocks():
         use_eagle=True,
         hash_block_size=block_size,
     )
-    # 2 full blocks + 5 tokens (non-divisible length)
-    token_ids = [0] * (2 * block_size + 5)
-    req = make_request("partial_block_test", token_ids, block_size, sha256)
+    token_ids = list(range(3 * block_size + 1))
+    _prime_cache(manager, "prime", token_ids)
 
-    # Prime the cache
-    computed_blocks, _, _ = manager.get_computed_blocks(req)
-    manager.allocate_slots(
-        req, len(token_ids), len(computed_blocks.blocks[0]) * 16, computed_blocks
+    other = token_ids[: 3 * block_size] + [999]
+    computed_blocks, num_computed = _eagle_hit(manager, "other", other)
+    assert len(computed_blocks.blocks[0]) == 2
+    assert num_computed == 2 * block_size
+
+    # Length divisible by the block size: the last block is unreachable
+    # (max hit is num_tokens - 1); the tail then is block 1, whose tag matches.
+    exact = token_ids[: 3 * block_size]
+    computed_blocks, num_computed = _eagle_hit(manager, "exact", exact)
+    assert num_computed == 2 * block_size
+
+
+def test_eagle_prefers_duplicate_with_matching_continuation():
+    """After a differently-continued request recomputes the tail block, both
+    copies are cached under the same hash; lookups pick the copy whose tag
+    matches, so either continuation gets the full hit."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, num_blocks=10),
+        max_model_len=8192,
+        enable_caching=True,
+        use_eagle=True,
+        hash_block_size=block_size,
     )
+    token_ids = list(range(3 * block_size + 1))
+    other = token_ids[: 3 * block_size] + [999]
+    _prime_cache(manager, "prime", token_ids)
+    _prime_cache(manager, "other", other)
+
+    for rid, ids in (("a", token_ids), ("b", other)):
+        computed_blocks, num_computed = _eagle_hit(manager, rid, ids)
+        assert num_computed == 3 * block_size
+        assert computed_blocks.blocks[0][-1].draft_next_tokens == (ids[-1],)
+
+
+def test_eagle_tag_is_filled_in_after_sampling():
+    """A block ending at the request's current end is cached before its next
+    token is sampled; the tag is filled in by the next allocation (decode) or,
+    for a request that finishes right there, on free."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, num_blocks=10),
+        max_model_len=8192,
+        enable_caching=True,
+        use_eagle=True,
+        hash_block_size=block_size,
+    )
+    prompt = list(range(2 * block_size))
+    req = make_request("gen", prompt, block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    manager.allocate_slots(req, len(prompt), num_computed, computed_blocks)
+    tail = manager.block_pool.blocks[2]
+    assert tail.block_hash is not None and tail.draft_next_tokens is None
+
+    # Decode step: the sampled token is committed, the next allocation tags.
+    req.append_output_token_ids(7)
+    req.num_computed_tokens = len(prompt)
+    manager.allocate_slots(req, 1, 0)
+    assert tail.draft_next_tokens == (7,)
+    req.append_output_token_ids(8)
+    req.num_computed_tokens += 1
     manager.free(req)
 
-    # New request with Eagle enabled
-    req_eagle = make_request("partial_eagle", token_ids, block_size, sha256)
-    computed_blocks, num_tokens, _ = manager.get_computed_blocks(req_eagle)
-    # Original match: 2 full blocks → Eagle removes 1 → 1 remaining
-    assert len(computed_blocks.blocks[0]) == 1
-    assert num_tokens == 1 * block_size
+    computed_blocks, num_computed = _eagle_hit(manager, "next", prompt + [7, 8])
+    assert num_computed == 2 * block_size
+
+    # Finish exactly at a block boundary: free() tags the last full block.
+    prompt2 = [500 + i for i in range(2 * block_size)]
+    req2 = make_request("fin", prompt2, block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req2)
+    manager.allocate_slots(req2, len(prompt2), num_computed, computed_blocks)
+    req2.append_output_token_ids(9)
+    req2.num_computed_tokens = len(prompt2)
+    manager.free(req2)
+    computed_blocks, num_computed = _eagle_hit(manager, "next2", prompt2 + [9])
+    assert num_computed == 2 * block_size
+
+
+def test_eagle_full_hit_hybrid_mamba_align():
+    """Hybrid full-attention + Mamba (align mode, attention block size forced to
+    the Mamba block): a drafting request with a matching continuation keeps the
+    block-aligned hit for both groups (the Mamba state at the boundary does not
+    depend on the next token) and recomputes only the prompt tail past it."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 30, ["full", "mamba_align"]),
+        max_model_len=8192,
+        enable_caching=True,
+        use_eagle=True,
+        hash_block_size=block_size,
+    )
+    assert not manager.coordinator.enable_partial_hash_hits
+    token_ids = list(range(3 * block_size + 5))
+
+    # Prefill the way the align-mode scheduler splits it: block-aligned chunks
+    # (a Mamba state is stored at each chunk end), then the tail.
+    req = make_request("prime", token_ids, block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    assert num_computed == 0
+    for num_new in (2 * block_size, block_size, 5):
+        assert manager.allocate_slots(req, num_new, 0, computed_blocks)
+        computed_blocks = None
+        req.num_computed_tokens += num_new
+    manager.free(req)
+
+    computed_blocks, num_computed = _eagle_hit(manager, "same", token_ids)
+    assert num_computed == 3 * block_size
+    assert len(computed_blocks.blocks[0]) == 3
+    mamba_blocks = computed_blocks.blocks[1]
+    assert len(mamba_blocks) == 3 and not mamba_blocks[-1].is_null
+    assert len(token_ids) - num_computed == 5
+
+    other = token_ids[: 3 * block_size] + [999] * 5
+    computed_blocks, num_computed = _eagle_hit(manager, "other", other)
+    assert num_computed == 2 * block_size
+    assert len(computed_blocks.blocks[0]) == 2
+
+
+def test_eagle_multi_token_lookahead_tag():
+    """Multi-module MTP consumes `num_prefill_lookahead` tokens past the
+    boundary; the tag covers all of them and any difference drops the tail."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, num_blocks=10),
+        max_model_len=8192,
+        enable_caching=True,
+        use_eagle=True,
+        hash_block_size=block_size,
+        num_prefill_lookahead=2,
+    )
+    assert manager.block_pool.draft_lookahead == 2
+    token_ids = list(range(2 * block_size + 3))
+    _prime_cache(manager, "prime", token_ids)
+    assert manager.block_pool.blocks[2].draft_next_tokens == tuple(
+        token_ids[2 * block_size : 2 * block_size + 2]
+    )
+    _, num_computed = _eagle_hit(manager, "same", token_ids)
+    assert num_computed == 2 * block_size
+    other = token_ids[: 2 * block_size + 1] + [999, 999]
+    _, num_computed = _eagle_hit(manager, "other", other)
+    assert num_computed == block_size
 
 
 def test_eagle_with_sliding_window():

@@ -68,6 +68,10 @@
 # after eviction 20.6 s -> 2.1 s, after service restart (disk tier) -> 3.1 s,
 # output byte-identical to cold. A venv rebuild loses this AND the two
 # pin_mmap_region patches (see qwen3_8_27b_fp8_max.yaml).
+# 2026-08-24: fs secondary tier REMOVED. Metrics over a full agent day: 1,377
+# async fs lookups costing 131 ms each on 72% of requests, for 33 fs-tier
+# block hits; the 24 GiB CPU tier serves everything that matters (2,218 hits).
+# Restart-survival of the KV cache is not worth 0.13 s per request of TTFT.
 #
 # NCCL P2P + Triton attention (2026-08-18): the unit sets NCCL_P2P_LEVEL=SYS
 # (needs IOMMU off + ACS cleared on the host; 4-way all-reduce 25.9 -> 11.7 ms,
@@ -136,7 +140,7 @@ max-num-batched-tokens: 8192
 mamba-ssm-cache-dtype: float16
 compilation-config: '{"max_cudagraph_capture_size": 128}'
 speculative-config: '{"method": "qwen3_5_mtp", "num_speculative_tokens": 7, "attention_backend": "TRITON_ATTN", "draft_tensor_parallel_size": 1, "use_local_argmax_reduction": true, "lazy_draft": true, "adaptive_draft_length": true, "adaptive_draft_margin": 2.0, "draft_lm_head_dtype": "int4", "num_speculative_tokens_per_batch_size": [[1, 16, 7], [17, 32, 2], [33, 128, 0]]}'
-kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/data/kv-offload/qwen38"}]}}'
+kv-transfer-config: '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776}}'
 reasoning-parser: qwen3
 # Dynamic reasoning effort v3 (venv patch 0009, docs/dynamic-reasoning.claude.md
 # §13; results in docs/dynamic-reasoning-v3-results.md). The v1 rung ladder and
@@ -210,3 +214,4 @@ additional-config: '{"lm_head_dtype": "fp8"}'
 shutdown-timeout: 300
 port: 8012
 middleware: ["vllm_keepalive.KeepAliveMiddleware"]
+enable-prompt-tokens-details: true

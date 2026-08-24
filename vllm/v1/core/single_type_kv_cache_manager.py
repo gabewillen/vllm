@@ -454,6 +454,7 @@ class SingleTypeKVCacheManager(ABC):
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
+        self.tag_draft_tail(request, num_cached_blocks)
 
         if num_cached_blocks >= num_full_blocks:
             return
@@ -485,6 +486,22 @@ class SingleTypeKVCacheManager(ABC):
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks
+
+    def tag_draft_tail(self, request: Request, num_cached_blocks: int) -> None:
+        """Fill in `draft_next_tokens` on the request's last cached block once
+        the tokens past its boundary are committed (they are not yet when the
+        block is cached at the request's current end, e.g. by the step that
+        samples them)."""
+        if num_cached_blocks == 0 or self.block_pool.draft_lookahead == 0:
+            return
+        blocks = self.req_to_blocks.get(request.request_id)
+        if not blocks or num_cached_blocks > len(blocks):
+            return
+        self.block_pool.tag_draft_tail(
+            request,
+            blocks[num_cached_blocks - 1],
+            num_cached_blocks * self.block_size,
+        )
 
     @classmethod
     def reachable_block_mask(
@@ -800,12 +817,22 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                 hit_length = (fine_idx + 1) * alignment_tokens
                 break
 
-        # Eagle needs the tokens right before the generation point recomputed:
+        # EAGLE/MTP shift the draft input by one token, so the drafter's KV at
+        # the hit's last position was written with the producer's next
+        # token(s). Keep the full hit when the tail blocks carry a matching
+        # `draft_next_tokens` tag (or a tagged duplicate exists); otherwise
         # drop one hash unit when fine-grained (the tail block's KV is
         # append-only, so it still covers the reduced length), else one cache
-        # block.
+        # block, so those positions are recomputed.
         if drop_eagle_block and hit_length > 0:
-            hit_length -= min(alignment_tokens, block_size)
+            tails = block_pool.draft_tail_blocks(
+                [computed[-1] for computed in computed_blocks], hit_length
+            )
+            if tails is None:
+                hit_length -= min(alignment_tokens, block_size)
+            else:
+                for computed, tail in zip(computed_blocks, tails):
+                    computed[-1] = tail
         # Round down to the alignment; a no-op when fine-grained (hits land on
         # hash boundaries by construction) and when alignment_tokens ==
         # block_size. Then trim blocks past the new tail.

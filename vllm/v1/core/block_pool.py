@@ -85,6 +85,18 @@ class BlockHashToBlockMap:
         self._unexpected_blocks_type(blocks)
         return None
 
+    def iter_blocks(self, key: BlockHashWithGroupId) -> Iterable[KVCacheBlock]:
+        """All blocks cached under `key` (duplicates included)."""
+        blocks = self._cache.get(key)
+        if blocks is None:
+            return ()
+        if isinstance(blocks, KVCacheBlock):
+            return (blocks,)
+        if isinstance(blocks, dict):
+            return blocks.values()
+        self._unexpected_blocks_type(blocks)
+        return ()
+
     def contain(self, key: BlockHashWithGroupId, block_id: int) -> bool:
         """
         Checks whether the key maps to the given block ID.
@@ -188,6 +200,13 @@ class BlockPool:
         # Set for the duration of a prefix-cache lookup that must not reuse
         # blocks with incomplete drafter KV (see KVCacheManager).
         self.require_draft_complete = False
+        # Number of tokens past a hash boundary that the drafter's KV at the
+        # boundary depends on (0 when no EAGLE/MTP drafter has a KV group).
+        self.draft_lookahead = 0
+        # Token ids of the request being looked up, set for the duration of a
+        # prefix-cache lookup so the eagle tail check can compare them against
+        # `KVCacheBlock.draft_next_tokens`.
+        self.lookup_token_ids: Sequence[int] | None = None
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -238,6 +257,79 @@ class BlockPool:
                 return None
             cached_blocks.append(block)
         return cached_blocks
+
+    def _draft_tag(self, request: Request, num_tokens: int) -> tuple[int, ...] | None:
+        """The `draft_lookahead` committed tokens following `num_tokens`.
+
+        None when tagging is off or the tokens are not committed yet (a block
+        whose boundary is the request's current end, or async placeholders).
+        """
+        lookahead = self.draft_lookahead
+        if lookahead == 0:
+            return None
+        end = num_tokens + lookahead
+        if end > request.num_tokens - request.num_output_placeholders:
+            return None
+        return tuple(request.all_token_ids[num_tokens:end])
+
+    def tag_draft_tail(
+        self, request: Request, block: KVCacheBlock, num_tokens: int
+    ) -> None:
+        """Late-tag a cached block whose next tokens were unknown at cache
+        time (the block ended exactly at the request's committed end)."""
+        if (
+            self.draft_lookahead == 0
+            or block.draft_next_tokens is not None
+            or block.is_null
+            or block.block_hash_num_tokens != num_tokens
+        ):
+            return
+        block.draft_next_tokens = self._draft_tag(request, num_tokens)
+
+    def draft_tail_blocks(
+        self, blocks: list[KVCacheBlock], num_tokens: int
+    ) -> list[KVCacheBlock] | None:
+        """Resolve the tail blocks of a `num_tokens`-long hit to ones whose
+        drafter KV is valid for the request being looked up.
+
+        A hit block's drafter KV at its last position was written with the
+        producer's next tokens (`draft_next_tokens`). It serves the looked-up
+        request as is when those tokens match the request's own; otherwise a
+        duplicate under the same hash with matching tokens is substituted.
+        Returns None (caller drops the tail) when any group cannot be
+        resolved or the tokens are unknown on either side.
+        """
+        tokens = self.lookup_token_ids
+        if tokens is None or self.draft_lookahead == 0:
+            return None
+        end = num_tokens + self.draft_lookahead
+        if end > len(tokens):
+            return None
+        expected = tuple(tokens[num_tokens:end])
+        resolved: list[KVCacheBlock] = []
+        for block in blocks:
+            if (
+                block.block_hash_num_tokens == num_tokens
+                and block.draft_next_tokens == expected
+            ):
+                resolved.append(block)
+                continue
+            key = block.block_hash
+            if key is None:
+                return None
+            match = None
+            for candidate in self.cached_block_hash_to_block.iter_blocks(key):
+                if (
+                    candidate.block_hash_num_tokens == num_tokens
+                    and candidate.draft_next_tokens == expected
+                    and not (self.require_draft_complete and candidate.draft_stale)
+                ):
+                    match = candidate
+                    break
+            if match is None:
+                return None
+            resolved.append(match)
+        return resolved
 
     def cache_full_blocks(
         self,
@@ -313,6 +405,7 @@ class BlockPool:
                 num_tokens=num_hash_tokens,
             )
             blk.draft_stale = request.draft_stale
+            blk.draft_next_tokens = self._draft_tag(request, num_hash_tokens)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -527,6 +620,9 @@ class BlockPool:
             block_hash_with_group_id,
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
+        )
+        block.draft_next_tokens = self._draft_tag(
+            request, num_hash_blocks * self.hash_block_size
         )
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(

@@ -3,6 +3,7 @@
 import itertools
 import math
 import time
+import zlib
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
@@ -81,7 +82,12 @@ from vllm.v1.engine import (
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    KVConnectorOutput,
+    LogprobsLists,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sample.effort_signals import EffortTelemetrySink
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -96,6 +102,15 @@ MAX_EFFORT_DECISION_SKIPS = 16
 before it gives up and runs at the default level. Purely a liveness bound: the
 request is simply not scheduled while it waits, and the vector normally arrives
 on the first step after the body prefill."""
+
+EFFORT_OFF_VOTE_TEMPERATURE = 0.7
+"""Sampling temperature of the think-off gate's yes/no votes."""
+
+EFFORT_OFF_VOTE_LOGPROBS = 20
+"""Top logprobs requested for the gate's first token. All `off_votes` votes are
+drawn from that one tempered distribution, so the gate costs a single
+resubmission instead of one per vote; mass outside the top entries counts as
+no, like any token that is not a clean yes."""
 
 
 def adaptive_num_spec_tokens(
@@ -544,6 +559,14 @@ class Scheduler(SchedulerInterface):
             # so sibling requests sharing the prefix can reuse it.
             start + (request.shared_prefix_boundary - start) // block_size * block_size
             if start < request.shared_prefix_boundary < end
+            else 0,
+            # Full-default effort form: a non-default level resubmits the
+            # request with another tail spliced at the seam, and its prefix
+            # hit can only resume where a chunk ended. End one at the last
+            # aligned boundary at or before the seam, so the resubmission
+            # recomputes the seam's partial block alone.
+            request.effort_seam // block_size * block_size
+            if request.effort_hold_prefill and request.effort_seam
             else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
@@ -2178,7 +2201,14 @@ class Scheduler(SchedulerInterface):
 
             if request.effort_meta_phase and not output_is_stale:
                 # Hidden guidance generation: keep the tokens, show none.
-                update = self._step_effort_meta(request, new_token_ids, stopped)
+                meta_logprobs = (
+                    logprobs.slice_request(req_index, len(new_token_ids))
+                    if logprobs and new_token_ids
+                    else None
+                )
+                update = self._step_effort_meta(
+                    request, new_token_ids, stopped, meta_logprobs
+                )
                 if update is not None:
                     effort_requeued.add(request)
                     outputs[request.client_index].append(
@@ -2877,15 +2907,11 @@ class Scheduler(SchedulerInterface):
                         request.effort_no_ids = {
                             int(i) for i in overrides.get("no_ids") or []
                         }
-                        request.effort_off_votes = int(
-                            overrides.get("off_votes") or 0
-                        )
+                        request.effort_off_votes = int(overrides.get("off_votes") or 0)
                         request.effort_meta_max_tokens = int(
                             overrides.get("off_vote_max_tokens") or 8
                         )
-                        request.effort_force_off = bool(
-                            overrides.get("force_off")
-                        )
+                        request.effort_force_off = bool(overrides.get("force_off"))
                 else:
                     boundary = self._effort_body_boundary(request, body_len)
                     if boundary and self._effort_split_worth_it(request, boundary):
@@ -2895,9 +2921,7 @@ class Scheduler(SchedulerInterface):
                         # head of every tail.
                         middle = list(request.prompt_token_ids[boundary:body_len])
                         request.effort_body_len = boundary
-                        request.effort_tail_variants = [
-                            middle + list(t) for t in tails
-                        ]
+                        request.effort_tail_variants = [middle + list(t) for t in tails]
                         request.effort_hold_prefill = True
                         request.effort_decision_pending = True
                 if self._effort_trace_budget > 0:
@@ -3172,19 +3196,34 @@ class Scheduler(SchedulerInterface):
         )
 
     def _start_effort_off_vote(self, request: Request) -> RoutedPromptUpdate:
-        """Resubmit the hidden yes/no question for the first off-gate vote.
+        """Resubmit the hidden yes/no question for the off-gate votes.
 
         The question's prompt shares every block with the default prompt up to
-        the seam, so the resubmission decodes over a warm cache. Votes are
-        sampled at temperature 0.7 with the vote index as seed - independent
-        enough for a quorum even when the client asked for greedy - and the
-        client's sampling is restored before the real request resumes.
+        the seam, so the resubmission decodes over a warm cache. The step also
+        returns the top logprobs of the question's first token; every vote is
+        a draw from that distribution at the vote temperature, which is what
+        sampling the token `off_votes` times would do, without paying the
+        seam's recompute per vote. Without logprobs (a runner that returns
+        none) the votes fall back to one sampled walk each, seeded by vote
+        index. The client's sampling is restored before the request resumes.
         """
         params = request.sampling_params
         assert params is not None
-        request.effort_saved_sampling = (params.temperature, params.seed)
-        params.temperature = 0.7
+        request.effort_saved_sampling = (
+            params.temperature,
+            params.seed,
+            params.logprobs,
+        )
+        params.temperature = EFFORT_OFF_VOTE_TEMPERATURE
         params.seed = 1
+        max_logprobs = self.vllm_config.model_config.max_logprobs
+        num_logprobs = (
+            EFFORT_OFF_VOTE_LOGPROBS
+            if max_logprobs < 0
+            else min(EFFORT_OFF_VOTE_LOGPROBS, max_logprobs)
+        )
+        if num_logprobs > 0:
+            params.logprobs = num_logprobs
         request.effort_meta_phase = True
         request.effort_meta_tokens = []
         request.effort_meta_votes = []
@@ -3197,7 +3236,9 @@ class Scheduler(SchedulerInterface):
         """Restore the client's sampling and render the gate's verdict."""
         params = request.sampling_params
         if params is not None and request.effort_saved_sampling is not None:
-            params.temperature, params.seed = request.effort_saved_sampling
+            params.temperature, params.seed, params.logprobs = (
+                request.effort_saved_sampling
+            )
             request.effort_saved_sampling = None
         request.effort_meta_phase = False
         tails = request.effort_tail_variants or []
@@ -3226,16 +3267,38 @@ class Scheduler(SchedulerInterface):
         return self._resubmit_effort_tail(request, tail)
 
     def _step_effort_meta(
-        self, request: Request, new_token_ids: list[int], stopped: bool
+        self,
+        request: Request,
+        new_token_ids: list[int],
+        stopped: bool,
+        logprobs: LogprobsLists | None = None,
     ) -> RoutedPromptUpdate | None:
         """Advance the off gate by one step.
 
-        A vote ends at its first yes/no token, at a stop id, at
+        With the first token's logprobs at hand, all `off_votes` votes are
+        drawn at once from its tempered distribution (a yes is a token in
+        `yes_ids`; everything else is no) and the gate ends in this step.
+        Otherwise a vote ends at its first yes/no token, at a stop id, at
         `off_vote_max_tokens`, or if the request itself stopped; anything but
         a clean yes counts as no. Any no ends the gate at the resting low
         level; `off_votes` unanimous yeses confirm think-off.
         """
         tokens = request.effort_meta_tokens
+        if (
+            logprobs is not None
+            and not tokens
+            and not request.effort_meta_votes
+            and (p_yes := self._effort_vote_yes_probability(request, logprobs))
+            is not None
+        ):
+            rng = np.random.default_rng(zlib.crc32(request.request_id.encode()))
+            draws = rng.random(request.effort_off_votes)
+            votes = [bool(draw < p_yes) for draw in draws]
+            if stopped:
+                # check_stop marked the request finished; it is not.
+                request.status = RequestStatus.RUNNING
+            request.effort_meta_votes = votes
+            return self._finish_effort_off_vote(request, off=all(votes))
         vote: bool | None = None
         done = stopped
         for tok in new_token_ids:
@@ -3269,6 +3332,40 @@ class Scheduler(SchedulerInterface):
         assert request.effort_meta_tail is not None
         return self._resubmit_effort_tail(request, request.effort_meta_tail)
 
+    def _effort_vote_yes_probability(
+        self, request: Request, logprobs: LogprobsLists
+    ) -> float | None:
+        """P(first gate token is a yes) at the vote temperature.
+
+        Renormalises the returned entries (the sampled token and the top
+        logprobs, which double as its support) after tempering; raw modes
+        need the temperature applied here, processed ones already carry it.
+        None when the step returned no usable entries.
+        """
+        if len(logprobs.logprobs) == 0:
+            return None
+        scores: dict[int, float] = {}
+        for token_id, score in zip(
+            logprobs.logprob_token_ids[0].tolist(), logprobs.logprobs[0].tolist()
+        ):
+            if math.isfinite(score):
+                scores[int(token_id)] = float(score)
+        if not scores:
+            return None
+        mode = self.vllm_config.model_config.logprobs_mode
+        inv_temperature = (
+            1.0 / EFFORT_OFF_VOTE_TEMPERATURE if mode.startswith("raw") else 1.0
+        )
+        top = max(scores.values())
+        total = 0.0
+        yes = 0.0
+        for token_id, score in scores.items():
+            weight = math.exp((score - top) * inv_temperature)
+            total += weight
+            if token_id in request.effort_yes_ids:
+                yes += weight
+        return yes / total
+
     def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
         """Record a finished request in the memory (§13.4).
 
@@ -3284,9 +3381,7 @@ class Scheduler(SchedulerInterface):
             # An abort or a max_tokens cap truncates the thinking, so the
             # length the request would have spent is unknown.
             close_kind = CLOSE_CLIENT_LIMIT
-        think_off = (
-            memory.cfg.think_off_level and state.level == 0 and state.decided
-        )
+        think_off = memory.cfg.think_off_level and state.level == 0 and state.decided
         memory.insert(
             vector,
             state.reasoning_tokens,

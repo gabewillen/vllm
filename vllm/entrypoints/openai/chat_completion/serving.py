@@ -32,6 +32,9 @@ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     off_vote_variant,
     split_body_and_tails,
 )
+from vllm.entrypoints.openai.chat_completion.effort_tails import (
+    tokenize_variant_tails,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -67,10 +70,12 @@ from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
+from vllm.renderers import merge_kwargs
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
+from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.utils.serial_utils import numpy2base64
 
 logger = init_logger(__name__)
@@ -229,6 +234,111 @@ class OpenAIServingChat(GenerateBaseServing):
 
         return await self.online_renderer.render_chat(request)
 
+    async def _render_effort_variants_full(
+        self,
+        default_input: EngineInput,
+        variant_requests: list[ChatCompletionRequest | None],
+    ) -> list[list[int] | None] | ErrorResponse | None:
+        """Token ids of every level, each through the full renderer."""
+        default_ids = self._extract_prompt_components(default_input).token_ids
+        rendered: list[list[int] | None] = []
+        for variant_request in variant_requests:
+            if variant_request is None:
+                rendered.append(default_ids)
+                continue
+            result = await self.render_chat_request(variant_request)
+            if isinstance(result, ErrorResponse):
+                return result
+            _, variant_inputs = result
+            if len(variant_inputs) != 1:
+                return None
+            rendered.append(
+                self._extract_prompt_components(variant_inputs[0]).token_ids
+            )
+        return rendered
+
+    async def _tokenize_effort_variants(
+        self,
+        request: ChatCompletionRequest,
+        default_input: EngineInput,
+        variant_requests: list[ChatCompletionRequest | None],
+    ) -> list[list[int]] | None:
+        """Token ids of every level from one tokenization of the conversation.
+
+        Each non-default level is run through the chat template only (no
+        tokenization); its ids are the default level's ids up to the last
+        special token the rendered texts share, plus the tokenized remainder.
+        Texts that diverge earlier than the last message (e.g.
+        `preserve_thinking=false` with a think-off level) just get a longer
+        tail. `None` when exactness cannot be proven - multimodal or truncated
+        prompts, a non-HF tokenizer, no shared special token, or a default
+        tail that does not re-tokenize to its own ids.
+        """
+        tokenizer = self.renderer.tokenizer
+        if (
+            tokenizer is None
+            or is_mistral_tokenizer(tokenizer)
+            or self.model_config.enable_prompt_embeds
+            or request.truncate_prompt_tokens is not None
+        ):
+            return None
+        components = self._extract_prompt_components(default_input)
+        default_text, default_ids = components.text, components.token_ids
+        if (
+            not isinstance(default_text, str)
+            or default_ids is None
+            or not isinstance(default_input, dict)
+            or "multi_modal_data" in default_input
+        ):
+            return None
+        variant_texts: list[str] = []
+        for variant_request in variant_requests:
+            if variant_request is None:
+                variant_texts.append(default_text)
+                continue
+            text = await self._render_effort_variant_text(variant_request)
+            if text is None:
+                return None
+            variant_texts.append(text)
+        return tokenize_variant_tails(
+            lambda text: tokenizer.encode(text, add_special_tokens=False),
+            default_text,
+            default_ids,
+            variant_texts,
+            tokenizer.all_special_tokens,
+        )
+
+    async def _render_effort_variant_text(
+        self, request: ChatCompletionRequest
+    ) -> str | None:
+        """The chat template's output for `request`, exactly as
+        `OnlineRenderer.preprocess_chat` would build it, but not tokenized."""
+        online = self.online_renderer
+        if request.tools is None or (
+            request.tool_choice == "none" and online.exclude_tools_when_tool_choice_none
+        ):
+            tool_dicts = None
+        else:
+            tool_dicts = [tool.model_dump() for tool in request.tools]
+        mm_config = self.model_config.multimodal_config
+        chat_params = request.build_chat_params(
+            online.chat_template, online.chat_template_content_format
+        ).with_defaults(
+            merge_kwargs(
+                online.default_chat_template_kwargs,
+                dict(tools=tool_dicts, tokenize=False),
+            ),
+            default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
+            default_mm_processor_kwargs=request.mm_processor_kwargs,
+        )
+        _, prompt = await online.renderer.render_messages_async(
+            request.messages, chat_params
+        )
+        if not isinstance(prompt, dict) or "multi_modal_data" in prompt:
+            return None
+        text = prompt.get("prompt")
+        return text if isinstance(text, str) else None
+
     async def _attach_effort_tails(
         self,
         request: ChatCompletionRequest,
@@ -236,11 +346,11 @@ class OpenAIServingChat(GenerateBaseServing):
     ) -> ErrorResponse | None:
         """Render the other levels and record the §13.3 body/tail seam.
 
-        The prompt already submitted is the default-level variant. Rendering the rest
-        costs one chat-template pass and one tokenization each; the engine only
-        ever prefills the body once, because the body is identical across levels.
-        Anything unexpected (multiple prompts, an empty seam) silently leaves
-        the request on today's single-level path.
+        The prompt already submitted is the default-level variant. The rest
+        cost one chat-template pass each and tokenize only their tail; the
+        engine only ever prefills the body once, because the body is identical
+        across levels. Anything unexpected (multiple prompts, an empty seam)
+        silently leaves the request on today's single-level path.
         """
         variants = request._dynamic_effort_variant_messages
         request._dynamic_effort_variant_messages = None
@@ -254,11 +364,10 @@ class OpenAIServingChat(GenerateBaseServing):
         if len(engine_inputs) != 1:
             return None
         default_level = request._dynamic_effort["default_level"]
-        default_token_ids = self._extract_prompt_components(engine_inputs[0]).token_ids
-        rendered = []
+        variant_requests: list[ChatCompletionRequest | None] = []
         for level, messages in enumerate(variants):
             if level == default_level:
-                rendered.append(default_token_ids)
+                variant_requests.append(None)
                 continue
             variant_request = copy(request)
             variant_request.messages = messages
@@ -268,16 +377,17 @@ class OpenAIServingChat(GenerateBaseServing):
                     **(request.chat_template_kwargs or {}),
                     "enable_thinking": False,
                 }
-            result = await self.render_chat_request(variant_request)
-            if isinstance(result, ErrorResponse):
-                return result
-            _, variant_inputs = result
-            if len(variant_inputs) != 1:
-                return None
-            rendered.append(
-                self._extract_prompt_components(variant_inputs[0]).token_ids
+            variant_requests.append(variant_request)
+        rendered = await self._tokenize_effort_variants(
+            request, engine_inputs[0], variant_requests
+        )
+        if rendered is None:
+            rendered = await self._render_effort_variants_full(
+                engine_inputs[0], variant_requests
             )
-        if any(ids is None for ids in rendered):
+        if isinstance(rendered, ErrorResponse):
+            return rendered
+        if rendered is None or any(ids is None for ids in rendered):
             return None
         split = split_body_and_tails([list(ids) for ids in rendered])  # type: ignore[arg-type]
         if split is None:
@@ -300,10 +410,16 @@ class OpenAIServingChat(GenerateBaseServing):
                 if eos is not None:
                     stop_ids.add(int(eos))
                 for text, bucket in (
-                    ("yes", yes_ids), ("Yes", yes_ids), ("YES", yes_ids),
-                    (" yes", yes_ids), (" Yes", yes_ids),
-                    ("no", no_ids), ("No", no_ids), ("NO", no_ids),
-                    (" no", no_ids), (" No", no_ids),
+                    ("yes", yes_ids),
+                    ("Yes", yes_ids),
+                    ("YES", yes_ids),
+                    (" yes", yes_ids),
+                    (" Yes", yes_ids),
+                    ("no", no_ids),
+                    ("No", no_ids),
+                    ("NO", no_ids),
+                    (" no", no_ids),
+                    (" No", no_ids),
                 ):
                     ids = tokenizer.encode(text, add_special_tokens=False)
                     if len(ids) == 1:
