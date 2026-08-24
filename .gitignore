@@ -264,3 +264,4 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 /work/lane-*/
 /logs/
 /goal/sessions/*/session-log.jsonl
+serve-configs/cliproxyapi.env

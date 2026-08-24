@@ -1,0 +1,18 @@
+port: 8317
+auth-dir: "/root/.cli-proxy-api"
+debug: false
+request-retry: 3
+api-keys:
+  - "sk-CLIENT-KEY"
+remote-management:
+  allow-remote: true
+  secret-key: "$2a$10$Csi3eYqGO9VEd4nHxv65nOb79zr9aGHcngPGUMwbRQxU9bdKDPg.6"
+  disable-control-panel: false
+openai-compatibility:
+  - name: "vllm-qwen38"
+    base-url: "http://host.docker.internal:8012/v1"
+    api-key-entries:
+      - api-key: "VLLM_API_KEY-from-/etc/vllm/qwen38.env"
+    models:
+      - name: "Qwen3.8-27B"
+        alias: "Qwen3.8-27B"
