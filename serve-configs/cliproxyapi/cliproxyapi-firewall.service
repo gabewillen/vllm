@@ -1,0 +1,12 @@
+[Unit]
+Description=Restrict cliproxyapi container egress to vLLM + WAN
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/cliproxyapi/firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
