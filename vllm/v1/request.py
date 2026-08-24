@@ -205,18 +205,21 @@ class Request:
         # and the seam is where a non-default tail is spliced on resubmission.
         self.effort_seam = 0
         self.effort_tail_variants: list[list[int]] | None = None
-        # Custom level: the hidden meta generation and how its note is spliced.
-        self.effort_custom_level: int | None = None
+        # Off-vote gate: the hidden yes/no generations behind a think-off
+        # verdict.
         self.effort_default_level = 0
-        self.effort_force_custom = False
+        self.effort_force_off = False
         self.effort_off_append: list[int] | None = None
         self.effort_meta_tail: list[int] | None = None
-        self.effort_custom_suffix: list[int] = []
         self.effort_meta_stop_ids: set[int] = set()
-        self.effort_meta_end_ids: set[int] = set()
+        self.effort_yes_ids: set[int] = set()
+        self.effort_no_ids: set[int] = set()
+        self.effort_off_votes = 0
         self.effort_meta_max_tokens = 0
         self.effort_meta_phase = False
         self.effort_meta_tokens: list[int] = []
+        self.effort_meta_votes: list[bool] = []
+        self.effort_saved_sampling: tuple[float, int | None] | None = None
         self.effort_prompt_revision = 0
         self.effort_decision_pending = False
         # True only for the two-phase form: the prefill stops at

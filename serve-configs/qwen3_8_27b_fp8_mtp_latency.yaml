@@ -186,15 +186,20 @@ reasoning-parser: qwen3
 # effort-telemetry.conf): per-step entropy/margin rows plus one `event: finish`
 # record with requested vs effective effort and this report
 # (level, decided, reasoning_tokens, close_kind, memory_entries, neighbours).
-# Levels: off / default / custom (2026-08-23). off = enable_thinking=false
-# below q_none (0.30: replayed estimates under it thought 19 tokens median,
-# 63 max). default = no sentence; measured 14/14 on the hard grid at 816 tokens
-# - every static "think harder" wording was worse (12-13/14, 2x tokens, cap
-# runaways), so low/xhigh sentences are gone. custom (>= q_high) = the model
-# writes its own one-line guidance thinking-off (~0.8 s, 37 tokens), which
-# is spliced in as the tail: 22/24 on the grid, hard prompts 40-55% shorter.
-# default_level 1 = default; the memory was restarted cold for the new lanes.
-reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "think_off_level": true, "custom_level": true, "q_none": 0.30, "q_high": 0.60, "default_level": 1, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
+# Levels: off / low / medium (2026-08-24). off = enable_thinking=false below
+# q_none (0.30), gated by the model itself: three hidden yes/no votes
+# ("could you answer with no step-by-step working?") at temp 0.7, unanimous
+# yes or the request demotes to low (unanimity-of-3 measured zero wrong-offs;
+# a single vote wrongly skipped arithmetic). low = the resting level,
+# "Reasoning effort is set to low." - 22/24 on the grid at 611 avg tokens vs
+# 21/24 at 774 with no sentence. medium (>= q_mid 0.60) = no sentence, the
+# template default. Every upward word (high/xhigh/max) measured worse
+# (19-20/24, 1.5-2x tokens, cap runaways), so there is no upward level; and
+# free-text guidance is gone after a fluent wrong note anchored an
+# implementation (VulcanBench itertools) - the model's voice is effort-only.
+# default_level 2 = medium (undecided prompts stay byte-identical); the
+# memory restarts cold for the new lane semantics.
+reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "hidden_effort": {"enabled": true, "think_off_level": true, "q_none": 0.30, "q_mid": 0.60, "q_high": 0.60, "default_level": 2, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B

@@ -2865,25 +2865,26 @@ class Scheduler(SchedulerInterface):
                     off_append = overrides.get("off_append")
                     if isinstance(off_append, list) and off_append:
                         request.effort_off_append = [int(t) for t in off_append]
-                    custom = overrides.get("custom_level")
                     meta_tail = overrides.get("meta_tail")
-                    if isinstance(custom, int) and isinstance(meta_tail, list):
-                        request.effort_custom_level = custom
+                    if isinstance(meta_tail, list):
                         request.effort_meta_tail = list(meta_tail)
-                        request.effort_custom_suffix = list(
-                            overrides.get("custom_suffix") or []
-                        )
                         request.effort_meta_stop_ids = {
                             int(i) for i in overrides.get("meta_stop_ids") or []
                         }
-                        request.effort_meta_end_ids = {
-                            int(i) for i in overrides.get("meta_end_ids") or []
+                        request.effort_yes_ids = {
+                            int(i) for i in overrides.get("yes_ids") or []
                         }
-                        request.effort_meta_max_tokens = int(
-                            overrides.get("custom_max_tokens") or 80
+                        request.effort_no_ids = {
+                            int(i) for i in overrides.get("no_ids") or []
+                        }
+                        request.effort_off_votes = int(
+                            overrides.get("off_votes") or 0
                         )
-                        request.effort_force_custom = bool(
-                            overrides.get("force_custom")
+                        request.effort_meta_max_tokens = int(
+                            overrides.get("off_vote_max_tokens") or 8
+                        )
+                        request.effort_force_off = bool(
+                            overrides.get("force_off")
                         )
                 else:
                     boundary = self._effort_body_boundary(request, body_len)
@@ -2981,8 +2982,8 @@ class Scheduler(SchedulerInterface):
                 "present" if vector is not None else "MISSING",
                 memory.n_entries if memory is not None else -1,
             )
-        if request.effort_force_custom and request.effort_custom_level is not None:
-            level, reason = request.effort_custom_level, "forced-custom"
+        if request.effort_force_off:
+            level, reason = 0, "forced-off"
             if memory is not None and vector is not None:
                 self._effort_vectors[request.request_id] = np.asarray(
                     vector, dtype=np.float32
@@ -3048,20 +3049,17 @@ class Scheduler(SchedulerInterface):
                 and self._effort_cfg is not None
                 and self._effort_cfg.hidden_effort.think_off_level
                 and request.effort_off_append
-                and default_level == self._effort_cfg.hidden_effort.low_level
             ):
+                if (
+                    request.effort_meta_tail is not None
+                    and request.effort_off_votes > 0
+                ):
+                    # Off gate: the model votes yes/no on skipping thinking,
+                    # hidden from the client, before the verdict stands.
+                    return self._start_effort_off_vote(request)
                 # Thinking off = the default prompt plus a closed think block:
                 # extend the prefilled request in place, no blocks freed.
                 return self._extend_effort_prompt(request, request.effort_off_append)
-            if (
-                level == request.effort_custom_level
-                and request.effort_meta_tail is not None
-            ):
-                # Custom level: first a hidden, thinking-off generation of the
-                # guidance line; the real tail is spliced when it stops.
-                request.effort_meta_phase = True
-                request.effort_meta_tokens = []
-                return self._resubmit_effort_tail(request, request.effort_meta_tail)
             return self._resubmit_effort_tail(request, tails[level])
         return self._apply_effort_tail(
             request=request,
@@ -3173,61 +3171,103 @@ class Scheduler(SchedulerInterface):
             prompt_token_ids=list(prompt),
         )
 
+    def _start_effort_off_vote(self, request: Request) -> RoutedPromptUpdate:
+        """Resubmit the hidden yes/no question for the first off-gate vote.
+
+        The question's prompt shares every block with the default prompt up to
+        the seam, so the resubmission decodes over a warm cache. Votes are
+        sampled at temperature 0.7 with the vote index as seed - independent
+        enough for a quorum even when the client asked for greedy - and the
+        client's sampling is restored before the real request resumes.
+        """
+        params = request.sampling_params
+        assert params is not None
+        request.effort_saved_sampling = (params.temperature, params.seed)
+        params.temperature = 0.7
+        params.seed = 1
+        request.effort_meta_phase = True
+        request.effort_meta_tokens = []
+        request.effort_meta_votes = []
+        assert request.effort_meta_tail is not None
+        return self._resubmit_effort_tail(request, request.effort_meta_tail)
+
+    def _finish_effort_off_vote(
+        self, request: Request, off: bool
+    ) -> RoutedPromptUpdate:
+        """Restore the client's sampling and render the gate's verdict."""
+        params = request.sampling_params
+        if params is not None and request.effort_saved_sampling is not None:
+            params.temperature, params.seed = request.effort_saved_sampling
+            request.effort_saved_sampling = None
+        request.effort_meta_phase = False
+        tails = request.effort_tail_variants or []
+        state = self._effort.get(request.request_id)
+        if off:
+            level = 0
+            default = request.effort_default_level
+            tail = list(tails[default] if default < len(tails) else [])
+            tail += list(request.effort_off_append or [])
+        else:
+            assert self._effort_cfg is not None
+            level = self._effort_cfg.hidden_effort.low_level
+            tail = list(tails[level]) if level < len(tails) else []
+        if state is not None:
+            state.level = level
+            state.off_votes = sum(request.effort_meta_votes)
+            state.off_vetoed = not off
+        if self._effort_trace_budget > 0:
+            logger.info(
+                "dynamic_effort %s: off gate %s (%d/%d yes)",
+                request.request_id,
+                "confirmed" if off else "vetoed",
+                sum(request.effort_meta_votes),
+                request.effort_off_votes,
+            )
+        return self._resubmit_effort_tail(request, tail)
+
     def _step_effort_meta(
         self, request: Request, new_token_ids: list[int], stopped: bool
     ) -> RoutedPromptUpdate | None:
-        """Collect the guidance line; when it ends, splice it into the custom
-        tail and resubmit the real request.
+        """Advance the off gate by one step.
 
-        The line ends at a stop id (newline, end of turn, EOS), at
-        `custom_max_tokens`, or if the request itself stopped (a client cap
-        smaller than the line). An empty line falls back to the default tail.
+        A vote ends at its first yes/no token, at a stop id, at
+        `off_vote_max_tokens`, or if the request itself stopped; anything but
+        a clean yes counts as no. Any no ends the gate at the resting low
+        level; `off_votes` unanimous yeses confirm think-off.
         """
         tokens = request.effort_meta_tokens
+        vote: bool | None = None
         done = stopped
-        truncated = False
         for tok in new_token_ids:
-            if tok in request.effort_meta_stop_ids:
-                done = True
+            tok = int(tok)
+            if tok in request.effort_yes_ids:
+                vote, done = True, True
                 break
-            tokens.append(int(tok))
-            if tok in request.effort_meta_end_ids and len(tokens) >= 12:
-                # Sentence over: keep the full stop and stop.
-                done = True
+            if tok in request.effort_no_ids or tok in request.effort_meta_stop_ids:
+                vote, done = False, True
                 break
+            tokens.append(tok)
             if len(tokens) >= request.effort_meta_max_tokens:
-                # Still running at the cap: the line is cut mid-sentence and
-                # would be worse than no guidance. Fall back to the default.
-                done = True
-                truncated = True
+                vote, done = False, True
                 break
         if not done:
             return None
-        if truncated:
-            tokens.clear()
-        request.effort_meta_phase = False
+        if vote is None:
+            vote = False
         if stopped:
             # check_stop marked the request finished; it is not.
             request.status = RequestStatus.RUNNING
-        tails = request.effort_tail_variants or []
-        custom = request.effort_custom_level
-        state = self._effort.get(request.request_id)
-        if tokens and custom is not None and custom < len(tails):
-            tail = list(tails[custom]) + tokens + list(request.effort_custom_suffix)
-        else:
-            default = request.effort_default_level
-            if state is not None:
-                state.level = default
-            tail = list(tails[default]) if default < len(tails) else []
-        if state is not None:
-            state.custom_note_tokens = len(tokens)
-        if self._effort_trace_budget > 0:
-            logger.info(
-                "dynamic_effort %s: custom guidance of %d tokens spliced",
-                request.request_id,
-                len(tokens),
-            )
-        return self._resubmit_effort_tail(request, tail)
+        request.effort_meta_votes.append(vote)
+        tokens.clear()
+        if not vote:
+            return self._finish_effort_off_vote(request, off=False)
+        if len(request.effort_meta_votes) >= request.effort_off_votes:
+            return self._finish_effort_off_vote(request, off=True)
+        params = request.sampling_params
+        if params is not None:
+            params.seed = len(request.effort_meta_votes) + 1
+        assert request.effort_meta_tail is not None
+        return self._resubmit_effort_tail(request, request.effort_meta_tail)
 
     def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
         """Record a finished request in the memory (§13.4).

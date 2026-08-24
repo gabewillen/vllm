@@ -65,8 +65,10 @@ class EffortState:
     decided_difficulty: float | None = None
     """Calibrated estimate the level was chosen from; a think-off request is
     remembered with it."""
-    custom_note_tokens: int = 0
-    """Length of the generated guidance line (custom level)."""
+    off_votes: int = 0
+    """Yes votes collected by the off gate before its verdict."""
+    off_vetoed: bool = False
+    """True when the off gate demoted a think-off verdict to low."""
     spread: float | None = None
     neighbours: int = 0
     memory_entries: int = 0
@@ -94,7 +96,8 @@ class EffortState:
             "estimate": self.estimate,
             "calibrated": self.decided_difficulty,
             "novelty_rank": self.novelty_rank,
-            "custom_note_tokens": self.custom_note_tokens,
+            "off_votes": self.off_votes,
+            "off_vetoed": int(self.off_vetoed),
         }
 
 

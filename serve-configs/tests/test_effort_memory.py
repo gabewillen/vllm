@@ -340,7 +340,8 @@ def test_legacy_file_migrates_to_within_level_difficulty(tmp_path):
         arrays = {k: data[k] for k in data.files if k != "meta"}
     for key in ("level_digests", "spend_digest", "probe_clock"):
         meta.pop(key, None)
-    np.savez(path, meta=np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8), **arrays)
+    meta_arr = np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8)
+    np.savez(path, meta=meta_arr, **arrays)
 
     fresh = _mem(memory_path=path, k=2)
     assert fresh.load()
@@ -385,7 +386,9 @@ def test_think_off_level_sits_under_low_and_probes_upward():
     request skips thinking; the resting level is still `low` (index 1); the
     probe clock renders a think-off verdict at low so the neighbourhood keeps
     receiving thinking-length evidence."""
-    cfg = _cfg(think_off_level=True, q_none=0.15, q_mid=0.35, q_high=0.60, default_level=2)
+    cfg = _cfg(
+        think_off_level=True, q_none=0.15, q_mid=0.35, q_high=0.60, default_level=2
+    )
     q = _query()
     top = 3
     assert decide_effort_level(q, (0.10, 0.1, 0.1), cfg, top).level == 0
@@ -441,11 +444,11 @@ def test_enabling_the_think_off_level_shifts_a_saved_memory(tmp_path):
     assert sorted(four._level_digests) == [1, 2, 3]
 
 
-def test_three_level_map_off_default_custom():
-    """off / default / custom: one level above the resting default, so only
-    `q_high` matters above it; `q_none` below; probes go down from custom
+def test_three_level_map_off_low_default():
+    """off / low / default: one level above the resting low, so only
+    `q_high` matters above it; `q_none` below; probes go down from the top
     and up from off."""
-    cfg = _cfg(think_off_level=True, custom_level=True, q_none=0.3, q_high=0.6, default_level=1)
+    cfg = _cfg(think_off_level=True, q_none=0.3, q_high=0.6, default_level=1)
     q = _query()
     top = 2
     assert decide_effort_level(q, (0.20, 0.1, 0.1), cfg, top).level == 0

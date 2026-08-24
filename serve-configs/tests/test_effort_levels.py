@@ -15,8 +15,8 @@ import random
 import pytest
 
 from vllm.config.reasoning import (
-    QWEN_LOW_EFFORT_SENTENCE,
-    QWEN_XHIGH_EFFORT_SENTENCE,
+    LOW_EFFORT_SENTENCE,
+    OFF_VOTE_PROMPT,
     DynamicEffortConfig,
     HiddenEffortConfig,
     ReasoningConfig,
@@ -91,19 +91,11 @@ def test_dynamic_effort_rejects_independent_data_parallel_state():
 # ------------------------------------------------------------------ frontend
 
 
-def test_levels_default_to_low_medium_xhigh():
+def test_levels_default_to_low_and_medium():
     cfg = _cfg()
-    assert cfg.num_levels == 3
-    assert cfg.level_sentences == [
-        QWEN_LOW_EFFORT_SENTENCE,
-        "",
-        QWEN_XHIGH_EFFORT_SENTENCE,
-    ]
-    assert QWEN_XHIGH_EFFORT_SENTENCE == (
-        "Reasoning effort is set to xhigh. Please think carefully through the "
-        "task, validate key assumptions, consider plausible alternatives, and "
-        "prioritize correctness, consistency, and clarity in the final answer."
-    )
+    assert cfg.num_levels == 2
+    assert cfg.level_sentences == [LOW_EFFORT_SENTENCE, ""]
+    assert LOW_EFFORT_SENTENCE == "Reasoning effort is set to low."
 
 
 def test_sentence_goes_at_the_true_tail_not_the_last_user_turn():
@@ -113,16 +105,12 @@ def test_sentence_goes_at_the_true_tail_not_the_last_user_turn():
     request = _request()
     apply_dynamic_effort(request, cfg)
     variants = request._dynamic_effort_variant_messages
-    assert len(variants) == 3
+    assert len(variants) == 2
     # Level 1 renders no sentence at all - the chat template's own `medium`.
     assert [m["role"] for m in variants[1]] == ["user", "assistant", "tool"]
-    for level in (0, 2):
-        assert variants[level][-1] == {
-            "role": "user",
-            "content": cfg.level_sentences[level],
-        }
-        # Everything before the sentence is untouched, so the body is shared.
-        assert variants[level][:-1] == variants[1]
+    assert variants[0][-1] == {"role": "user", "content": LOW_EFFORT_SENTENCE}
+    # Everything before the sentence is untouched, so the body is shared.
+    assert variants[0][:-1] == variants[1]
     # The submitted prompt is the default level, and the template sees `medium`.
     assert request.messages is variants[0]
     assert request.reasoning_effort == "medium"
@@ -144,12 +132,40 @@ def test_an_explicit_thinking_budget_is_rejected():
 
 
 def test_a_forced_level_skips_the_decision():
-    request = _request(vllm_xargs={"dynamic_effort_level": 2})
+    request = _request(vllm_xargs={"dynamic_effort_level": 0})
     apply_dynamic_effort(request, _cfg())
-    assert request.messages[-1]["content"] == QWEN_XHIGH_EFFORT_SENTENCE
-    assert request._dynamic_effort["forced_level"] == 2
+    assert request.messages[-1]["content"] == LOW_EFFORT_SENTENCE
+    assert request._dynamic_effort["forced_level"] == 0
     with pytest.raises(DynamicEffortError):
         apply_dynamic_effort(_request(vllm_xargs={"dynamic_effort_level": 9}), _cfg())
+
+
+def test_a_forced_think_off_still_passes_the_off_gate():
+    """Forcing the think-off level via vllm_xargs may not bypass the vote:
+    the engine gets `force_off` instead of a forced level."""
+    cfg = _cfg(hidden_effort=HiddenEffortConfig(think_off_level=True, default_level=1))
+    request = _request(vllm_xargs={"dynamic_effort_level": 0})
+    apply_dynamic_effort(request, cfg)
+    overrides = request._dynamic_effort
+    assert overrides["force_off"] is True
+    assert "forced_level" not in overrides
+    assert overrides["default_level"] == 1
+    assert overrides["think_off_levels"] == [0]
+    assert overrides["off_votes"] == 3
+    assert overrides["off_vote_max_tokens"] == 8
+    # With the gate disabled the forced level is honoured directly and no
+    # vote parameters are shipped.
+    cfg = _cfg(
+        hidden_effort=HiddenEffortConfig(
+            think_off_level=True, default_level=1, off_vote=False
+        )
+    )
+    request = _request(vllm_xargs={"dynamic_effort_level": 0})
+    apply_dynamic_effort(request, cfg)
+    overrides = request._dynamic_effort
+    assert overrides["forced_level"] == 0
+    assert "force_off" not in overrides
+    assert "off_votes" not in overrides
 
 
 def test_no_server_config_is_a_client_error():
@@ -176,11 +192,7 @@ def test_attachment_preserves_absolute_levels_with_a_medium_default():
 
     low = [1, 2, 3, 10]
     medium = [1, 2, 3, 20]
-    high = [1, 2, 3, 30]
-    rendered_by_sentence = {
-        QWEN_LOW_EFFORT_SENTENCE: low,
-        QWEN_XHIGH_EFFORT_SENTENCE: high,
-    }
+    rendered_by_sentence = {LOW_EFFORT_SENTENCE: low}
 
     serving = OpenAIServingChat.__new__(OpenAIServingChat)
     serving.model_config = type("ModelConfig", (), {"is_encoder_decoder": False})()
@@ -200,7 +212,7 @@ def test_attachment_preserves_absolute_levels_with_a_medium_default():
 
     body_len = request._dynamic_effort["body_len"]
     tails = request._dynamic_effort["tails"]
-    assert [medium[:body_len] + tail for tail in tails] == [low, medium, high]
+    assert [medium[:body_len] + tail for tail in tails] == [low, medium]
 
 
 # ---------------------------------------------------------------- controller
@@ -261,14 +273,14 @@ def test_a_prompt_that_ends_mid_think_starts_in_the_think_block():
 def test_the_report_is_the_level_and_how_it_closed():
     cfg = _cfg()
     state = _state(cfg)
-    state.level = 2
+    state.level = 1
     state.decided = True
     state.memory_entries = 4096
     state.neighbours = 16
     _run(state, cfg, [START, 5, 6, 7, END])
     report = finish_effort(state)
     assert report == {
-        "level": 2,
+        "level": 1,
         "decided": 1,
         "reasoning_tokens": 3,
         "close_kind": CLOSE_NATURAL,
@@ -277,10 +289,11 @@ def test_the_report_is_the_level_and_how_it_closed():
         "estimate": None,
         "calibrated": None,
         "novelty_rank": None,
-        "custom_note_tokens": 0,
+        "off_votes": 0,
+        "off_vetoed": 0,
     }
     info = EffortInfo.from_report(report)
-    assert info.level == 2 and info.decided and info.close_kind == CLOSE_NATURAL
+    assert info.level == 1 and info.decided and info.close_kind == CLOSE_NATURAL
     assert info.reasoning_tokens == 3 and info.memory_entries == 4096
 
 
@@ -289,6 +302,10 @@ def test_hidden_effort_validates_its_levels():
         HiddenEffortConfig(effort_sentences=["only one"])
     with pytest.raises(ValueError):
         HiddenEffortConfig(default_level=5)
+    with pytest.raises(ValueError):
+        HiddenEffortConfig(off_votes=0)
+    with pytest.raises(ValueError):
+        HiddenEffortConfig(off_vote_max_tokens=0)
     assert HiddenEffortConfig(effort_sentences=["a", "b", "c", "d"]).sentences() == [
         "a",
         "b",
@@ -372,29 +389,23 @@ def test_think_off_variant_renders_without_a_sentence():
         HiddenEffortConfig(enabled=True, think_off_level=True, default_level=0)
 
 
-def test_custom_level_variants_carry_placeholders_and_the_meta_prompt():
-    from vllm.config.reasoning import (
-        CUSTOM_EFFORT_SENTENCE,
-        CUSTOM_META_PROMPT,
-        CUSTOM_TAIL_PREFIX,
-    )
+def test_off_vote_variant_asks_the_hidden_question_at_the_tail():
     from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
-        CUSTOM_PLACEHOLDERS,
-        custom_aux_variants,
-        render_effort_variants,
+        off_vote_variant,
     )
 
-    cfg = HiddenEffortConfig(
-        enabled=True, think_off_level=True, custom_level=True, default_level=1
-    )
-    assert cfg.sentences() == [None, "", CUSTOM_EFFORT_SENTENCE]
-    assert cfg.low_level == 1
+    cfg = HiddenEffortConfig(enabled=True, think_off_level=True, default_level=2)
+    assert cfg.sentences() == [None, LOW_EFFORT_SENTENCE, ""]
     msgs = [{"role": "user", "content": "hi"}]
-    variants = render_effort_variants(msgs, cfg.sentences())
-    assert variants[0] == msgs and variants[1] == msgs
-    assert variants[2][-1]["content"].startswith(CUSTOM_TAIL_PREFIX + CUSTOM_PLACEHOLDERS[0])
-    second, meta = custom_aux_variants(msgs)
-    assert CUSTOM_PLACEHOLDERS[1] in second[-1]["content"]
-    assert meta[-1]["content"] == CUSTOM_META_PROMPT
-    with pytest.raises(ValueError):
-        HiddenEffortConfig(enabled=True, custom_level=True, default_level=1)
+    meta = off_vote_variant(msgs)
+    assert meta[:-1] == msgs
+    assert meta[-1] == {"role": "user", "content": OFF_VOTE_PROMPT}
+    # The vote parameters ship with any think-off configuration.
+    request = _request()
+    apply_dynamic_effort(
+        request, _cfg(hidden_effort=HiddenEffortConfig(think_off_level=True,
+                                                       default_level=1))
+    )
+    overrides = request._dynamic_effort
+    assert overrides["think_off_levels"] == [0]
+    assert overrides["off_votes"] == 3 and overrides["off_vote_max_tokens"] == 8

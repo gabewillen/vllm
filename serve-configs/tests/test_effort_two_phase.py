@@ -55,6 +55,9 @@ def _scheduler(max_num_batched_tokens=2048, async_scheduling=None, **hidden_kw):
         k=4,
         flush_every=0,
         probe_every=0,
+        # Three levels, so TAILS matches: the base config is 2-level and the
+        # think-off tests pass effort_sentences=None to get [off, low, ""].
+        effort_sentences=["low", "", "high"],
     )
     kwargs.update(hidden_kw)
     hidden = HiddenEffortConfig(**kwargs)
@@ -400,6 +403,7 @@ def test_split_survives_async_scheduling(async_scheduling):
         q_mid=0.0,
         q_high=0.0,
         probe_every=0,
+        effort_sentences=["low", "", "high"],
     )
     scheduler._effort_cfg = DynamicEffortConfig(hidden_effort=hidden)
     scheduler._effort_start_ids = [START]
@@ -583,28 +587,40 @@ def test_a_seam_far_from_the_prompt_tail_is_not_worth_a_split():
     assert other.effort_hold_prefill and other.effort_body_len == 32
 
 
-def test_custom_level_generates_a_hidden_note_and_splices_it():
-    """A custom verdict resubmits with the meta tail, collects the generated
-    line without emitting it, then resubmits once more with the note spliced
-    between the custom tail's prefix and suffix (prompt revision 2)."""
-    scheduler = _scheduler(q_mid=0.0, q_high=0.0)  # everything routes to 2
+YES, NO, NL = 600, 601, 198
+META = [900, 901, 902]
+OFF = [880, 881]
+
+
+def _off_vote_scheduler(**kw):
+    kwargs = dict(
+        q_mid=1.0, q_high=1.0, think_off_level=True, q_none=1.0,
+        default_level=1, effort_sentences=None,
+    )  # off / low / default; everything routes to 0 (off)
+    kwargs.update(kw)
+    scheduler = _scheduler(**kwargs)
     _fill_memory(scheduler)
     scheduler.need_mamba_block_aligned_split = True
-    seam = 90
-    META = [900, 901, 902]
-    PREFIX, SUFFIX = [700, 701], [710, 711, 712]
+    return scheduler
+
+
+def _add_gated(scheduler, force_off=False, off_vote_max_tokens=8):
     params = SamplingParams(
         max_tokens=60000,
+        temperature=0.0,
         extra_args={
             "dynamic_effort": {
                 "default_level": 1,
-                "body_len": seam,
-                "tails": [TAILS[0], TAILS[1], PREFIX],
-                "custom_level": 2,
-                "custom_suffix": SUFFIX,
+                "body_len": 90,
+                "tails": TAILS,
+                "off_append": OFF,
                 "meta_tail": META,
-                "meta_stop_ids": [198],
-                "custom_max_tokens": 8,
+                "meta_stop_ids": [NL],
+                "yes_ids": [YES],
+                "no_ids": [NO],
+                "off_votes": 3,
+                "off_vote_max_tokens": off_vote_max_tokens,
+                **({"force_off": True} if force_off else {}),
             }
         },
     )
@@ -616,52 +632,137 @@ def test_custom_level_generates_a_hidden_note_and_splices_it():
         block_hasher=_block_hasher(),
     )
     scheduler.add_request(request)
-    prompt = list(request.prompt_token_ids)
-    assert request.effort_custom_level == 2 and request.effort_meta_tail == META
+    return request
 
-    while True:
+
+def _prefill_to_capture(scheduler, vector=True):
+    for _ in range(8):
         output = scheduler.schedule()
         if output.effort_prefill_capture:
             break
         scheduler.update_from_output(output, _runner_output(output))
-    outs = scheduler.update_from_output(
+    assert output.effort_prefill_capture == ["a"]
+    return scheduler.update_from_output(
         output,
         _runner_output(
-            output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}
+            output,
+            {"a": np.ones(HIDDEN, dtype=np.float16)} if vector else None,
+            sampled={"a": [START]},
         ),
     )
-    # Resubmitted with the meta tail, hidden from the client.
+
+
+def _vote(scheduler, sampled):
+    step = scheduler.schedule()
+    return scheduler.update_from_output(
+        step, _runner_output(step, sampled={"a": sampled})
+    )
+
+
+def test_an_off_verdict_starts_the_hidden_vote():
+    """An off verdict does not stand on its own: the hidden yes/no question is
+    resubmitted at temperature 0.7 and nothing reaches the client."""
+    scheduler = _off_vote_scheduler()
+    request = _add_gated(scheduler)
+    prompt = list(request.prompt_token_ids)
+    assert request.effort_meta_tail == META and request.effort_off_votes == 3
+    outs = _prefill_to_capture(scheduler)
     upd = outs[0].outputs[0].routed_prompt_update
     assert upd is not None and upd.revision == 1
-    assert list(request.prompt_token_ids) == prompt[:seam] + META
+    assert list(request.prompt_token_ids) == prompt[:90] + META
     assert request.effort_meta_phase
-
-    # Prefill the meta prompt, then generate the note: two tokens, then newline.
-    step = scheduler.schedule()
-    outs = scheduler.update_from_output(step, _runner_output(step, sampled={"a": [501]}))
-    assert all(o.new_token_ids == [] for o in outs[0].outputs)  # nothing shown
-    step = scheduler.schedule()
-    outs = scheduler.update_from_output(step, _runner_output(step, sampled={"a": [502]}))
-    step = scheduler.schedule()
-    outs = scheduler.update_from_output(step, _runner_output(step, sampled={"a": [198]}))
-    upd = [o.routed_prompt_update for o in outs[0].outputs if o.routed_prompt_update]
-    assert upd and upd[0].revision == 2
-    assert list(request.prompt_token_ids) == prompt[:seam] + PREFIX + [501, 502] + SUFFIX
-    assert not request.effort_meta_phase
+    assert request.effort_saved_sampling == (0.0, None)
+    assert request.sampling_params.temperature == 0.7
+    assert request.sampling_params.seed == 1
     assert len(request.output_token_ids) == 0
-    assert scheduler._effort["a"].level == 2
-    assert scheduler._effort["a"].custom_note_tokens == 2
-    # And the real request prefills its new tail and runs.
+
+
+def test_three_unanimous_yeses_confirm_think_off():
+    scheduler = _off_vote_scheduler()
+    request = _add_gated(scheduler)
+    prompt = list(request.prompt_token_ids)
+    _prefill_to_capture(scheduler)
+
+    outs = _vote(scheduler, [YES])
+    assert all(o.new_token_ids == [] for o in outs[0].outputs)  # nothing shown
+    assert request.effort_meta_phase and request.effort_meta_votes == [True]
+    assert request.sampling_params.seed == 2  # next vote, next seed
+    _vote(scheduler, [YES])
+    assert request.effort_meta_votes == [True, True]
+    outs = _vote(scheduler, [YES])
+
+    assert not request.effort_meta_phase
+    # Off rendering: the default tail plus the closed think block.
+    assert list(request.prompt_token_ids) == prompt[:90] + TAILS[1] + OFF
+    assert len(request.output_token_ids) == 0
+    upd = [o.routed_prompt_update for o in outs[0].outputs if o.routed_prompt_update]
+    assert upd and upd[0].prompt_token_ids == prompt[:90] + TAILS[1] + OFF
+    assert request.sampling_params.temperature == 0.0  # client sampling restored
+    assert request.sampling_params.seed is None
+    state = scheduler._effort["a"]
+    assert state.level == 0
+    assert state.off_votes == 3 and not state.off_vetoed
+    # And the request prefills its off tail and runs.
     step = scheduler.schedule()
     assert step.num_scheduled_tokens["a"] > 0
+
+
+def test_a_single_no_vetoes_think_off_to_the_resting_low():
+    scheduler = _off_vote_scheduler()
+    request = _add_gated(scheduler)
+    prompt = list(request.prompt_token_ids)
+    _prefill_to_capture(scheduler)
+
+    _vote(scheduler, [YES])
+    _vote(scheduler, [NO])
+
+    assert not request.effort_meta_phase
+    assert list(request.prompt_token_ids) == prompt[:90] + TAILS[1]  # low tail
+    assert request.sampling_params.temperature == 0.0
+    state = scheduler._effort["a"]
+    assert state.level == 1
+    assert state.off_votes == 1 and state.off_vetoed
+
+
+def test_an_unclassifiable_vote_counts_as_no():
+    """A vote still running at off_vote_max_tokens never said yes; it is a
+    no, and one no ends the gate."""
+    scheduler = _off_vote_scheduler()
+    request = _add_gated(scheduler, off_vote_max_tokens=3)
+    prompt = list(request.prompt_token_ids)
+    _prefill_to_capture(scheduler)
+
+    _vote(scheduler, [501, 502, 503, 504])
+
+    assert not request.effort_meta_phase
+    assert request.effort_meta_votes == [False]
+    assert list(request.prompt_token_ids) == prompt[:90] + TAILS[1]
+    assert scheduler._effort["a"].off_vetoed
+
+
+def test_a_forced_off_still_passes_the_gate():
+    """`vllm_xargs.dynamic_effort_level` on the think-off level ships
+    `force_off`: the memory is skipped but the vote is not."""
+    scheduler = _off_vote_scheduler(q_none=0.0)  # the map would never say off...
+    request = _add_gated(scheduler, force_off=True)
+    assert request.effort_force_off
+    _prefill_to_capture(scheduler, vector=False)  # ...and no vector either
+    # Forced off wins over both, but only up to the gate.
+    assert request.effort_meta_phase
+    _vote(scheduler, [YES])
+    _vote(scheduler, [YES])
+    _vote(scheduler, [YES])
+    assert scheduler._effort["a"].level == 0
+    assert not scheduler._effort["a"].off_vetoed
 
 
 def test_think_off_extends_the_prefilled_prompt_in_place():
     """An off verdict appends the closed think block to the default prompt
     and continues: nothing is freed, only the appended tokens prefill."""
     scheduler = _scheduler(
-        q_mid=1.0, q_high=1.0, think_off_level=True, custom_level=True, q_none=1.0, default_level=1
-    )  # off / default / custom; everything routes to 0 (off)
+        q_mid=1.0, q_high=1.0, think_off_level=True, q_none=1.0,
+        default_level=1, effort_sentences=None,
+    )  # off / low / default; everything routes to 0 (off)
     _fill_memory(scheduler)
     scheduler.need_mamba_block_aligned_split = True
     OFF = [880, 881]
@@ -705,146 +806,3 @@ def test_think_off_extends_the_prefilled_prompt_in_place():
     assert outs[0].outputs[0].routed_prompt_update.prompt_token_ids == prompt + OFF
     step = scheduler.schedule()
     assert step.num_scheduled_tokens["a"] == len(OFF)
-
-
-def test_truncated_guidance_falls_back_to_the_default_tail():
-    """A note still running at custom_max_tokens was cut mid-sentence; it is
-    dropped and the request runs at the default level."""
-    scheduler = _scheduler(q_mid=0.0, q_high=0.0)
-    _fill_memory(scheduler)
-    scheduler.need_mamba_block_aligned_split = True
-    params = SamplingParams(
-        max_tokens=60000,
-        extra_args={
-            "dynamic_effort": {
-                "default_level": 1,
-                "body_len": 90,
-                "tails": [TAILS[0], TAILS[1], [700, 701]],
-                "custom_level": 2,
-                "custom_suffix": [710],
-                "meta_tail": [900, 901],
-                "meta_stop_ids": [198],
-                "custom_max_tokens": 3,
-            }
-        },
-    )
-    request = Request(
-        request_id="a", prompt_token_ids=_prompt(7, TAILS[1]),
-        sampling_params=params, pooling_params=None, block_hasher=_block_hasher(),
-    )
-    scheduler.add_request(request)
-    prompt = list(request.prompt_token_ids)
-    for _ in range(8):
-        output = scheduler.schedule()
-        if output.effort_prefill_capture:
-            break
-        scheduler.update_from_output(output, _runner_output(output))
-    scheduler.update_from_output(
-        output,
-        _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}),
-    )
-    assert request.effort_meta_phase
-    step = scheduler.schedule()
-    outs = scheduler.update_from_output(
-        step, _runner_output(step, sampled={"a": [501, 502, 503, 504]})
-    )
-    upd = [o.routed_prompt_update for o in outs[0].outputs if o.routed_prompt_update]
-    assert upd and list(request.prompt_token_ids) == prompt[:90] + TAILS[1]
-    assert scheduler._effort["a"].level == 1
-    assert scheduler._effort["a"].custom_note_tokens == 0
-
-
-def test_guidance_stops_at_the_sentence_end_inclusively():
-    scheduler = _scheduler(q_mid=0.0, q_high=0.0)
-    _fill_memory(scheduler)
-    scheduler.need_mamba_block_aligned_split = True
-    DOT = 13
-    params = SamplingParams(
-        max_tokens=60000,
-        extra_args={
-            "dynamic_effort": {
-                "default_level": 1,
-                "body_len": 90,
-                "tails": [TAILS[0], TAILS[1], [700]],
-                "custom_level": 2,
-                "custom_suffix": [710],
-                "meta_tail": [900],
-                "meta_stop_ids": [198],
-                "meta_end_ids": [DOT],
-                "custom_max_tokens": 150,
-            }
-        },
-    )
-    request = Request(
-        request_id="a", prompt_token_ids=_prompt(7, TAILS[1]),
-        sampling_params=params, pooling_params=None, block_hasher=_block_hasher(),
-    )
-    scheduler.add_request(request)
-    prompt = list(request.prompt_token_ids)
-    for _ in range(8):
-        output = scheduler.schedule()
-        if output.effort_prefill_capture:
-            break
-        scheduler.update_from_output(output, _runner_output(output))
-    scheduler.update_from_output(
-        output,
-        _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}),
-    )
-    # An early dot (below the 12-token floor) does not end the note.
-    note=[500+i for i in range(11)]
-    step = scheduler.schedule()
-    scheduler.update_from_output(step, _runner_output(step, sampled={"a": [note[0], DOT]+note[1:]}))
-    assert request.effort_meta_phase
-    step = scheduler.schedule()
-    outs = scheduler.update_from_output(step, _runner_output(step, sampled={"a": [DOT, 999]}))
-    assert not request.effort_meta_phase
-    spliced = request.prompt_token_ids[90:]
-    assert spliced[0] == 700 and spliced[-1] == 710
-    assert spliced[1:-1] == [note[0], DOT] + note[1:] + [DOT]  # ends at the dot, dot kept
-
-
-def test_guidance_ends_at_the_first_sentence_dot_past_the_floor():
-    scheduler = _scheduler(q_mid=0.0, q_high=0.0)
-    _fill_memory(scheduler)
-    scheduler.need_mamba_block_aligned_split = True
-    DOT = 13
-    params = SamplingParams(
-        max_tokens=60000,
-        extra_args={
-            "dynamic_effort": {
-                "default_level": 1,
-                "body_len": 90,
-                "tails": [TAILS[0], TAILS[1], [700]],
-                "custom_level": 2,
-                "custom_suffix": [710],
-                "meta_tail": [900],
-                "meta_stop_ids": [198],
-                "meta_end_ids": [DOT],
-                "custom_max_tokens": 150,
-            }
-        },
-    )
-    request = Request(
-        request_id="a", prompt_token_ids=_prompt(7, TAILS[1]),
-        sampling_params=params, pooling_params=None, block_hasher=_block_hasher(),
-    )
-    scheduler.add_request(request)
-    for _ in range(8):
-        output = scheduler.schedule()
-        if output.effort_prefill_capture:
-            break
-        scheduler.update_from_output(output, _runner_output(output))
-    scheduler.update_from_output(
-        output,
-        _runner_output(output, {"a": np.ones(HIDDEN, dtype=np.float16)}, sampled={"a": [START]}),
-    )
-    # A dot below the 12-token floor (e.g. "v1.2") does not end the note.
-    early = [500, 501, DOT, 502, 503, 504, 505, 506, 507, 508]
-    step = scheduler.schedule()
-    scheduler.update_from_output(step, _runner_output(step, sampled={"a": early}))
-    assert request.effort_meta_phase
-    step = scheduler.schedule()
-    scheduler.update_from_output(step, _runner_output(step, sampled={"a": [509, 510, DOT, 999, 998]}))
-    assert not request.effort_meta_phase
-    spliced = request.prompt_token_ids[90:]
-    assert spliced == [700] + early + [509, 510, DOT] + [710]  # ends at the dot, dot kept

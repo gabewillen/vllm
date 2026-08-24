@@ -29,7 +29,7 @@ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     DynamicEffortError,
     apply_default_effort,
     apply_dynamic_effort,
-    custom_aux_variants,
+    off_vote_variant,
     split_body_and_tails,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -247,9 +247,10 @@ class OpenAIServingChat(GenerateBaseServing):
         if variants is None or request._dynamic_effort is None:
             return None
         think_off_levels = set(request._dynamic_effort.get("think_off_levels", ()))
-        custom_level = request._dynamic_effort.get("custom_level")
-        if custom_level is not None:
-            variants = list(variants) + custom_aux_variants(variants[custom_level][:-1])
+        off_votes = request._dynamic_effort.get("off_votes")
+        if think_off_levels and off_votes:
+            base = min(i for i in range(len(variants)) if i not in think_off_levels)
+            variants = list(variants) + [off_vote_variant(variants[base][:-1])]
         if len(engine_inputs) != 1:
             return None
         default_level = request._dynamic_effort["default_level"]
@@ -261,7 +262,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 continue
             variant_request = copy(request)
             variant_request.messages = messages
-            is_meta = custom_level is not None and level == len(variants) - 1
+            is_meta = bool(off_votes) and level == len(variants) - 1
             if level in think_off_levels or is_meta:
                 variant_request.chat_template_kwargs = {
                     **(request.chat_template_kwargs or {}),
@@ -282,46 +283,34 @@ class OpenAIServingChat(GenerateBaseServing):
         if split is None:
             return None
         body_len, tails = split
-        if custom_level is not None:
-            # tails[-2] is the second placeholder rendering, tails[-1] the meta
-            # prompt. The custom tail's prefix/suffix are what the two
-            # placeholder renderings share; the engine splices the note in.
-            meta_tail = tails.pop()
-            second = tails.pop()
-            first = tails[custom_level]
-            lp = 0
-            while lp < min(len(first), len(second)) and first[lp] == second[lp]:
-                lp += 1
-            ls = 0
-            while (
-                ls < min(len(first), len(second)) - lp
-                and first[-1 - ls] == second[-1 - ls]
-            ):
-                ls += 1
-            tails[custom_level] = first[:lp]
-            request._dynamic_effort["custom_suffix"] = first[len(first) - ls :]
-            request._dynamic_effort["meta_tail"] = meta_tail
+        if think_off_levels and off_votes:
+            # tails[-1] is the hidden yes/no question; the engine samples it
+            # `off_votes` times before it lets a think-off verdict stand.
+            request._dynamic_effort["meta_tail"] = tails.pop()
             tokenizer = self.renderer.tokenizer
             stop_ids: set[int] = set()
-            end_ids: set[int] = set()
+            yes_ids: set[int] = set()
+            no_ids: set[int] = set()
             if tokenizer is not None:
-                for text in ("\n", "\n\n", ".\n"):
+                for text in ("\n", "\n\n"):
                     ids = tokenizer.encode(text, add_special_tokens=False)
                     if len(ids) == 1:
                         stop_ids.add(int(ids[0]))
-                # Sentence enders stop the note *inclusively* once past a
-                # short floor: the ". " form of a sentence end, with the
-                # following space riding on the next token. The note is one
-                # sentence by construction instead of by request.
-                for text in (".", "!", "?"):
-                    ids = tokenizer.encode(text, add_special_tokens=False)
-                    if len(ids) == 1:
-                        end_ids.add(int(ids[0]))
                 eos = getattr(tokenizer, "eos_token_id", None)
                 if eos is not None:
                     stop_ids.add(int(eos))
+                for text, bucket in (
+                    ("yes", yes_ids), ("Yes", yes_ids), ("YES", yes_ids),
+                    (" yes", yes_ids), (" Yes", yes_ids),
+                    ("no", no_ids), ("No", no_ids), ("NO", no_ids),
+                    (" no", no_ids), (" No", no_ids),
+                ):
+                    ids = tokenizer.encode(text, add_special_tokens=False)
+                    if len(ids) == 1:
+                        bucket.add(int(ids[0]))
             request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
-            request._dynamic_effort["meta_end_ids"] = sorted(end_ids)
+            request._dynamic_effort["yes_ids"] = sorted(yes_ids)
+            request._dynamic_effort["no_ids"] = sorted(no_ids)
         if think_off_levels:
             # Thinking off is the default rendering plus a closed think block:
             # appended in place, no resubmission (measured identical to the

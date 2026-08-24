@@ -22,16 +22,9 @@ import copy
 from typing import TYPE_CHECKING, Any
 
 from vllm.config.reasoning import (
-    CUSTOM_EFFORT_SENTENCE,
-    CUSTOM_META_PROMPT,
-    CUSTOM_TAIL_PREFIX,
-    CUSTOM_TAIL_SUFFIX,
+    OFF_VOTE_PROMPT,
     DynamicEffortConfig,
 )
-
-CUSTOM_PLACEHOLDERS = ("QZQZQZ", "QZQZQZQZQZQZ")
-"""Two placeholder notes of different length; the custom tail's prefix and
-suffix token ids are the common prefix and suffix of their renderings."""
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -116,12 +109,17 @@ def apply_dynamic_effort(
         )
     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
     forced = overrides.get("forced_level")
-    if forced is not None and cfg.level_sentences[forced] == CUSTOM_EFFORT_SENTENCE:
-        # Custom needs the engine's meta pass: run the normal two-phase path
-        # and force the verdict there instead of rendering it as the default.
-        overrides["force_custom"] = True
+    hidden = cfg.hidden_effort
+    if (
+        forced is not None
+        and cfg.level_sentences[forced] is None
+        and hidden.off_vote
+    ):
+        # A forced think-off still passes through the off-vote gate: run the
+        # normal two-phase path and force the verdict in the engine.
+        overrides["force_off"] = True
         del overrides["forced_level"]
-    default_level = overrides.get("forced_level", cfg.hidden_effort.default_level)
+    default_level = overrides.get("forced_level", hidden.default_level)
     variants = render_effort_variants(request.messages, cfg.level_sentences)
     request.messages = variants[default_level]
     request._dynamic_effort_variant_messages = variants
@@ -129,12 +127,9 @@ def apply_dynamic_effort(
     overrides["think_off_levels"] = [
         i for i, sentence in enumerate(cfg.level_sentences) if sentence is None
     ]
-    custom = [
-        i for i, sentence in enumerate(cfg.level_sentences)
-        if sentence == CUSTOM_EFFORT_SENTENCE
-    ]
-    overrides["custom_level"] = custom[0] if custom else None
-    overrides["custom_max_tokens"] = cfg.hidden_effort.custom_max_tokens
+    if overrides["think_off_levels"] and hidden.off_vote:
+        overrides["off_votes"] = hidden.off_votes
+        overrides["off_vote_max_tokens"] = hidden.off_vote_max_tokens
     if default_level in overrides["think_off_levels"]:
         request.chat_template_kwargs = {**kwargs, "enable_thinking": False}
     request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
@@ -151,25 +146,17 @@ def render_effort_variants(
     variants: list[list[Any]] = []
     for sentence in sentences:
         rendered = copy.deepcopy(messages)
-        if sentence == CUSTOM_EFFORT_SENTENCE:
-            # The level's own rendering is the first placeholder; the engine
-            # splices the generated note between the tail's prefix and suffix.
-            sentence = CUSTOM_TAIL_PREFIX + CUSTOM_PLACEHOLDERS[0] + CUSTOM_TAIL_SUFFIX
         append_to_last_message(rendered, sentence or "")
         variants.append(rendered)
     return variants
 
 
-def custom_aux_variants(messages: list[Any]) -> list[list[Any]]:
-    """The two extra renderings a custom level needs: the second placeholder
-    and the hidden meta prompt (rendered thinking-off)."""
-    second = copy.deepcopy(messages)
-    append_to_last_message(
-        second, CUSTOM_TAIL_PREFIX + CUSTOM_PLACEHOLDERS[1] + CUSTOM_TAIL_SUFFIX
-    )
+def off_vote_variant(messages: list[Any]) -> list[Any]:
+    """The extra rendering the off gate needs: the hidden yes/no question,
+    rendered thinking-off."""
     meta = copy.deepcopy(messages)
-    append_to_last_message(meta, CUSTOM_META_PROMPT)
-    return [second, meta]
+    append_to_last_message(meta, OFF_VOTE_PROMPT)
+    return meta
 
 
 def split_body_and_tails(

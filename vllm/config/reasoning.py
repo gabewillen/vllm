@@ -20,29 +20,20 @@ VALID_REASONING_EFFORTS = frozenset(
 """The `reasoning_effort` values the chat completion API accepts; kept in step
 with `ChatCompletionRequest.reasoning_effort`."""
 
-QWEN_LOW_EFFORT_SENTENCE = (
-    "Reasoning effort is set to low. Keep your thinking brief and focused, "
-    "moving directly to the conclusion without unnecessary elaboration."
-)
+LOW_EFFORT_SENTENCE = "Reasoning effort is set to low."
+"""The resting level's whole tail. Measured 2026-08-23 on the 12-prompt grid
+(2 reps): 22/24 correct at 611 avg tokens vs 21/24 at 774 with no sentence;
+every upward word (high/xhigh/max) lost accuracy at 1.5-2x tokens with cap
+runaways, so there is no upward level."""
 
-CUSTOM_EFFORT_SENTENCE = "__custom__"
-"""Sentinel level: the tail is written by the model itself for this request
-(a one-line note on what a careful solver must get right), generated with
-thinking off before the real request runs."""
-
-CUSTOM_META_PROMPT = (
-    "Before answering, in one short sentence (at most 25 words) say what a "
-    "careful solver of the request above must get right. Reply with that "
-    "sentence only."
+OFF_VOTE_PROMPT = (
+    "Could you answer the request above correctly with no step-by-step "
+    "working? Reply with one word: yes or no."
 )
-CUSTOM_TAIL_PREFIX = "Guidance for this task: "
-CUSTOM_TAIL_SUFFIX = " Decide your approach, verify it once, then answer."
-
-QWEN_XHIGH_EFFORT_SENTENCE = (
-    "Reasoning effort is set to xhigh. Please think carefully through the task, "
-    "validate key assumptions, consider plausible alternatives, and prioritize "
-    "correctness, consistency, and clarity in the final answer."
-)
+"""The hidden question that gates a think-off verdict. Sampled `off_votes`
+times at temperature 0.7; only a unanimous yes skips thinking. Measured
+2026-08-23: unanimity-of-3 had zero wrong-offs on the grid, a single vote
+wrongly said yes on arithmetic."""
 
 
 @config
@@ -130,21 +121,18 @@ class HiddenEffortConfig:
     q_none: float = Field(default=0.15, ge=0.0, le=1.0)
     """Neighbour difficulty below which a request skips thinking entirely
     (only with `think_off_level`)."""
-    custom_level: bool = False
-    """Replace the static low/xhigh sentences with two levels: the model's
-    default (no sentence) and a *custom* level whose tail the model writes
-    itself. On a custom verdict the engine first generates, thinking off and
-    hidden from the client, one line on what a careful solver must get right
-    (`CUSTOM_META_PROMPT`, at most `custom_max_tokens`), then resubmits the
-    request with that line as its tail. Measured 2026-08-23: the guided run
-    matched the default's accuracy and thought 40-55% less on the hard
-    prompts; the model's own 1-5 difficulty rating tracked realised thinking
-    at Spearman 0.77."""
-    custom_max_tokens: int = Field(default=150, ge=8)
-    """Hard cap on the guidance line. A line still running at the cap was
-    truncated mid-sentence and is NOT spliced - the request falls back to the
-    default tail - so this is a backstop, not a target; the meta prompt asks
-    for one short sentence."""
+    off_vote: bool = True
+    """Gate every think-off verdict on the model itself: before thinking is
+    skipped, the engine asks `OFF_VOTE_PROMPT` hidden from the client,
+    `off_votes` times. Only a unanimous yes renders think-off; any dissent
+    demotes the request to the resting low level. Free-text guidance was
+    removed after a fluent wrong note anchored an implementation on a wrong
+    contract - the model's voice is effort-only, one word."""
+    off_votes: int = Field(default=3, ge=1)
+    """Votes the off gate samples. Each is a short hidden generation over the
+    fully cached prompt at a different seed."""
+    off_vote_max_tokens: int = Field(default=8, ge=1)
+    """Cap on one vote's generation; an unclassifiable vote counts as no."""
 
     def __post_init__(self) -> None:
         if self.q_high < self.q_mid:
@@ -153,14 +141,12 @@ class HiddenEffortConfig:
             raise ValueError("hidden_effort.k must not exceed memory_size")
         if self.effort_sentences is not None and len(self.effort_sentences) < 2:
             raise ValueError("hidden_effort.effort_sentences needs at least two levels")
-        if self.custom_level and self.effort_sentences is not None:
-            raise ValueError("hidden_effort.custom_level and effort_sentences conflict")
         if self.default_level >= len(self.sentences()):
             raise ValueError("hidden_effort.default_level is outside the levels")
         if self.think_off_level and self.default_level == 0:
-            raise ValueError("hidden_effort.default_level may not be the think-off level")
-        if self.sentences()[self.default_level] == CUSTOM_EFFORT_SENTENCE:
-            raise ValueError("hidden_effort.default_level may not be the custom level")
+            raise ValueError(
+                "hidden_effort.default_level may not be the think-off level"
+            )
         if self.think_off_level and self.q_none > self.q_mid:
             raise ValueError("hidden_effort.q_none must be <= q_mid")
 
@@ -169,10 +155,8 @@ class HiddenEffortConfig:
         think-off level: no sentence, `enable_thinking=false`."""
         if self.effort_sentences is not None:
             base: list[str | None] = list(self.effort_sentences)
-        elif self.custom_level:
-            base = ["", CUSTOM_EFFORT_SENTENCE]
         else:
-            base = [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_XHIGH_EFFORT_SENTENCE]
+            base = [LOW_EFFORT_SENTENCE, ""]
         return ([None] if self.think_off_level else []) + base
 
     @property
