@@ -49,9 +49,10 @@ journal showed every "stream canceled by remote with error code 0" on ONE of
 its four edge connections (connIndex=2: 576 errors vs ~80 on the others), and
 a restart just moved the problem to the new connIndex=2 — i.e. a QUIC/UDP
 path problem from this LXC (path-MTU black-hole), not a bad edge server.
-Fix: `protocol: http2` at the top of /etc/cloudflared/config.yml (TCP
-transport), then `systemctl restart cloudflared`. Verified: 5.6 MB page
-0.18-0.35 s through the tunnel, zero cancels. Note a cloudflared restart
+**Actual cause: an unpaid Cloudflare bill** (account degraded for external
+clients while the origin looked healthy). `protocol: http2` was applied at the
+same time and is kept (harmless, slightly more robust in an LXC), but do not
+treat it as the fix — check the Cloudflare account/billing status first. Note a cloudflared restart
 drops in-flight cpa.willen.dev requests (pi retries 530s, but 10 consecutive
 failures end a pi session), so restart it only between benchmark runs.
 
