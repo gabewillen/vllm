@@ -37,8 +37,10 @@ management API.
       --network cliproxy-net -p 127.0.0.1:18317:18317 \
       -v cpa-manager-plus-data:/data seakee/cpa-manager-plus:latest
 
-Bound to localhost only, not exposed via cloudflared. UI at
-http://127.0.0.1:18317/management.html. First-run wizard needs:
+Public endpoint: https://cpamp.willen.dev (cloudflared -> localhost:18317,
+own ingress hostname added 2026-08-24; separate from cpa.willen.dev since
+CPAMP's admin key has broader access than the client key). First-run wizard
+needs:
 - Admin key: from `docker logs cpa-manager-plus` (grep "admin key generated"),
   also stashed in `serve-configs/cliproxyapi.env` as `CPAMP_ADMIN_KEY`.
 - CPA URL: `http://cliproxyapi:8317` (container DNS name on `cliproxy-net`).
