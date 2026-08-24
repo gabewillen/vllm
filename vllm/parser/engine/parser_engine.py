@@ -630,7 +630,12 @@ class ParserEngine(Parser):
         if start_id is None or end_id is None:
             return 0
         count = 0
-        depth = 0
+        # Templates that pre-open the think block put THINK_START in the
+        # prompt, so the generated ids begin inside reasoning and carry only
+        # THINK_END; the parser config's initial state records that.
+        depth = (
+            1 if self.parser_engine_config.initial_state == ParserState.REASONING else 0
+        )
         for token_id in token_ids:
             if token_id == start_id:
                 depth += 1

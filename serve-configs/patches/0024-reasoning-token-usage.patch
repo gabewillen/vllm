@@ -1,0 +1,144 @@
+diff --git a/tests/parser/engine/test_qwen3.py b/tests/parser/engine/test_qwen3.py
+index 07a025876a..5740fe55df 100644
+--- a/tests/parser/engine/test_qwen3.py
++++ b/tests/parser/engine/test_qwen3.py
+@@ -1175,3 +1175,32 @@ class TestNestedSchemaCoercion:
+         assert questions[0]["question"] == "Pick a color"
+         assert questions[0]["multiSelect"] is False
+         assert questions[0]["answer"] is None
++
++
++class TestCountReasoningTokens:
++    """The Qwen3 template pre-opens the think block, so generated ids start
++    inside reasoning and only carry THINK_END."""
++
++    @pytest.fixture
++    def think_tokenizer(self):
++        return make_mock_tokenizer(
++            {
++                TOOL_CALL_START: 100,
++                TOOL_CALL_END: 101,
++                "<think>": 102,
++                "</think>": 103,
++            }
++        )
++
++    def test_counts_from_pre_opened_think_block(self, think_tokenizer):
++        parser = ParserEngine(
++            think_tokenizer, parser_engine_config=qwen3_config(thinking=True)
++        )
++        assert parser.count_reasoning_tokens([5, 6, 7, 103, 8, 9]) == 3
++
++    def test_counts_explicit_span_when_thinking_off(self, think_tokenizer):
++        parser = ParserEngine(
++            think_tokenizer, parser_engine_config=qwen3_config(thinking=False)
++        )
++        assert parser.count_reasoning_tokens([5, 102, 6, 7, 103, 8]) == 2
++        assert parser.count_reasoning_tokens([5, 6, 103, 8]) == 0
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 6aa084ba38..d6428c4a5a 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -49,6 +49,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
+     EffortInfo,
+ )
+ from vllm.entrypoints.openai.engine.protocol import (
++    CompletionTokenUsageInfo,
+     DeltaMessage,
+     ErrorResponse,
+     FunctionCall,
+@@ -98,6 +99,19 @@ def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
+     }
+ 
+ 
++def _make_completion_tokens_details(
++    parser: "Parser | None", output_token_ids: list[GenericSequence[int]]
++) -> CompletionTokenUsageInfo | None:
++    """`completion_tokens_details.reasoning_tokens` from the reasoning parser's
++    span count over each choice's generated ids; None without a parser."""
++    if parser is None or parser.reasoning_parser is None:
++        return None
++    count = parser.reasoning_parser.count_reasoning_tokens
++    return CompletionTokenUsageInfo(
++        reasoning_tokens=sum(count(ids) for ids in output_token_ids)
++    )
++
++
+ def _make_prompt_tokens_details(
+     enable_prompt_tokens_details: bool,
+     num_cached_tokens: int | None,
+@@ -683,6 +697,7 @@ class OpenAIServingChat(GenerateBaseServing):
+         # Send response for each token for each request.n (index)
+         num_choices = 1 if request.n is None else request.n
+         previous_num_tokens = [0] * num_choices
++        previous_token_ids: list[list[int]] = [[] for _ in range(num_choices)]
+         finish_reason_sent = [False] * num_choices
+         num_prompt_tokens = 0
+         num_cached_tokens = None
+@@ -875,6 +890,7 @@ class OpenAIServingChat(GenerateBaseServing):
+ 
+                     # set the previous values for the next iteration
+                     previous_num_tokens[i] += len(output.token_ids)
++                    previous_token_ids[i].extend(output.token_ids)
+ 
+                     # if the message delta is None (e.g. because it was a
+                     # "control token" for tool calls or the parser otherwise
+@@ -1020,6 +1036,9 @@ class OpenAIServingChat(GenerateBaseServing):
+                     num_cache_creation_tokens,
+                     mm_token_counts,
+                 )
++                final_usage.completion_tokens_details = _make_completion_tokens_details(
++                    parsers[0] if parsers else None, previous_token_ids
++                )
+ 
+                 # In streaming, metrics ride on this final usage chunk, which is
+                 # only emitted when usage reporting is enabled (i.e.
+@@ -1312,6 +1331,9 @@ class OpenAIServingChat(GenerateBaseServing):
+             final_res.num_cache_creation_tokens,
+             mm_token_counts,
+         )
++        usage.completion_tokens_details = _make_completion_tokens_details(
++            parser, [output.token_ids for output in final_res.outputs]
++        )
+ 
+         request_metadata.final_usage_info = usage
+ 
+diff --git a/vllm/entrypoints/openai/engine/protocol.py b/vllm/entrypoints/openai/engine/protocol.py
+index 4d07c29408..dded1261dc 100644
+--- a/vllm/entrypoints/openai/engine/protocol.py
++++ b/vllm/entrypoints/openai/engine/protocol.py
+@@ -117,11 +117,16 @@ class PromptTokenUsageInfo(OpenAIBaseModel):
+     request has no multimodal input."""
+ 
+ 
++class CompletionTokenUsageInfo(OpenAIBaseModel):
++    reasoning_tokens: int = 0
++
++
+ class UsageInfo(OpenAIBaseModel):
+     prompt_tokens: int = 0
+     total_tokens: int = 0
+     completion_tokens: int | None = 0
+     prompt_tokens_details: PromptTokenUsageInfo | None = None
++    completion_tokens_details: CompletionTokenUsageInfo | None = None
+ 
+ 
+ class PerRequestTimingMetrics(OpenAIBaseModel):
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+index 048e714cb4..c5a3524700 100644
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -630,7 +630,12 @@ class ParserEngine(Parser):
+         if start_id is None or end_id is None:
+             return 0
+         count = 0
+-        depth = 0
++        # Templates that pre-open the think block put THINK_START in the
++        # prompt, so the generated ids begin inside reasoning and carry only
++        # THINK_END; the parser config's initial state records that.
++        depth = (
++            1 if self.parser_engine_config.initial_state == ParserState.REASONING else 0
++        )
+         for token_id in token_ids:
+             if token_id == start_id:
+                 depth += 1

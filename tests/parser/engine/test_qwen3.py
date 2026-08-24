@@ -1175,3 +1175,32 @@ class TestNestedSchemaCoercion:
         assert questions[0]["question"] == "Pick a color"
         assert questions[0]["multiSelect"] is False
         assert questions[0]["answer"] is None
+
+
+class TestCountReasoningTokens:
+    """The Qwen3 template pre-opens the think block, so generated ids start
+    inside reasoning and only carry THINK_END."""
+
+    @pytest.fixture
+    def think_tokenizer(self):
+        return make_mock_tokenizer(
+            {
+                TOOL_CALL_START: 100,
+                TOOL_CALL_END: 101,
+                "<think>": 102,
+                "</think>": 103,
+            }
+        )
+
+    def test_counts_from_pre_opened_think_block(self, think_tokenizer):
+        parser = ParserEngine(
+            think_tokenizer, parser_engine_config=qwen3_config(thinking=True)
+        )
+        assert parser.count_reasoning_tokens([5, 6, 7, 103, 8, 9]) == 3
+
+    def test_counts_explicit_span_when_thinking_off(self, think_tokenizer):
+        parser = ParserEngine(
+            think_tokenizer, parser_engine_config=qwen3_config(thinking=False)
+        )
+        assert parser.count_reasoning_tokens([5, 102, 6, 7, 103, 8]) == 2
+        assert parser.count_reasoning_tokens([5, 6, 103, 8]) == 0

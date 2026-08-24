@@ -49,6 +49,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     EffortInfo,
 )
 from vllm.entrypoints.openai.engine.protocol import (
+    CompletionTokenUsageInfo,
     DeltaMessage,
     ErrorResponse,
     FunctionCall,
@@ -96,6 +97,19 @@ def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
         for modality, ranges in (mm_placeholders or {}).items()
         if ranges
     }
+
+
+def _make_completion_tokens_details(
+    parser: "Parser | None", output_token_ids: list[GenericSequence[int]]
+) -> CompletionTokenUsageInfo | None:
+    """`completion_tokens_details.reasoning_tokens` from the reasoning parser's
+    span count over each choice's generated ids; None without a parser."""
+    if parser is None or parser.reasoning_parser is None:
+        return None
+    count = parser.reasoning_parser.count_reasoning_tokens
+    return CompletionTokenUsageInfo(
+        reasoning_tokens=sum(count(ids) for ids in output_token_ids)
+    )
 
 
 def _make_prompt_tokens_details(
@@ -683,6 +697,7 @@ class OpenAIServingChat(GenerateBaseServing):
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
         previous_num_tokens = [0] * num_choices
+        previous_token_ids: list[list[int]] = [[] for _ in range(num_choices)]
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
@@ -875,6 +890,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
+                    previous_token_ids[i].extend(output.token_ids)
 
                     # if the message delta is None (e.g. because it was a
                     # "control token" for tool calls or the parser otherwise
@@ -1019,6 +1035,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     num_cached_tokens,
                     num_cache_creation_tokens,
                     mm_token_counts,
+                )
+                final_usage.completion_tokens_details = _make_completion_tokens_details(
+                    parsers[0] if parsers else None, previous_token_ids
                 )
 
                 # In streaming, metrics ride on this final usage chunk, which is
@@ -1311,6 +1330,9 @@ class OpenAIServingChat(GenerateBaseServing):
             final_res.num_cached_tokens,
             final_res.num_cache_creation_tokens,
             mm_token_counts,
+        )
+        usage.completion_tokens_details = _make_completion_tokens_details(
+            parser, [output.token_ids for output in final_res.outputs]
         )
 
         request_metadata.final_usage_info = usage
