@@ -56,6 +56,18 @@ treat it as the fix — check the Cloudflare account/billing status first. Note 
 drops in-flight cpa.willen.dev requests (pi retries 530s, but 10 consecutive
 failures end a pi session), so restart it only between benchmark runs.
 
+## Key Policy plugin: persist its key store
+
+`cpa-plugin-key-policy` keeps its keys/aliases/usage in a JSON state file
+that defaults to `/CLIProxyAPI/cpa-key-policy-state.json` INSIDE the container
+— recreating the container wipes every key made in its UI (happened
+2026-08-24 13:49). config.yaml now sets
+`plugins.configs.cpa-key-policy.state_file: /root/.cli-proxy-api/cpa-key-policy-state.json`
+(the mounted /etc/cliproxyapi/auth dir). The path is read at startup only;
+when changing it, first `docker cp cliproxyapi:/CLIProxyAPI/cpa-key-policy-state.json
+/etc/cliproxyapi/auth/` then `docker restart cliproxyapi`. Verify with
+`GET /v0/management/plugins/cpa-key-policy/status` (`state_file` field).
+
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
 create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at
