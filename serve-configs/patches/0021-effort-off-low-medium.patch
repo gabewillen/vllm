@@ -1,0 +1,594 @@
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index 9f9a09ca50..52b59b9cf5 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -20,16 +20,20 @@ VALID_REASONING_EFFORTS = frozenset(
+ """The `reasoning_effort` values the chat completion API accepts; kept in step
+ with `ChatCompletionRequest.reasoning_effort`."""
+ 
+-QWEN_LOW_EFFORT_SENTENCE = (
+-    "Reasoning effort is set to low. Keep your thinking brief and focused, "
+-    "moving directly to the conclusion without unnecessary elaboration."
+-)
+-
+-QWEN_XHIGH_EFFORT_SENTENCE = (
+-    "Reasoning effort is set to xhigh. Please think carefully through the task, "
+-    "validate key assumptions, consider plausible alternatives, and prioritize "
+-    "correctness, consistency, and clarity in the final answer."
++LOW_EFFORT_SENTENCE = "Reasoning effort is set to low."
++"""The resting level's whole tail. Measured 2026-08-23 on the 12-prompt grid
++(2 reps): 22/24 correct at 611 avg tokens vs 21/24 at 774 with no sentence;
++every upward word (high/xhigh/max) lost accuracy at 1.5-2x tokens with cap
++runaways, so there is no upward level."""
++
++OFF_VOTE_PROMPT = (
++    "Could you answer the request above correctly with no step-by-step "
++    "working? Reply with one word: yes or no."
+ )
++"""The hidden question that gates a think-off verdict. Sampled `off_votes`
++times at temperature 0.7; only a unanimous yes skips thinking. Measured
++2026-08-23: unanimity-of-3 had zero wrong-offs on the grid, a single vote
++wrongly said yes on arithmetic."""
+ 
+ 
+ @config
+@@ -117,6 +121,18 @@ class HiddenEffortConfig:
+     q_none: float = Field(default=0.15, ge=0.0, le=1.0)
+     """Neighbour difficulty below which a request skips thinking entirely
+     (only with `think_off_level`)."""
++    off_vote: bool = True
++    """Gate every think-off verdict on the model itself: before thinking is
++    skipped, the engine asks `OFF_VOTE_PROMPT` hidden from the client,
++    `off_votes` times. Only a unanimous yes renders think-off; any dissent
++    demotes the request to the resting low level. Free-text guidance was
++    removed after a fluent wrong note anchored an implementation on a wrong
++    contract - the model's voice is effort-only, one word."""
++    off_votes: int = Field(default=3, ge=1)
++    """Votes the off gate samples. Each is a short hidden generation over the
++    fully cached prompt at a different seed."""
++    off_vote_max_tokens: int = Field(default=8, ge=1)
++    """Cap on one vote's generation; an unclassifiable vote counts as no."""
+ 
+     def __post_init__(self) -> None:
+         if self.q_high < self.q_mid:
+@@ -128,7 +144,9 @@ class HiddenEffortConfig:
+         if self.default_level >= len(self.sentences()):
+             raise ValueError("hidden_effort.default_level is outside the levels")
+         if self.think_off_level and self.default_level == 0:
+-            raise ValueError("hidden_effort.default_level may not be the think-off level")
++            raise ValueError(
++                "hidden_effort.default_level may not be the think-off level"
++            )
+         if self.think_off_level and self.q_none > self.q_mid:
+             raise ValueError("hidden_effort.q_none must be <= q_mid")
+ 
+@@ -138,7 +156,7 @@ class HiddenEffortConfig:
+         if self.effort_sentences is not None:
+             base: list[str | None] = list(self.effort_sentences)
+         else:
+-            base = [QWEN_LOW_EFFORT_SENTENCE, "", QWEN_XHIGH_EFFORT_SENTENCE]
++            base = [LOW_EFFORT_SENTENCE, ""]
+         return ([None] if self.think_off_level else []) + base
+ 
+     @property
+diff --git a/vllm/entrypoints/launcher.py b/vllm/entrypoints/launcher.py
+index 80b2105163..9dbc875f63 100644
+--- a/vllm/entrypoints/launcher.py
++++ b/vllm/entrypoints/launcher.py
+@@ -82,7 +82,33 @@ async def serve_http(
+     if h11_max_header_count is None:
+         h11_max_header_count = H11_MAX_HEADER_COUNT_DEFAULT
+ 
+-    config = uvicorn.Config(app, **uvicorn_kwargs)
++    draining = {"on": False}
++
++    async def draining_guard(scope, receive, send):
++        # From the shutdown signal until the process exits, the engine client
++        # is being drained or is gone: a request reaching it now fails with a
++        # 500. Answer 503 + Retry-After so clients wait for the next process.
++        if scope["type"] == "http" and draining["on"]:
++            body = (
++                b'{"error": {"message": "server is draining for restart; retry '
++                b'shortly", "type": "server_error", "code": 503}}'
++            )
++            await send(
++                {
++                    "type": "http.response.start",
++                    "status": 503,
++                    "headers": [
++                        (b"content-type", b"application/json"),
++                        (b"content-length", str(len(body)).encode()),
++                        (b"retry-after", b"5"),
++                    ],
++                }
++            )
++            await send({"type": "http.response.body", "body": body})
++            return
++        await app(scope, receive, send)
++
++    config = uvicorn.Config(draining_guard, **uvicorn_kwargs)
+     # Set header limits
+     config.h11_max_incomplete_event_size = h11_max_incomplete_event_size
+     config.h11_max_header_count = h11_max_header_count
+@@ -107,11 +133,11 @@ async def serve_http(
+     )
+ 
+     shutdown_event = asyncio.Event()
+-
+     def signal_handler() -> None:
+         if shutdown_event.is_set():
+             return
+         logger.info_once("[shutdown] API server: shutdown triggered")
++        draining["on"] = True
+         shutdown_event.set()
+ 
+     async def dummy_shutdown() -> None:
+diff --git a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+index 7473c03be3..7e16086b9a 100644
+--- a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
++++ b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+@@ -21,7 +21,10 @@ is set: on this path the model ends its own think block.
+ import copy
+ from typing import TYPE_CHECKING, Any
+ 
+-from vllm.config.reasoning import DynamicEffortConfig
++from vllm.config.reasoning import (
++    OFF_VOTE_PROMPT,
++    DynamicEffortConfig,
++)
+ 
+ if TYPE_CHECKING:
+     from vllm.entrypoints.openai.chat_completion.protocol import (
+@@ -105,7 +108,18 @@ def apply_dynamic_effort(
+             "chat_template_kwargs.enable_thinking=false"
+         )
+     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
+-    default_level = overrides.get("forced_level", cfg.hidden_effort.default_level)
++    forced = overrides.get("forced_level")
++    hidden = cfg.hidden_effort
++    if (
++        forced is not None
++        and cfg.level_sentences[forced] is None
++        and hidden.off_vote
++    ):
++        # A forced think-off still passes through the off-vote gate: run the
++        # normal two-phase path and force the verdict in the engine.
++        overrides["force_off"] = True
++        del overrides["forced_level"]
++    default_level = overrides.get("forced_level", hidden.default_level)
+     variants = render_effort_variants(request.messages, cfg.level_sentences)
+     request.messages = variants[default_level]
+     request._dynamic_effort_variant_messages = variants
+@@ -113,6 +127,9 @@ def apply_dynamic_effort(
+     overrides["think_off_levels"] = [
+         i for i, sentence in enumerate(cfg.level_sentences) if sentence is None
+     ]
++    if overrides["think_off_levels"] and hidden.off_vote:
++        overrides["off_votes"] = hidden.off_votes
++        overrides["off_vote_max_tokens"] = hidden.off_vote_max_tokens
+     if default_level in overrides["think_off_levels"]:
+         request.chat_template_kwargs = {**kwargs, "enable_thinking": False}
+     request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
+@@ -134,6 +151,14 @@ def render_effort_variants(
+     return variants
+ 
+ 
++def off_vote_variant(messages: list[Any]) -> list[Any]:
++    """The extra rendering the off gate needs: the hidden yes/no question,
++    rendered thinking-off."""
++    meta = copy.deepcopy(messages)
++    append_to_last_message(meta, OFF_VOTE_PROMPT)
++    return meta
++
++
+ def split_body_and_tails(
+     variant_token_ids: list[list[int]],
+ ) -> tuple[int, list[list[int]]] | None:
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 2b53b26c11..fbc4c11baa 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -29,6 +29,7 @@ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+     DynamicEffortError,
+     apply_default_effort,
+     apply_dynamic_effort,
++    off_vote_variant,
+     split_body_and_tails,
+ )
+ from vllm.entrypoints.openai.chat_completion.protocol import (
+@@ -246,6 +247,10 @@ class OpenAIServingChat(GenerateBaseServing):
+         if variants is None or request._dynamic_effort is None:
+             return None
+         think_off_levels = set(request._dynamic_effort.get("think_off_levels", ()))
++        off_votes = request._dynamic_effort.get("off_votes")
++        if think_off_levels and off_votes:
++            base = min(i for i in range(len(variants)) if i not in think_off_levels)
++            variants = list(variants) + [off_vote_variant(variants[base][:-1])]
+         if len(engine_inputs) != 1:
+             return None
+         default_level = request._dynamic_effort["default_level"]
+@@ -257,7 +262,8 @@ class OpenAIServingChat(GenerateBaseServing):
+                 continue
+             variant_request = copy(request)
+             variant_request.messages = messages
+-            if level in think_off_levels:
++            is_meta = bool(off_votes) and level == len(variants) - 1
++            if level in think_off_levels or is_meta:
+                 variant_request.chat_template_kwargs = {
+                     **(request.chat_template_kwargs or {}),
+                     "enable_thinking": False,
+@@ -277,6 +283,43 @@ class OpenAIServingChat(GenerateBaseServing):
+         if split is None:
+             return None
+         body_len, tails = split
++        if think_off_levels and off_votes:
++            # tails[-1] is the hidden yes/no question; the engine samples it
++            # `off_votes` times before it lets a think-off verdict stand.
++            request._dynamic_effort["meta_tail"] = tails.pop()
++            tokenizer = self.renderer.tokenizer
++            stop_ids: set[int] = set()
++            yes_ids: set[int] = set()
++            no_ids: set[int] = set()
++            if tokenizer is not None:
++                for text in ("\n", "\n\n"):
++                    ids = tokenizer.encode(text, add_special_tokens=False)
++                    if len(ids) == 1:
++                        stop_ids.add(int(ids[0]))
++                eos = getattr(tokenizer, "eos_token_id", None)
++                if eos is not None:
++                    stop_ids.add(int(eos))
++                for text, bucket in (
++                    ("yes", yes_ids), ("Yes", yes_ids), ("YES", yes_ids),
++                    (" yes", yes_ids), (" Yes", yes_ids),
++                    ("no", no_ids), ("No", no_ids), ("NO", no_ids),
++                    (" no", no_ids), (" No", no_ids),
++                ):
++                    ids = tokenizer.encode(text, add_special_tokens=False)
++                    if len(ids) == 1:
++                        bucket.add(int(ids[0]))
++            request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
++            request._dynamic_effort["yes_ids"] = sorted(yes_ids)
++            request._dynamic_effort["no_ids"] = sorted(no_ids)
++        if think_off_levels:
++            # Thinking off is the default rendering plus a closed think block:
++            # appended in place, no resubmission (measured identical to the
++            # template's own `<think>\n\n</think>\n\n` rendering).
++            tokenizer = self.renderer.tokenizer
++            if tokenizer is not None:
++                request._dynamic_effort["off_append"] = list(
++                    tokenizer.encode("</think>\n\n", add_special_tokens=False)
++                )
+         request._dynamic_effort["body_len"] = body_len
+         request._dynamic_effort["tails"] = tails
+         return None
+diff --git a/vllm/v1/core/sched/effort_controller.py b/vllm/v1/core/sched/effort_controller.py
+index 1fe20bca76..9d93201863 100644
+--- a/vllm/v1/core/sched/effort_controller.py
++++ b/vllm/v1/core/sched/effort_controller.py
+@@ -65,6 +65,10 @@ class EffortState:
+     decided_difficulty: float | None = None
+     """Calibrated estimate the level was chosen from; a think-off request is
+     remembered with it."""
++    off_votes: int = 0
++    """Yes votes collected by the off gate before its verdict."""
++    off_vetoed: bool = False
++    """True when the off gate demoted a think-off verdict to low."""
+     spread: float | None = None
+     neighbours: int = 0
+     memory_entries: int = 0
+@@ -90,7 +94,10 @@ class EffortState:
+             "memory_entries": self.memory_entries,
+             "neighbours": self.neighbours,
+             "estimate": self.estimate,
++            "calibrated": self.decided_difficulty,
+             "novelty_rank": self.novelty_rank,
++            "off_votes": self.off_votes,
++            "off_vetoed": int(self.off_vetoed),
+         }
+ 
+ 
+diff --git a/vllm/v1/core/sched/effort_memory.py b/vllm/v1/core/sched/effort_memory.py
+index 366367a747..8ddab4566e 100644
+--- a/vllm/v1/core/sched/effort_memory.py
++++ b/vllm/v1/core/sched/effort_memory.py
+@@ -651,10 +651,13 @@ def decide_effort_level(
+     if query is None or estimate is None:
+         return LevelDecision(default, "no-estimate", estimate, nov_rank, spread_rank)
+     low = cfg.low_level
+-    if estimate >= cfg.q_high:
+-        level, reason = min(low + 2, top_level), "q>=q_high"
+-    elif estimate >= cfg.q_mid:
+-        level, reason = min(low + 1, top_level), "q>=q_mid"
++    above = max(top_level - low, 0)
++    if above >= 2 and estimate >= cfg.q_high:
++        level, reason = low + 2, "q>=q_high"
++    elif above >= 2 and estimate >= cfg.q_mid:
++        level, reason = low + 1, "q>=q_mid"
++    elif above == 1 and estimate >= cfg.q_high:
++        level, reason = low + 1, "q>=q_high"
+     elif cfg.think_off_level and estimate < cfg.q_none:
+         level, reason = 0, "q<q_none"
+     else:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index f8e8b3d353..86fbe37c53 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2176,6 +2176,20 @@ class Scheduler(SchedulerInterface):
+                 request.status = RequestStatus.FINISHED_STOPPED
+                 stopped = True
+ 
++            if request.effort_meta_phase and not output_is_stale:
++                # Hidden guidance generation: keep the tokens, show none.
++                update = self._step_effort_meta(request, new_token_ids, stopped)
++                if update is not None:
++                    effort_requeued.add(request)
++                    outputs[request.client_index].append(
++                        EngineCoreOutput(
++                            request_id=req_id,
++                            new_token_ids=[],
++                            routed_prompt_update=update,
++                        )
++                    )
++                continue
++
+             effort_state = self._effort.get(req_id) if self._effort else None
+             if effort_state is not None and new_token_ids:
+                 assert self._effort_cfg is not None
+@@ -2847,6 +2861,31 @@ class Scheduler(SchedulerInterface):
+                     request.effort_tail_variants = [list(t) for t in tails]
+                     request.effort_hold_prefill = True
+                     request.effort_decision_pending = True
++                    request.effort_default_level = state.level
++                    off_append = overrides.get("off_append")
++                    if isinstance(off_append, list) and off_append:
++                        request.effort_off_append = [int(t) for t in off_append]
++                    meta_tail = overrides.get("meta_tail")
++                    if isinstance(meta_tail, list):
++                        request.effort_meta_tail = list(meta_tail)
++                        request.effort_meta_stop_ids = {
++                            int(i) for i in overrides.get("meta_stop_ids") or []
++                        }
++                        request.effort_yes_ids = {
++                            int(i) for i in overrides.get("yes_ids") or []
++                        }
++                        request.effort_no_ids = {
++                            int(i) for i in overrides.get("no_ids") or []
++                        }
++                        request.effort_off_votes = int(
++                            overrides.get("off_votes") or 0
++                        )
++                        request.effort_meta_max_tokens = int(
++                            overrides.get("off_vote_max_tokens") or 8
++                        )
++                        request.effort_force_off = bool(
++                            overrides.get("force_off")
++                        )
+                 else:
+                     boundary = self._effort_body_boundary(request, body_len)
+                     if boundary and self._effort_split_worth_it(request, boundary):
+@@ -2943,7 +2982,15 @@ class Scheduler(SchedulerInterface):
+                 "present" if vector is not None else "MISSING",
+                 memory.n_entries if memory is not None else -1,
+             )
+-        if memory is not None and vector is not None:
++        if request.effort_force_off:
++            level, reason = 0, "forced-off"
++            if memory is not None and vector is not None:
++                self._effort_vectors[request.request_id] = np.asarray(
++                    vector, dtype=np.float32
++                )
++            if state is not None:
++                state.decided = True
++        elif memory is not None and vector is not None:
+             self._effort_vectors[request.request_id] = np.asarray(
+                 vector, dtype=np.float32
+             )
+@@ -2997,12 +3044,61 @@ class Scheduler(SchedulerInterface):
+         if level == default_level or not tails:
+             return None
+         if request.effort_seam:
++            if (
++                level == 0
++                and self._effort_cfg is not None
++                and self._effort_cfg.hidden_effort.think_off_level
++                and request.effort_off_append
++            ):
++                if (
++                    request.effort_meta_tail is not None
++                    and request.effort_off_votes > 0
++                ):
++                    # Off gate: the model votes yes/no on skipping thinking,
++                    # hidden from the client, before the verdict stands.
++                    return self._start_effort_off_vote(request)
++                # Thinking off = the default prompt plus a closed think block:
++                # extend the prefilled request in place, no blocks freed.
++                return self._extend_effort_prompt(request, request.effort_off_append)
+             return self._resubmit_effort_tail(request, tails[level])
+         return self._apply_effort_tail(
+             request=request,
+             tail=tails[level],
+         )
+ 
++    def _extend_effort_prompt(
++        self, request: Request, extra: list[int]
++    ) -> RoutedPromptUpdate:
++        """Append `extra` to a fully prefilled prompt and keep going.
++
++        The request's KV and recurrent state are current at the prompt's end,
++        so the new tokens are one more prefill chunk; the token sampled after
++        the default prompt is dropped. Nothing is freed or recomputed."""
++        prompt = request.prompt_token_ids
++        assert prompt is not None
++        body_len = len(prompt)
++        prompt.extend(extra)
++        del request._all_token_ids[body_len:]
++        request._all_token_ids.extend(extra)
++        request._output_token_ids.clear()
++        request.num_prompt_tokens = len(prompt)
++        del request.block_hashes[body_len // self.hash_block_size :]
++        request.update_block_hashes()
++        request.max_tokens = min(
++            request.max_tokens, max(self.max_model_len - request.num_prompt_tokens, 1)
++        )
++        request.num_output_placeholders = 0
++        if request.spec_token_ids:
++            request.spec_token_ids = []
++        request.drop_stale_output = True
++        request.num_stale_output_tokens = request.num_in_flight_tokens
++        request.status = RequestStatus.WAITING
++        request.effort_prompt_revision += 1
++        return RoutedPromptUpdate(
++            revision=request.effort_prompt_revision,
++            prompt_token_ids=list(prompt),
++        )
++
+     def _resubmit_effort_tail(
+         self, request: Request, tail: list[int]
+     ) -> RoutedPromptUpdate:
+@@ -3037,9 +3133,13 @@ class Scheduler(SchedulerInterface):
+         request.draft_stale = False
+         if request.spec_token_ids:
+             request.spec_token_ids = []
++        # Any step still in flight computed the rendering just replaced.
++        request.drop_stale_output = True
++        request.num_stale_output_tokens = request.num_in_flight_tokens
+         request.status = RequestStatus.WAITING
++        request.effort_prompt_revision += 1
+         return RoutedPromptUpdate(
+-            revision=1,
++            revision=request.effort_prompt_revision,
+             prompt_token_ids=list(prompt),
+         )
+ 
+@@ -3071,6 +3171,104 @@ class Scheduler(SchedulerInterface):
+             prompt_token_ids=list(prompt),
+         )
+ 
++    def _start_effort_off_vote(self, request: Request) -> RoutedPromptUpdate:
++        """Resubmit the hidden yes/no question for the first off-gate vote.
++
++        The question's prompt shares every block with the default prompt up to
++        the seam, so the resubmission decodes over a warm cache. Votes are
++        sampled at temperature 0.7 with the vote index as seed - independent
++        enough for a quorum even when the client asked for greedy - and the
++        client's sampling is restored before the real request resumes.
++        """
++        params = request.sampling_params
++        assert params is not None
++        request.effort_saved_sampling = (params.temperature, params.seed)
++        params.temperature = 0.7
++        params.seed = 1
++        request.effort_meta_phase = True
++        request.effort_meta_tokens = []
++        request.effort_meta_votes = []
++        assert request.effort_meta_tail is not None
++        return self._resubmit_effort_tail(request, request.effort_meta_tail)
++
++    def _finish_effort_off_vote(
++        self, request: Request, off: bool
++    ) -> RoutedPromptUpdate:
++        """Restore the client's sampling and render the gate's verdict."""
++        params = request.sampling_params
++        if params is not None and request.effort_saved_sampling is not None:
++            params.temperature, params.seed = request.effort_saved_sampling
++            request.effort_saved_sampling = None
++        request.effort_meta_phase = False
++        tails = request.effort_tail_variants or []
++        state = self._effort.get(request.request_id)
++        if off:
++            level = 0
++            default = request.effort_default_level
++            tail = list(tails[default] if default < len(tails) else [])
++            tail += list(request.effort_off_append or [])
++        else:
++            assert self._effort_cfg is not None
++            level = self._effort_cfg.hidden_effort.low_level
++            tail = list(tails[level]) if level < len(tails) else []
++        if state is not None:
++            state.level = level
++            state.off_votes = sum(request.effort_meta_votes)
++            state.off_vetoed = not off
++        if self._effort_trace_budget > 0:
++            logger.info(
++                "dynamic_effort %s: off gate %s (%d/%d yes)",
++                request.request_id,
++                "confirmed" if off else "vetoed",
++                sum(request.effort_meta_votes),
++                request.effort_off_votes,
++            )
++        return self._resubmit_effort_tail(request, tail)
++
++    def _step_effort_meta(
++        self, request: Request, new_token_ids: list[int], stopped: bool
++    ) -> RoutedPromptUpdate | None:
++        """Advance the off gate by one step.
++
++        A vote ends at its first yes/no token, at a stop id, at
++        `off_vote_max_tokens`, or if the request itself stopped; anything but
++        a clean yes counts as no. Any no ends the gate at the resting low
++        level; `off_votes` unanimous yeses confirm think-off.
++        """
++        tokens = request.effort_meta_tokens
++        vote: bool | None = None
++        done = stopped
++        for tok in new_token_ids:
++            tok = int(tok)
++            if tok in request.effort_yes_ids:
++                vote, done = True, True
++                break
++            if tok in request.effort_no_ids or tok in request.effort_meta_stop_ids:
++                vote, done = False, True
++                break
++            tokens.append(tok)
++            if len(tokens) >= request.effort_meta_max_tokens:
++                vote, done = False, True
++                break
++        if not done:
++            return None
++        if vote is None:
++            vote = False
++        if stopped:
++            # check_stop marked the request finished; it is not.
++            request.status = RequestStatus.RUNNING
++        request.effort_meta_votes.append(vote)
++        tokens.clear()
++        if not vote:
++            return self._finish_effort_off_vote(request, off=False)
++        if len(request.effort_meta_votes) >= request.effort_off_votes:
++            return self._finish_effort_off_vote(request, off=True)
++        params = request.sampling_params
++        if params is not None:
++            params.seed = len(request.effort_meta_votes) + 1
++        assert request.effort_meta_tail is not None
++        return self._resubmit_effort_tail(request, request.effort_meta_tail)
++
+     def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
+         """Record a finished request in the memory (§13.4).
+ 
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 934398753b..c2e9e67702 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -205,6 +205,22 @@ class Request:
+         # and the seam is where a non-default tail is spliced on resubmission.
+         self.effort_seam = 0
+         self.effort_tail_variants: list[list[int]] | None = None
++        # Off-vote gate: the hidden yes/no generations behind a think-off
++        # verdict.
++        self.effort_default_level = 0
++        self.effort_force_off = False
++        self.effort_off_append: list[int] | None = None
++        self.effort_meta_tail: list[int] | None = None
++        self.effort_meta_stop_ids: set[int] = set()
++        self.effort_yes_ids: set[int] = set()
++        self.effort_no_ids: set[int] = set()
++        self.effort_off_votes = 0
++        self.effort_meta_max_tokens = 0
++        self.effort_meta_phase = False
++        self.effort_meta_tokens: list[int] = []
++        self.effort_meta_votes: list[bool] = []
++        self.effort_saved_sampling: tuple[float, int | None] | None = None
++        self.effort_prompt_revision = 0
+         self.effort_decision_pending = False
+         # True only for the two-phase form: the prefill stops at
+         # `effort_body_len` and the request is held until the level is chosen.
