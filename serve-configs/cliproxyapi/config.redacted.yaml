@@ -28,6 +28,7 @@ openai-compatibility:
           levels: ["none", "low", "medium", "high", "xhigh"]
   - name: opencode
     base-url: https://opencode.ai/zen/go/v1
+    disable-cooling: true
     api-key-entries:
       - api-key: <redacted>
     models:

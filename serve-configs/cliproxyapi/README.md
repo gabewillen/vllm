@@ -98,6 +98,23 @@ Two silent translation gaps, both found while ablating effort on DeepSWE:
   now deterministic. Related: https://github.com/router-for-me/CLIProxyAPI/pull/5224
   (non-stream `reasoning_tokens`).
 
+## Provider cooldown: opencode single key (2026-08-25)
+
+`opencode` (openai-compatibility, one key) got two one-off upstream
+`server_error: Endpoint is unavailable` responses; each made CPA cool the key
+down for 60 s (`transientErrorCooldown`, `sdk/cliproxy/auth/conductor_refresh.go`),
+so every request on that model returned `503 auth_unavailable: no auth
+available` for a minute. With a single credential the cooldown is pure
+amplification, so the provider now carries `disable-cooling: true` — upstream
+5xx is returned to the client as-is and the next request retries immediately.
+
+**Editing config.yaml:** it is bind-mounted into the container as a single
+file. `sed -i` and most editors write a new inode, which the container never
+sees (no reload, and the running config silently diverges). Write in place:
+`sudo cat new.yaml | docker exec -i cliproxyapi sh -c 'cat > /CLIProxyAPI/config.yaml'`
+(and keep the host copy identical) — the watcher then logs
+`config successfully reloaded`.
+
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
 create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at
