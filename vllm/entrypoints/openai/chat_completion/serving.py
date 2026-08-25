@@ -28,6 +28,7 @@ from vllm.entrypoints.generate.base.serving import (
 from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     DynamicEffortError,
     EffortRender,
+    EffortVariant,
     EffortVariants,
     apply_default_effort,
     apply_dynamic_effort,
@@ -204,6 +205,7 @@ class OpenAIServingChat(GenerateBaseServing):
         # Please use the Responses API instead.
         self.supports_code_interpreter = False
         self.python_tool = None
+        self._effort_pieces: dict[tuple, str] = {}
 
     def _dynamic_effort_config(self) -> DynamicEffortConfig | None:
         vllm_config = getattr(self.engine_client, "vllm_config", None)
@@ -253,38 +255,55 @@ class OpenAIServingChat(GenerateBaseServing):
         self,
         default_input: EngineInput,
         renders: list[EffortRender],
-        default_suffix: str,
+        default: EffortRender,
     ) -> list[list[int] | None] | ErrorResponse | None:
         """Token ids of every level, each through the full renderer.
 
-        A render with no request shares the default level's template output;
-        its ids are the default ids minus `default_suffix`, plus its own
-        suffix. `None` when the default suffix cannot be peeled off exactly."""
+        A render's insert and suffix are tokenized on their own and spliced
+        around the generation prompt's ids; a render with no request starts
+        from the default level's ids. `None` when the pieces cannot be peeled
+        off the ids exactly."""
         tokenizer = self.renderer.tokenizer
         if tokenizer is None:
             return None
+
+        def encode(text: str) -> list[int]:
+            return list(tokenizer.encode(text, add_special_tokens=False))
+
+        def peel(ids: list[int], text: str) -> list[int] | None:
+            tail = encode(text)
+            if not text:
+                return ids
+            if not tail or ids[-len(tail) :] != tail:
+                return None
+            return ids[: -len(tail)]
+
+        def compose(template_ids: list[int], render: EffortRender) -> list[int] | None:
+            ids = template_ids
+            if render.insert:
+                ids = peel(ids, render.gen)
+                if ids is None:
+                    return None
+                ids = ids + encode(render.insert + render.gen)
+            return ids + encode(render.suffix)
+
         default_ids = self._extract_prompt_components(default_input).token_ids
         if default_ids is None:
             return None
-        default_ids = list(default_ids)
-        base_ids = default_ids
-        if default_suffix:
-            suffix_ids = tokenizer.encode(default_suffix, add_special_tokens=False)
-            if not suffix_ids or default_ids[-len(suffix_ids) :] != list(suffix_ids):
-                return None
-            base_ids = default_ids[: -len(suffix_ids)]
+        base_ids = peel(list(default_ids), default.suffix)
+        if base_ids is not None and default.insert:
+            base_ids = peel(base_ids, default.insert + default.gen)
+            if base_ids is not None:
+                base_ids += encode(default.gen)
         rendered: list[list[int] | None] = []
         for render in renders:
             if render.request is None:
-                if render.suffix == default_suffix:
-                    rendered.append(default_ids)
-                else:
-                    rendered.append(
-                        base_ids
-                        + list(
-                            tokenizer.encode(render.suffix, add_special_tokens=False)
-                        )
-                    )
+                if render is default:
+                    rendered.append(list(default_ids))
+                    continue
+                if base_ids is None:
+                    return None
+                rendered.append(compose(base_ids, render))
                 continue
             result = await self.render_chat_request(render.request)
             if isinstance(result, ErrorResponse):
@@ -293,13 +312,7 @@ class OpenAIServingChat(GenerateBaseServing):
             if len(variant_inputs) != 1:
                 return None
             ids = self._extract_prompt_components(variant_inputs[0]).token_ids
-            if ids is None:
-                rendered.append(None)
-                continue
-            rendered.append(
-                list(ids)
-                + list(tokenizer.encode(render.suffix, add_special_tokens=False))
-            )
+            rendered.append(None if ids is None else compose(list(ids), render))
         return rendered
 
     async def _tokenize_effort_variants(
@@ -307,15 +320,15 @@ class OpenAIServingChat(GenerateBaseServing):
         request: ChatCompletionRequest,
         default_input: EngineInput,
         renders: list[EffortRender],
-        default_suffix: str = "",
+        default: EffortRender,
     ) -> list[list[int]] | None:
         """Token ids of every level from one tokenization of the conversation.
 
         Each non-default level is run through the chat template only (no
         tokenization), or reuses the default level's template output when only
-        its suffix differs; its ids are the default level's ids up to the last
-        special token the rendered texts share, plus the tokenized remainder.
-        Texts that diverge earlier than the last message (e.g.
+        its insert or suffix differs; its ids are the default level's ids up
+        to the last special token the rendered texts share, plus the tokenized
+        remainder. Texts that diverge earlier than the last message (e.g.
         `preserve_thinking=false` with a think-off level) just get a longer
         tail. `None` when exactness cannot be proven - multimodal or truncated
         prompts, a non-HF tokenizer, no shared special token, or a default
@@ -338,18 +351,23 @@ class OpenAIServingChat(GenerateBaseServing):
             or "multi_modal_data" in default_input
         ):
             return None
-        if default_suffix and not default_text.endswith(default_suffix):
+        base_text = default.base_text(default_text)
+        if base_text is None:
             return None
-        base_text = default_text[: len(default_text) - len(default_suffix)]
         variant_texts: list[str] = []
         for render in renders:
-            if render.request is None:
-                variant_texts.append(base_text + render.suffix)
+            if render is default:
+                variant_texts.append(default_text)
                 continue
-            text = await self._render_effort_variant_text(render.request)
-            if text is None:
+            text = (
+                base_text
+                if render.request is None
+                else await self._render_effort_variant_text(render.request)
+            )
+            composed = None if text is None else render.compose(text)
+            if composed is None:
                 return None
-            variant_texts.append(text + render.suffix)
+            variant_texts.append(composed)
         return tokenize_variant_tails(
             lambda text: tokenizer.encode(text, add_special_tokens=False),
             default_text,
@@ -389,42 +407,182 @@ class OpenAIServingChat(GenerateBaseServing):
         text = prompt.get("prompt")
         return text if isinstance(text, str) else None
 
-    def _append_default_effort_suffix(
-        self, request: ChatCompletionRequest, engine_inputs: list[EngineInput]
+    def _effort_piece_key(self, request: ChatCompletionRequest) -> tuple:
+        kwargs = request.chat_template_kwargs or {}
+        return (
+            request.chat_template,
+            request.reasoning_effort,
+            tuple(sorted((k, repr(v)) for k, v in kwargs.items())),
+        )
+
+    async def _effort_generation_prompt(
+        self, request: ChatCompletionRequest, rendered_text: str
+    ) -> str | None:
+        """The chat template's generation prompt for `request`: what
+        `add_generation_prompt=True` adds after the last message. Cached per
+        template and kwargs; a cached value is trusted only when the text
+        actually ends with it, otherwise it is re-derived from two renders."""
+        key = ("gen", *self._effort_piece_key(request))
+        cached = self._effort_pieces.get(key)
+        if cached and rendered_text.endswith(cached):
+            return cached
+        if not request.add_generation_prompt or request.continue_final_message:
+            return None
+        without = copy(request)
+        without.add_generation_prompt = False
+        text = await self._render_effort_variant_text(without)
+        if text is None or not rendered_text.startswith(text):
+            return None
+        gen = rendered_text[len(text) :]
+        if not gen:
+            return None
+        self._effort_pieces[key] = gen
+        return gen
+
+    async def _effort_system_turn(
+        self, request: ChatCompletionRequest, sentence: str
+    ) -> str | None:
+        """The chat template's rendering of one system message carrying
+        `sentence`, as it would appear at the head of a conversation. A
+        template that will not render it as a clean single turn (a default
+        system prompt, tools, a rejected lone system message) yields `None`.
+        Assembled as text because the template rejects a system message that
+        is not first."""
+        key = ("system", sentence, *self._effort_piece_key(request))
+        cached = self._effort_pieces.get(key)
+        if cached is not None:
+            return cached or None
+        probe = "effort placement probe"
+        with_system = copy(request)
+        with_system.add_generation_prompt = False
+        with_system.tools = None
+        with_system.messages = [
+            {"role": "system", "content": sentence},
+            {"role": "user", "content": probe},
+        ]
+        without_system = copy(with_system)
+        without_system.messages = [{"role": "user", "content": probe}]
+        turn = None
+        try:
+            a = await self._render_effort_variant_text(with_system)
+            b = await self._render_effort_variant_text(without_system)
+        except Exception as exc:
+            logger.debug("dynamic_effort: no system turn for the template: %s", exc)
+            a = b = None
+        if a and b and a.endswith(b):
+            turn = a[: -len(b)]
+            if not turn or probe in turn or sentence not in turn:
+                turn = None
+        self._effort_pieces[key] = turn or ""
+        return turn
+
+    async def _apply_default_effort_layout(
+        self,
+        request: ChatCompletionRequest,
+        variants: EffortVariants,
+        engine_inputs: list[EngineInput],
     ) -> None:
-        """Append the default level's suffix to the prompt already rendered."""
-        variants = request._dynamic_effort_variants
-        if variants is None or len(engine_inputs) != 1:
+        """Apply the default level's system insert and suffix to the prompt
+        already rendered, text and ids. A default level whose system turn
+        cannot be derived is rendered as a trailing user message instead by
+        `_effort_renders`, so here only the template pieces are spliced."""
+        if len(engine_inputs) != 1:
             return
-        suffix = variants.levels[variants.default_level].suffix
+        variant = variants.levels[variants.default_level]
         engine_input = engine_inputs[0]
         tokenizer = self.renderer.tokenizer
-        if not suffix or tokenizer is None or not isinstance(engine_input, dict):
+        if (
+            (not variant.system and not variant.suffix)
+            or tokenizer is None
+            or not isinstance(engine_input, dict)
+        ):
             return
         text = engine_input.get("prompt")
         ids = engine_input.get("prompt_token_ids")
-        if isinstance(text, str):
-            engine_input["prompt"] = text + suffix  # type: ignore[typeddict-item]
-        if ids is not None:
-            engine_input["prompt_token_ids"] = list(ids) + list(  # type: ignore[typeddict-item]
-                tokenizer.encode(suffix, add_special_tokens=False)
-            )
+        if not isinstance(text, str):
+            return
+        render = await self._resolve_effort_render(request, variant, text)
+        if render.request is not None:
+            # Fallback: the level re-renders as a trailing user message.
+            result = await self.render_chat_request(render.request)
+            if isinstance(result, ErrorResponse) or len(result[1]) != 1:
+                return
+            engine_inputs[0] = result[1][0]
+            request.messages = render.request.messages
+            return
+        composed = render.compose(text)
+        if composed is None:
+            return
+        engine_input["prompt"] = composed  # type: ignore[typeddict-item]
+        if ids is None:
+            return
+        new_ids: list[int] | None = list(ids)
+        if render.insert:
+            gen_ids = tokenizer.encode(render.gen, add_special_tokens=False)
+            if new_ids[-len(gen_ids) :] == list(gen_ids):
+                new_ids = new_ids[: -len(gen_ids)] + list(
+                    tokenizer.encode(
+                        render.insert + render.gen, add_special_tokens=False
+                    )
+                )
+            else:
+                new_ids = None
+        if new_ids is None:
+            new_ids = list(tokenizer.encode(composed, add_special_tokens=False))
+        else:
+            new_ids += list(tokenizer.encode(render.suffix, add_special_tokens=False))
+        engine_input["prompt_token_ids"] = new_ids  # type: ignore[typeddict-item]
 
-    def _effort_renders(
-        self, request: ChatCompletionRequest, variants: EffortVariants
+    async def _resolve_effort_render(
+        self,
+        request: ChatCompletionRequest,
+        variant: EffortVariant,
+        rendered_text: str,
+        kwargs: dict[str, Any] | None = None,
+    ) -> EffortRender:
+        """The render of a variant that shares the default level's template
+        output. A system sentence becomes an insert before the generation
+        prompt; when either piece cannot be derived from the template the
+        level falls back to the trailing-user-message rendering."""
+        if kwargs is None:
+            kwargs = dict(request.chat_template_kwargs or {})
+        if variant.system:
+            gen = await self._effort_generation_prompt(request, rendered_text)
+            turn = (
+                None
+                if gen is None
+                else await self._effort_system_turn(request, variant.system)
+            )
+            if gen is None or turn is None:
+                fallback = copy(request)
+                fallback.messages = variant.messages + [
+                    {"role": "user", "content": variant.system}
+                ]
+                fallback.chat_template_kwargs = kwargs or None
+                return EffortRender(fallback, suffix=variant.suffix)
+            return EffortRender(None, insert=turn, gen=gen, suffix=variant.suffix)
+        return EffortRender(None, suffix=variant.suffix)
+
+    async def _effort_renders(
+        self,
+        request: ChatCompletionRequest,
+        variants: EffortVariants,
+        rendered_text: str,
     ) -> list[EffortRender]:
         """One render per level (plus the off-vote question last): the request
         to run through the chat template, or none when the level's template
-        output is the default level's and only the suffix differs."""
+        output is the default level's and only its insert or suffix differs."""
         default_level = variants.default_level
         default_variant = variants.levels[default_level]
         default_kwargs = dict(request.chat_template_kwargs or {})
         renders: list[EffortRender] = []
         for level, variant in enumerate(variants.levels):
-            if level == default_level:
-                renders.append(EffortRender(None, variant.suffix))
-                continue
             kwargs = dict(default_kwargs)
+            if level == default_level:
+                renders.append(
+                    await self._resolve_effort_render(request, variant, rendered_text)
+                )
+                continue
             if level in variants.think_off_levels:
                 kwargs["enable_thinking"] = False
             elif default_level in variants.think_off_levels:
@@ -433,12 +591,16 @@ class OpenAIServingChat(GenerateBaseServing):
                 variant.messages is default_variant.messages
                 and kwargs == default_kwargs
             ):
-                renders.append(EffortRender(None, variant.suffix))
+                renders.append(
+                    await self._resolve_effort_render(
+                        request, variant, rendered_text, kwargs
+                    )
+                )
                 continue
             variant_request = copy(request)
             variant_request.messages = variant.messages
             variant_request.chat_template_kwargs = kwargs or None
-            renders.append(EffortRender(variant_request, variant.suffix))
+            renders.append(EffortRender(variant_request, suffix=variant.suffix))
         if variants.meta_messages is not None:
             meta_request = copy(request)
             meta_request.messages = variants.meta_messages
@@ -446,7 +608,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 **default_kwargs,
                 "enable_thinking": False,
             }
-            renders.append(EffortRender(meta_request, ""))
+            renders.append(EffortRender(meta_request))
         return renders
 
     async def _attach_effort_tails(
@@ -471,14 +633,19 @@ class OpenAIServingChat(GenerateBaseServing):
             return None
         think_off_levels = variants.think_off_levels
         has_meta = variants.meta_messages is not None
-        default_suffix = variants.levels[variants.default_level].suffix
-        renders = self._effort_renders(request, variants)
+        default_text = self._extract_prompt_components(engine_inputs[0]).text
+        if not isinstance(default_text, str):
+            return None
+        renders = await self._effort_renders(request, variants, default_text)
+        default = renders[variants.default_level]
+        if default.request is not None:
+            return None
         rendered = await self._tokenize_effort_variants(
-            request, engine_inputs[0], renders, default_suffix
+            request, engine_inputs[0], renders, default
         )
         if rendered is None:
             rendered = await self._render_effort_variants_full(
-                engine_inputs[0], renders, default_suffix
+                engine_inputs[0], renders, default
             )
         if isinstance(rendered, ErrorResponse):
             return rendered
@@ -522,12 +689,13 @@ class OpenAIServingChat(GenerateBaseServing):
             request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
             request._dynamic_effort["yes_ids"] = sorted(yes_ids)
             request._dynamic_effort["no_ids"] = sorted(no_ids)
-        if think_off_levels and not default_suffix:
+        if think_off_levels and not default.suffix:
             # Thinking off is the default rendering plus a closed think block:
             # appended in place, no resubmission (measured identical to the
-            # template's own `<think>\n\n</think>\n\n` rendering). A default
-            # level with its sentence already inside the think block cannot be
-            # closed that way; the engine resubmits the think-off tail instead.
+            # template's own `<think>\n\n</think>\n\n` rendering). Only valid
+            # when the default prompt ends with the generation prompt: a
+            # `think` placement default has its sentence after it, so the
+            # engine resubmits the rendered think-off tail instead.
             tokenizer = self.renderer.tokenizer
             if tokenizer is not None:
                 request._dynamic_effort["off_append"] = list(
@@ -590,7 +758,9 @@ class OpenAIServingChat(GenerateBaseServing):
 
         conversation, engine_inputs = result
         if request._dynamic_effort_variants is not None:
-            self._append_default_effort_suffix(request, engine_inputs)
+            await self._apply_default_effort_layout(
+                request, request._dynamic_effort_variants, engine_inputs
+            )
             variant_error = await self._attach_effort_tails(request, engine_inputs)
             if variant_error is not None:
                 return variant_error

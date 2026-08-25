@@ -104,16 +104,21 @@ class HiddenEffortConfig:
     *whole* actuator: it is placed at the true tail of the prompt, after the
     generation prompt (see `sentence_placement`), so the body before it is
     byte-identical across levels and one body per conversation is cached."""
-    sentence_placement: Literal["think", "user"] = "think"
-    """Where a level's sentence is rendered. `"think"` appends it, plus a
-    newline, to the rendered prompt right after the chat template's generation
-    prompt, so it is the first line of the model's own think block
-    (`<|im_start|>assistant\n<think>\nReasoning effort is set to low.\n`) and
-    the conversation's messages are untouched. `"user"` is the older rendering,
-    kept for A/B: the sentence as a trailing user message after the last
-    message. Measured 2026-08-24 on an agent benchmark, `"user"` lands right
-    after a tool result and the model answers it as the user's turn, ending the
-    agent loop."""
+    sentence_placement: Literal["user", "system", "think"] = "user"
+    """Where a level's sentence is rendered. `"user"` (default, unchanged):
+    the sentence as a trailing user message after the last message; on the
+    12-prompt grid 21/24 correct at 465 avg tokens, but on an agent benchmark
+    it can land right after a tool result and the model may answer it as the
+    user's turn, ending the agent loop. `"system"` inserts the chat template's
+    own rendering of a system message carrying the sentence right before the
+    generation prompt (`<|im_start|>system\nReasoning effort is set to
+    low.<|im_end|>\n<|im_start|>assistant\n<think>\n` on Qwen3.8); the
+    messages are untouched and a system turn cannot be read as a user request;
+    measured 2026-08-25: 21/24 at 481, matching the user form. `"think"`
+    appends the sentence plus a newline after the generation prompt as the
+    first line of the model's own think block; forcing the first thought
+    measured worse (19/24 at 1285 avg tokens, one capped, one unclosed think
+    block). `system` and `think` are opt-in for A/B."""
     default_level: int = Field(default=0, ge=0)
     """Level a request gets when no decision can be made - a cold memory, a
     missing vector, a prompt with no usable seam. 0 is the `low` sentence,
