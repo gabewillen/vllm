@@ -84,8 +84,6 @@ openai-compatibility:
         alias: ""
       - name: hy3-preview
         alias: ""
-      - name: gpt-5.6-luna
-        alias: ""
       - name: grok-4.5
         alias: ""
       - name: muse-spark-1.2-contributor
