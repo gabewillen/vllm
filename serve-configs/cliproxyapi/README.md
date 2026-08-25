@@ -115,6 +115,21 @@ sees (no reload, and the running config silently diverges). Write in place:
 (and keep the host copy identical) — the watcher then logs
 `config successfully reloaded`.
 
+## Codex remote compaction v2 through compat providers (2026-08-25)
+
+Codex Desktop compacts by sending a normal streaming `/v1/responses` whose
+`input` ends with `{"type":"compaction_trigger"}` and expects exactly one
+`{"type":"compaction","encrypted_content":…}` output item (codex-rs
+`compact_remote_v2*.rs`). Upstream CPA translates compat providers to
+`/chat/completions` and drops the trigger, so Codex got message items and
+failed with `expected exactly one compaction output item, got 0 from N`.
+Fork branch `feat/compat-responses-compaction` (image `cli-proxy-api:compaction`)
+makes CPA do the compaction: strips tools, appends a summarization
+instruction, returns the text as one `compaction` item (`encrypted_content` =
+`cpa1:` + base64url JSON), and re-injects that item as a summary message on
+later turns. Verified against vLLM Qwen: summary produced, replay answered
+from it. Only the openai-compatibility path is affected.
+
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
 create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at
