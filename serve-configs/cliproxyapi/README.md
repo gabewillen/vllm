@@ -68,6 +68,36 @@ when changing it, first `docker cp cliproxyapi:/CLIProxyAPI/cpa-key-policy-state
 /etc/cliproxyapi/auth/` then `docker restart cliproxyapi`. Verify with
 `GET /v0/management/plugins/cpa-key-policy/status` (`state_file` field).
 
+## Effort levels and sampling params through CPA (2026-08-25)
+
+Two silent translation gaps, both found while ablating effort on DeepSWE:
+
+- **`reasoning.effort: none` became `low`.** CPA's thinking pipeline validates
+  the requested budget against the model registry; a user-defined
+  openai-compatibility model has no `thinking` spec, so budget 0 is "not
+  allowed" (`validate.go` warns "budget zero not allowed") and the effort is
+  clamped to the lowest level. Fix in config.yaml (needs a container restart,
+  hot reload does not re-register the model):
+
+      models:
+        - name: "Qwen3.8-27B"
+          alias: "Qwen3.8-27B"
+          thinking:
+            zero-allowed: true
+            levels: ["none", "low", "medium", "high", "xhigh"]
+
+  Verified: `none` now renders the 29-token bare prompt with 0 reasoning
+  tokens (vLLM sets `enable_thinking=false` for an explicit `none`).
+- **`temperature`/`top_p`/`top_k`… were dropped on `/v1/responses`.** The
+  responses→chat translator mapped only `max_output_tokens`, so every client
+  ran at the model's `generation_config.json` defaults (t1.0/p0.95/k20).
+  Fixed upstream in https://github.com/router-for-me/CLIProxyAPI/pull/5231;
+  until it ships, the container runs the fork build `cli-proxy-api:sampling-fix`
+  (`docker build -t cli-proxy-api:sampling-fix /shared/CLIProxyAPI` on branch
+  `fix/responses-sampling-params`). Verified: `temperature: 0` through CPA is
+  now deterministic. Related: https://github.com/router-for-me/CLIProxyAPI/pull/5224
+  (non-stream `reasoning_tokens`).
+
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
 create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at

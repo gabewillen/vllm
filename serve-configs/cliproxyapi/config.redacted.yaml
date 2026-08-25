@@ -1,0 +1,143 @@
+request-log: false
+port: 8317
+auth-dir: "/root/.cli-proxy-api"
+debug: false
+request-retry: 3
+api-keys:
+  - <redacted>
+  - <redacted>
+  - <redacted>
+  - <redacted>
+  - <redacted>
+  - <redacted>
+  - <redacted>
+remote-management:
+  allow-remote: true
+  secret-key: "<redacted>"
+  disable-control-panel: false
+openai-compatibility:
+  - name: "vllm-qwen38"
+    base-url: "http://host.docker.internal:8012/v1"
+    api-key-entries:
+      - api-key: "<redacted>"
+    models:
+      - name: "Qwen3.8-27B"
+        alias: "Qwen3.8-27B"
+        thinking:
+          zero-allowed: true
+          levels: ["none", "low", "medium", "high", "xhigh"]
+  - name: opencode
+    base-url: https://opencode.ai/zen/go/v1
+    api-key-entries:
+      - api-key: <redacted>
+    models:
+      - name: minimax-m3
+        alias: ""
+      - name: minimax-m2.7
+        alias: ""
+      - name: minimax-m2.5
+        alias: ""
+      - name: kimi-k3
+        alias: ""
+      - name: kimi-k2.7-code
+        alias: ""
+      - name: kimi-k2.6
+        alias: ""
+      - name: kimi-k2.5
+        alias: ""
+      - name: glm-5.2
+        alias: ""
+      - name: glm-5.3
+        alias: ""
+      - name: ox-alpha-free
+        alias: ""
+      - name: glm-5.1
+        alias: ""
+      - name: glm-5
+        alias: ""
+      - name: deepseek-v4-pro
+        alias: ""
+      - name: deepseek-v4-flash
+        alias: ""
+      - name: deepseek-v4-flash-vision-exp
+        alias: ""
+      - name: qwen3.7-max
+        alias: ""
+      - name: qwen3.8-max
+        alias: ""
+      - name: qwen3.7-plus
+        alias: ""
+      - name: qwen3.6-plus
+        alias: ""
+      - name: qwen3.5-plus
+        alias: ""
+      - name: mimo-v2-pro
+        alias: ""
+      - name: mimo-v2-omni
+        alias: ""
+      - name: mimo-v2.5-pro
+        alias: ""
+      - name: mimo-v2.5
+        alias: ""
+      - name: hy3
+        alias: ""
+      - name: hy3-preview
+        alias: ""
+      - name: gpt-5.6-luna
+        alias: ""
+      - name: grok-4.5
+        alias: ""
+      - name: muse-spark-1.2-contributor
+        alias: ""
+plugins:
+  enabled: true
+  configs:
+    cpa-key-policy:
+      enabled: true
+      state_file: /root/.cli-proxy-api/cpa-key-policy-state.json
+      store:
+        id: cpa-key-policy
+        name: CPA Key Policy
+        description: Manages plugin-owned downstream API keys with per-key model alias lists routed to CPA provider models,
+          per-key RPM, daily/weekly USD usage limits with cache-aware billing (cache spend + hit-rate reporting), and
+          management APIs. Includes an embedded multilingual (zh-CN/zh-TW/en/ru) Key Policy UI served as a CPA plugin
+          resource, following the panel's language. Acts as a non-exclusive frontend auth provider (native api-keys may
+          still be used).
+        author: origin652
+        version: 0.4.4
+        release-tag: v0.4.4
+        repository: https://github.com/origin652/cpa-plugin-key-policy
+        homepage: https://github.com/origin652/cpa-plugin-key-policy
+        license: MIT
+        tags:
+          - Management
+          - Auth
+        source-id: official
+        source-name: Official
+        source-url: https://raw.githubusercontent.com/router-for-me/CLIProxyAPI-Plugins-Store/main/registry.json
+        install:
+          type: github-release
+credential-concurrency:
+  cpa-heartbeat-timeout: 3s
+  cpa-cancel-bound: 5s
+  reclaim-grace: 5s
+  cleanup-interval: 5s
+  release-flush-interval: 250ms
+  release-max-backoff: 2s
+  busy-retry-min: 250ms
+  busy-retry-max: 1s
+  max-limit: 1000000
+credential-in-flight:
+  snapshot-interval: 2s
+  stale-after: 10s
+  max-part-bytes: 262144
+  max-part-count: 64
+  max-revision-bytes: 16777216
+  max-aggregate-groups: 100000
+  max-details: 10000
+  max-string-bytes: 256
+  staging-retention: 1m
+redis-usage-queue-retention-seconds: 60
+ws-auth: true
+usage-statistics-enabled: true
+nonstream-keepalive-interval: 15
