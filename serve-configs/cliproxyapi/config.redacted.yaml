@@ -84,8 +84,6 @@ openai-compatibility:
         alias: ""
       - name: hy3-preview
         alias: ""
-      - name: grok-4.5
-        alias: ""
       - name: muse-spark-1.2-contributor
         alias: ""
 plugins:
