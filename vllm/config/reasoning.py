@@ -53,6 +53,15 @@ class HiddenEffortConfig:
     enabled: bool = False
     """Split the prompt at the effort sentence and choose the level from the
     body's pooled hidden state."""
+    sentence_placement: Literal["user", "system", "auto"] = "user"
+    """Role of the trailing message that carries the level sentence. `user`
+    (measured 2026-08-19, 1.23x up / 0.78x down) reads as the user's turn right
+    after a tool result and can end an agent loop (cattrs 2026-08-25: forced
+    low 0/3, 29 turns). `system` renders a trailing system turn (needs a chat
+    template that accepts one; `serve-configs/qwen3_8_chat_template.jinja`):
+    forced low 1/3 at 108 turns, the same loop shape as a leading system
+    sentence. `auto` uses `user` when the conversation ends on a user message
+    and `system` otherwise (after a tool result or assistant prefix)."""
     shadow: bool = False
     """Compute and log the decision but always render `default_level` (§13.8
     step 1). The memory still fills, so a shadow day warms it for free."""
@@ -99,26 +108,11 @@ class HiddenEffortConfig:
     `default_level`, with a byte-identical prompt."""
     effort_sentences: list[str] | None = None
     """One prompt sentence per effort level, lowest first. `None` uses
-    `[low, ""]`: the model's own `low` wording, with the top level rendering
-    no sentence at all - the chat template's `medium`. The sentence is the
-    *whole* actuator: it is placed at the true tail of the prompt, after the
-    generation prompt (see `sentence_placement`), so the body before it is
-    byte-identical across levels and one body per conversation is cached."""
-    sentence_placement: Literal["user", "system", "think"] = "user"
-    """Where a level's sentence is rendered. `"user"` (default, unchanged):
-    the sentence as a trailing user message after the last message; on the
-    12-prompt grid 21/24 correct at 465 avg tokens, but on an agent benchmark
-    it can land right after a tool result and the model may answer it as the
-    user's turn, ending the agent loop. `"system"` inserts the chat template's
-    own rendering of a system message carrying the sentence right before the
-    generation prompt (`<|im_start|>system\nReasoning effort is set to
-    low.<|im_end|>\n<|im_start|>assistant\n<think>\n` on Qwen3.8); the
-    messages are untouched and a system turn cannot be read as a user request;
-    measured 2026-08-25: 21/24 at 481, matching the user form. `"think"`
-    appends the sentence plus a newline after the generation prompt as the
-    first line of the model's own think block; forcing the first thought
-    measured worse (19/24 at 1285 avg tokens, one capped, one unclosed think
-    block). `system` and `think` are opt-in for A/B."""
+    `[low, "", xhigh]`: the model's own `low` and `xhigh` wording, with the
+    middle level rendering no sentence at all - the chat template's `medium`.
+    The sentence is the *whole* actuator: it is placed at the true tail of the
+    prompt, after the last message, so the body before it is byte-identical
+    across levels and one body per conversation is cached."""
     default_level: int = Field(default=0, ge=0)
     """Level a request gets when no decision can be made - a cold memory, a
     missing vector, a prompt with no usable seam. 0 is the `low` sentence,
