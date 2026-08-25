@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field
 
@@ -99,11 +99,21 @@ class HiddenEffortConfig:
     `default_level`, with a byte-identical prompt."""
     effort_sentences: list[str] | None = None
     """One prompt sentence per effort level, lowest first. `None` uses
-    `[low, "", xhigh]`: the model's own `low` and `xhigh` wording, with the
-    middle level rendering no sentence at all - the chat template's `medium`.
-    The sentence is the *whole* actuator: it is placed at the true tail of the
-    prompt, after the last message, so the body before it is byte-identical
-    across levels and one body per conversation is cached."""
+    `[low, ""]`: the model's own `low` wording, with the top level rendering
+    no sentence at all - the chat template's `medium`. The sentence is the
+    *whole* actuator: it is placed at the true tail of the prompt, after the
+    generation prompt (see `sentence_placement`), so the body before it is
+    byte-identical across levels and one body per conversation is cached."""
+    sentence_placement: Literal["think", "user"] = "think"
+    """Where a level's sentence is rendered. `"think"` appends it, plus a
+    newline, to the rendered prompt right after the chat template's generation
+    prompt, so it is the first line of the model's own think block
+    (`<|im_start|>assistant\n<think>\nReasoning effort is set to low.\n`) and
+    the conversation's messages are untouched. `"user"` is the older rendering,
+    kept for A/B: the sentence as a trailing user message after the last
+    message. Measured 2026-08-24 on an agent benchmark, `"user"` lands right
+    after a tool result and the model answers it as the user's turn, ending the
+    agent loop."""
     default_level: int = Field(default=0, ge=0)
     """Level a request gets when no decision can be made - a cold memory, a
     missing vector, a prompt with no usable seam. 0 is the `low` sentence,

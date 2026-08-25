@@ -3072,7 +3072,6 @@ class Scheduler(SchedulerInterface):
                 level == 0
                 and self._effort_cfg is not None
                 and self._effort_cfg.hidden_effort.think_off_level
-                and request.effort_off_append
             ):
                 if (
                     request.effort_meta_tail is not None
@@ -3081,9 +3080,13 @@ class Scheduler(SchedulerInterface):
                     # Off gate: the model votes yes/no on skipping thinking,
                     # hidden from the client, before the verdict stands.
                     return self._start_effort_off_vote(request)
-                # Thinking off = the default prompt plus a closed think block:
-                # extend the prefilled request in place, no blocks freed.
-                return self._extend_effort_prompt(request, request.effort_off_append)
+                if request.effort_off_append:
+                    # Thinking off = the default prompt plus a closed think
+                    # block: extend the prefilled request in place, no blocks
+                    # freed.
+                    return self._extend_effort_prompt(
+                        request, request.effort_off_append
+                    )
             return self._resubmit_effort_tail(request, tails[level])
         return self._apply_effort_tail(
             request=request,
@@ -3246,8 +3249,12 @@ class Scheduler(SchedulerInterface):
         if off:
             level = 0
             default = request.effort_default_level
-            tail = list(tails[default] if default < len(tails) else [])
-            tail += list(request.effort_off_append or [])
+            if request.effort_off_append and default < len(tails):
+                tail = list(tails[default]) + list(request.effort_off_append)
+            else:
+                # The default tail cannot be closed in place (its sentence is
+                # inside the think block): use the rendered think-off tail.
+                tail = list(tails[0]) if tails else []
         else:
             assert self._effort_cfg is not None
             level = self._effort_cfg.hidden_effort.low_level

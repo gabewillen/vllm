@@ -21,6 +21,7 @@ from vllm.config.reasoning import (
 )
 from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     apply_dynamic_effort,
+    render_effort_variants,
 )
 from vllm.entrypoints.openai.chat_completion.effort_tails import (
     special_token_cut,
@@ -237,6 +238,7 @@ async def _effort_overrides(
     result = await serving.render_chat_request(request)
     assert not isinstance(result, ErrorResponse), result
     _, engine_inputs = result
+    serving._append_default_effort_suffix(request, engine_inputs)
     original = serving._tokenize_effort_variants
     fast_results: list = []
 
@@ -272,6 +274,18 @@ _CASES = {
     "preserve-thinking-false": dict(
         hidden=dict(think_off_level=True, default_level=2),
         kwargs={"preserve_thinking": False},
+    ),
+    "user-placement": dict(
+        hidden=dict(think_off_level=True, default_level=2, sentence_placement="user"),
+        kwargs=None,
+    ),
+    "default-with-suffix": dict(
+        hidden=dict(think_off_level=True, default_level=1), kwargs=None
+    ),
+    "forced-low-suffix": dict(
+        hidden=dict(think_off_level=True, default_level=2),
+        kwargs=None,
+        xargs={"dynamic_effort_level": 1},
     ),
 }
 
@@ -310,7 +324,7 @@ async def _check_tail_tokenization(spec: dict):
     assert fast.get("meta_stop_ids") == slow.get("meta_stop_ids")
     assert fast["body_len"] < len(default_ids)
     assert (
-        default_ids[: fast["body_len"]] + fast["tails"][cfg.hidden_effort.default_level]
+        default_ids[: fast["body_len"]] + fast["tails"][fast["default_level"]]
         == default_ids
     )
 
@@ -334,23 +348,102 @@ async def _check_tail_path_taken():
     result = await serving.render_chat_request(request)
     assert not isinstance(result, ErrorResponse)
     _, engine_inputs = result
-    variants = request._dynamic_effort_variant_messages
+    variants = request._dynamic_effort_variants
     assert variants is not None
-    requests = []
-    for level, msgs in enumerate(variants):
-        if level == cfg.hidden_effort.default_level:
-            requests.append(None)
-            continue
-        variant = request.model_copy()
-        variant.messages = msgs
-        if level == 0:
-            variant.chat_template_kwargs = {"enable_thinking": False}
-        requests.append(variant)
+    renders = serving._effort_renders(request, variants)
+    assert [r.request is None for r in renders] == [False, True, True, False]
     rendered = await serving._tokenize_effort_variants(
-        request, engine_inputs[0], requests
+        request, engine_inputs[0], renders, ""
     )
     assert rendered is not None
-    assert len(rendered) == len(variants)
+    assert len(rendered) == len(variants.levels) + 1
+
+
+def test_render_effort_variants_placement():
+    """`think` leaves the messages alone and carries the sentence as a suffix;
+    `user` appends it as a trailing user message with no suffix."""
+    messages = [{"role": "user", "content": "hi"}]
+    sentences = [None, "Reasoning effort is set to low.", ""]
+    think = render_effort_variants(messages, sentences, "think")
+    assert [v.messages is messages for v in think] == [True, True, True]
+    assert [v.suffix for v in think] == ["", "Reasoning effort is set to low.\n", ""]
+    assert messages == [{"role": "user", "content": "hi"}]
+    user = render_effort_variants(messages, sentences, "user")
+    assert [v.suffix for v in user] == ["", "", ""]
+    assert user[0].messages == messages
+    assert user[1].messages == messages + [
+        {"role": "user", "content": "Reasoning effort is set to low."}
+    ]
+    assert user[2].messages == messages
+
+
+@pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
+def test_think_placement_tail_is_generation_prompt_plus_sentence():
+    """With `think` placement the level-1 tail is the generation prompt plus
+    the sentence as the first think line, the body is shared and the request's
+    messages are the client's."""
+    asyncio.run(_check_think_placement())
+
+
+async def _check_think_placement():
+    cfg = _effort_config(think_off_level=True, default_level=2)
+    serving = _build_qwen3_serving_chat(cfg)
+    tokenizer = serving.renderer.tokenizer
+    messages = agent_conversation(turns=2, words_per_tool_result=20)
+    request = ChatCompletionRequest(
+        model=BASE_MODEL_PATHS[0].name,
+        messages=messages,
+        tools=TOOLS,
+        reasoning_effort="dynamic",
+    )
+    apply_dynamic_effort(request, cfg)
+    assert request.messages == messages
+    levels = request._dynamic_effort_variants.levels
+    assert all(v.messages is levels[0].messages for v in levels)
+    assert levels[1].messages == messages
+    overrides, default_ids = await _effort_overrides(
+        serving, cfg, messages, full_render=False
+    )
+    body_len, tails = overrides["body_len"], overrides["tails"]
+    assert default_ids[:body_len] + tails[2] == default_ids
+    low_tail = tokenizer.decode(tails[1])
+    assert low_tail.endswith(
+        "<|im_start|>assistant\n<think>\nReasoning effort is set to low.\n"
+    )
+    assert tokenizer.decode(tails[2]).endswith("<|im_start|>assistant\n<think>\n")
+    assert tails[1][: len(tails[2])] == tails[2]
+    assert tails[1][len(tails[2]) :] == tokenizer.encode(
+        "Reasoning effort is set to low.\n", add_special_tokens=False
+    )
+    assert tokenizer.decode(tails[0]).endswith("<think>\n\n</think>\n\n")
+    assert tokenizer.decode(overrides["meta_tail"]).startswith("<|im_start|>user\n")
+    # The full renderer agrees, suffix included.
+    slow, _ = await _effort_overrides(serving, cfg, messages, full_render=True)
+    assert slow["tails"] == tails and slow["body_len"] == body_len
+
+
+@pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
+def test_user_placement_reproduces_trailing_user_message():
+    asyncio.run(_check_user_placement())
+
+
+async def _check_user_placement():
+    cfg = _effort_config(
+        think_off_level=True, default_level=2, sentence_placement="user"
+    )
+    serving = _build_qwen3_serving_chat(cfg)
+    tokenizer = serving.renderer.tokenizer
+    messages = agent_conversation(turns=2, words_per_tool_result=20)
+    overrides, default_ids = await _effort_overrides(
+        serving, cfg, messages, full_render=False
+    )
+    tails = overrides["tails"]
+    assert default_ids[: overrides["body_len"]] + tails[2] == default_ids
+    assert tokenizer.decode(tails[1]).endswith(
+        "<|im_start|>user\nReasoning effort is set to low.<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n"
+    )
+    assert "Reasoning effort" not in tokenizer.decode(tails[2])
 
 
 def test_tokenize_variant_tails_rejects_unproven_boundary():

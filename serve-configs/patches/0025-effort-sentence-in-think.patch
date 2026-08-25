@@ -1,0 +1,699 @@
+diff --git a/tests/entrypoints/openai/chat_completion/test_effort_tails.py b/tests/entrypoints/openai/chat_completion/test_effort_tails.py
+index 8913261986..06439522f4 100644
+--- a/tests/entrypoints/openai/chat_completion/test_effort_tails.py
++++ b/tests/entrypoints/openai/chat_completion/test_effort_tails.py
+@@ -21,6 +21,7 @@ from vllm.config.reasoning import (
+ )
+ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+     apply_dynamic_effort,
++    render_effort_variants,
+ )
+ from vllm.entrypoints.openai.chat_completion.effort_tails import (
+     special_token_cut,
+@@ -237,6 +238,7 @@ async def _effort_overrides(
+     result = await serving.render_chat_request(request)
+     assert not isinstance(result, ErrorResponse), result
+     _, engine_inputs = result
++    serving._append_default_effort_suffix(request, engine_inputs)
+     original = serving._tokenize_effort_variants
+     fast_results: list = []
+ 
+@@ -273,6 +275,18 @@ _CASES = {
+         hidden=dict(think_off_level=True, default_level=2),
+         kwargs={"preserve_thinking": False},
+     ),
++    "user-placement": dict(
++        hidden=dict(think_off_level=True, default_level=2, sentence_placement="user"),
++        kwargs=None,
++    ),
++    "default-with-suffix": dict(
++        hidden=dict(think_off_level=True, default_level=1), kwargs=None
++    ),
++    "forced-low-suffix": dict(
++        hidden=dict(think_off_level=True, default_level=2),
++        kwargs=None,
++        xargs={"dynamic_effort_level": 1},
++    ),
+ }
+ 
+ 
+@@ -310,7 +324,7 @@ async def _check_tail_tokenization(spec: dict):
+     assert fast.get("meta_stop_ids") == slow.get("meta_stop_ids")
+     assert fast["body_len"] < len(default_ids)
+     assert (
+-        default_ids[: fast["body_len"]] + fast["tails"][cfg.hidden_effort.default_level]
++        default_ids[: fast["body_len"]] + fast["tails"][fast["default_level"]]
+         == default_ids
+     )
+ 
+@@ -334,23 +348,102 @@ async def _check_tail_path_taken():
+     result = await serving.render_chat_request(request)
+     assert not isinstance(result, ErrorResponse)
+     _, engine_inputs = result
+-    variants = request._dynamic_effort_variant_messages
++    variants = request._dynamic_effort_variants
+     assert variants is not None
+-    requests = []
+-    for level, msgs in enumerate(variants):
+-        if level == cfg.hidden_effort.default_level:
+-            requests.append(None)
+-            continue
+-        variant = request.model_copy()
+-        variant.messages = msgs
+-        if level == 0:
+-            variant.chat_template_kwargs = {"enable_thinking": False}
+-        requests.append(variant)
++    renders = serving._effort_renders(request, variants)
++    assert [r.request is None for r in renders] == [False, True, True, False]
+     rendered = await serving._tokenize_effort_variants(
+-        request, engine_inputs[0], requests
++        request, engine_inputs[0], renders, ""
+     )
+     assert rendered is not None
+-    assert len(rendered) == len(variants)
++    assert len(rendered) == len(variants.levels) + 1
++
++
++def test_render_effort_variants_placement():
++    """`think` leaves the messages alone and carries the sentence as a suffix;
++    `user` appends it as a trailing user message with no suffix."""
++    messages = [{"role": "user", "content": "hi"}]
++    sentences = [None, "Reasoning effort is set to low.", ""]
++    think = render_effort_variants(messages, sentences, "think")
++    assert [v.messages is messages for v in think] == [True, True, True]
++    assert [v.suffix for v in think] == ["", "Reasoning effort is set to low.\n", ""]
++    assert messages == [{"role": "user", "content": "hi"}]
++    user = render_effort_variants(messages, sentences, "user")
++    assert [v.suffix for v in user] == ["", "", ""]
++    assert user[0].messages == messages
++    assert user[1].messages == messages + [
++        {"role": "user", "content": "Reasoning effort is set to low."}
++    ]
++    assert user[2].messages == messages
++
++
++@pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
++def test_think_placement_tail_is_generation_prompt_plus_sentence():
++    """With `think` placement the level-1 tail is the generation prompt plus
++    the sentence as the first think line, the body is shared and the request's
++    messages are the client's."""
++    asyncio.run(_check_think_placement())
++
++
++async def _check_think_placement():
++    cfg = _effort_config(think_off_level=True, default_level=2)
++    serving = _build_qwen3_serving_chat(cfg)
++    tokenizer = serving.renderer.tokenizer
++    messages = agent_conversation(turns=2, words_per_tool_result=20)
++    request = ChatCompletionRequest(
++        model=BASE_MODEL_PATHS[0].name,
++        messages=messages,
++        tools=TOOLS,
++        reasoning_effort="dynamic",
++    )
++    apply_dynamic_effort(request, cfg)
++    assert request.messages == messages
++    levels = request._dynamic_effort_variants.levels
++    assert all(v.messages is levels[0].messages for v in levels)
++    assert levels[1].messages == messages
++    overrides, default_ids = await _effort_overrides(
++        serving, cfg, messages, full_render=False
++    )
++    body_len, tails = overrides["body_len"], overrides["tails"]
++    assert default_ids[:body_len] + tails[2] == default_ids
++    low_tail = tokenizer.decode(tails[1])
++    assert low_tail.endswith(
++        "<|im_start|>assistant\n<think>\nReasoning effort is set to low.\n"
++    )
++    assert tokenizer.decode(tails[2]).endswith("<|im_start|>assistant\n<think>\n")
++    assert tails[1][: len(tails[2])] == tails[2]
++    assert tails[1][len(tails[2]) :] == tokenizer.encode(
++        "Reasoning effort is set to low.\n", add_special_tokens=False
++    )
++    assert tokenizer.decode(tails[0]).endswith("<think>\n\n</think>\n\n")
++    assert tokenizer.decode(overrides["meta_tail"]).startswith("<|im_start|>user\n")
++    # The full renderer agrees, suffix included.
++    slow, _ = await _effort_overrides(serving, cfg, messages, full_render=True)
++    assert slow["tails"] == tails and slow["body_len"] == body_len
++
++
++@pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
++def test_user_placement_reproduces_trailing_user_message():
++    asyncio.run(_check_user_placement())
++
++
++async def _check_user_placement():
++    cfg = _effort_config(
++        think_off_level=True, default_level=2, sentence_placement="user"
++    )
++    serving = _build_qwen3_serving_chat(cfg)
++    tokenizer = serving.renderer.tokenizer
++    messages = agent_conversation(turns=2, words_per_tool_result=20)
++    overrides, default_ids = await _effort_overrides(
++        serving, cfg, messages, full_render=False
++    )
++    tails = overrides["tails"]
++    assert default_ids[: overrides["body_len"]] + tails[2] == default_ids
++    assert tokenizer.decode(tails[1]).endswith(
++        "<|im_start|>user\nReasoning effort is set to low.<|im_end|>\n"
++        "<|im_start|>assistant\n<think>\n"
++    )
++    assert "Reasoning effort" not in tokenizer.decode(tails[2])
+ 
+ 
+ def test_tokenize_variant_tails_rejects_unproven_boundary():
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index 97e73619c6..d3ac7dc2c1 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from dataclasses import field
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Literal
+ 
+ from pydantic import Field
+ 
+@@ -99,11 +99,21 @@ class HiddenEffortConfig:
+     `default_level`, with a byte-identical prompt."""
+     effort_sentences: list[str] | None = None
+     """One prompt sentence per effort level, lowest first. `None` uses
+-    `[low, "", xhigh]`: the model's own `low` and `xhigh` wording, with the
+-    middle level rendering no sentence at all - the chat template's `medium`.
+-    The sentence is the *whole* actuator: it is placed at the true tail of the
+-    prompt, after the last message, so the body before it is byte-identical
+-    across levels and one body per conversation is cached."""
++    `[low, ""]`: the model's own `low` wording, with the top level rendering
++    no sentence at all - the chat template's `medium`. The sentence is the
++    *whole* actuator: it is placed at the true tail of the prompt, after the
++    generation prompt (see `sentence_placement`), so the body before it is
++    byte-identical across levels and one body per conversation is cached."""
++    sentence_placement: Literal["think", "user"] = "think"
++    """Where a level's sentence is rendered. `"think"` appends it, plus a
++    newline, to the rendered prompt right after the chat template's generation
++    prompt, so it is the first line of the model's own think block
++    (`<|im_start|>assistant\n<think>\nReasoning effort is set to low.\n`) and
++    the conversation's messages are untouched. `"user"` is the older rendering,
++    kept for A/B: the sentence as a trailing user message after the last
++    message. Measured 2026-08-24 on an agent benchmark, `"user"` lands right
++    after a tool result and the model answers it as the user's turn, ending the
++    agent loop."""
+     default_level: int = Field(default=0, ge=0)
+     """Level a request gets when no decision can be made - a cold memory, a
+     missing vector, a prompt with no usable seam. 0 is the `low` sentence,
+diff --git a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+index cd988332f0..e93d1cc916 100644
+--- a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
++++ b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+@@ -5,13 +5,15 @@
+ `dynamic` never reaches the chat template. The request is rewritten in place:
+ the template sees `render_effort` (medium: no effort sentence, so block 0 of the
+ prompt is identical for every level), and each effort level is rendered as a
+-**trailing user message carrying only that level's sentence**, after the last
+-message of the conversation. That is the true tail of the prompt, which is where
+-the model actually honours it - measured on this box 2026-08-19: with the
+-sentence on the last *user* message of an agent turn (the placement patch 0009
+-shipped) the `xhigh` wording moves reasoning length 1.14x against no sentence,
+-because a tool result sits between it and the generation point; as a trailing
+-user message it moves it 1.23x up and 0.78x down.
++**tail after the shared body**: the level's sentence as the first line of the
++model's own think block (`sentence_placement="think"`), appended to the rendered
++prompt right after the template's generation prompt. The messages are not
++touched, so the body is byte-identical across levels and the model cannot
++mistake the sentence for a turn of the conversation - measured 2026-08-24 on an
++agent benchmark: the older trailing-user-message placement
++(`sentence_placement="user"`, kept for A/B) made the model answer the sentence
++("What would you like me to help with?") whenever it landed after a tool result
++and ended the agent loop.
+ 
+ The engine gets the shared body and one tail per level and picks the level from
+ the body's own pooled hidden state before the model thinks. No thinking budget
+@@ -19,7 +21,8 @@ is set: on this path the model ends its own think block.
+ """
+ 
+ import copy
+-from typing import TYPE_CHECKING, Any
++from dataclasses import dataclass, field
++from typing import TYPE_CHECKING, Any, Literal
+ 
+ from vllm.config.reasoning import (
+     OFF_VOTE_PROMPT,
+@@ -38,6 +41,36 @@ class DynamicEffortError(ValueError):
+     """Client error in a dynamic-effort request (rendered as HTTP 400)."""
+ 
+ 
++@dataclass
++class EffortVariant:
++    """One effort level's rendering: the messages the chat template sees and
++    the text appended after the template's output (`""` for none)."""
++
++    messages: list[Any]
++    suffix: str = ""
++
++
++@dataclass
++class EffortRender:
++    """A variant as the serving layer renders it: the request to run through
++    the chat template (`None`: the default level's template output) and the
++    text appended after it."""
++
++    request: Any
++    suffix: str = ""
++
++
++@dataclass
++class EffortVariants:
++    """Every level's variant plus, when the off gate is on, the messages of the
++    hidden off-vote question."""
++
++    levels: list[EffortVariant]
++    meta_messages: list[Any] | None = None
++    default_level: int = 0
++    think_off_levels: set[int] = field(default_factory=set)
++
++
+ def build_dynamic_effort_overrides(
+     cfg: DynamicEffortConfig, xargs: dict[str, Any] | None
+ ) -> dict[str, Any]:
+@@ -116,24 +149,31 @@ def apply_dynamic_effort(
+     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
+     forced = overrides.get("forced_level")
+     hidden = cfg.hidden_effort
+-    if (
+-        forced is not None
+-        and cfg.level_sentences[forced] is None
+-        and hidden.off_vote
+-    ):
++    if forced is not None and cfg.level_sentences[forced] is None and hidden.off_vote:
+         # A forced think-off still passes through the off-vote gate: run the
+         # normal two-phase path and force the verdict in the engine.
+         overrides["force_off"] = True
+         del overrides["forced_level"]
+     default_level = overrides.get("forced_level", hidden.default_level)
+-    variants = render_effort_variants(request.messages, cfg.level_sentences)
+-    request.messages = variants[default_level]
+-    request._dynamic_effort_variant_messages = variants
+-    overrides["default_level"] = default_level
+-    overrides["think_off_levels"] = [
++    levels = render_effort_variants(
++        request.messages, cfg.level_sentences, hidden.sentence_placement
++    )
++    think_off_levels = [
+         i for i, sentence in enumerate(cfg.level_sentences) if sentence is None
+     ]
+-    if overrides["think_off_levels"] and hidden.off_vote:
++    meta = None
++    if think_off_levels and hidden.off_vote:
++        meta = off_vote_variant(request.messages)
++    request._dynamic_effort_variants = EffortVariants(
++        levels=levels,
++        meta_messages=meta,
++        default_level=default_level,
++        think_off_levels=set(think_off_levels),
++    )
++    request.messages = levels[default_level].messages
++    overrides["default_level"] = default_level
++    overrides["think_off_levels"] = think_off_levels
++    if meta is not None:
+         overrides["off_votes"] = hidden.off_votes
+         overrides["off_vote_max_tokens"] = hidden.off_vote_max_tokens
+     if default_level in overrides["think_off_levels"]:
+@@ -143,17 +183,28 @@ def apply_dynamic_effort(
+ 
+ 
+ def render_effort_variants(
+-    messages: list[Any], sentences: list[str | None]
+-) -> list[list[Any]]:
+-    """One message list per level, each with that level's tail sentence.
+-
+-    A `None` sentence is the think-off level: the messages are untouched and
+-    the variant is rendered with `enable_thinking=false` instead."""
+-    variants: list[list[Any]] = []
++    messages: list[Any],
++    sentences: list[str | None],
++    placement: Literal["think", "user"] = "think",
++) -> list[EffortVariant]:
++    """One variant per level, each carrying that level's sentence.
++
++    With `placement="think"` the messages are shared untouched and the sentence
++    (plus a newline) is the suffix appended after the generation prompt, i.e.
++    the first line of the think block. With `placement="user"` the sentence is
++    a trailing user message and there is no suffix. A `None` sentence is the
++    think-off level: the messages are untouched and the variant is rendered
++    with `enable_thinking=false` instead."""
++    variants: list[EffortVariant] = []
+     for sentence in sentences:
+-        rendered = copy.deepcopy(messages)
+-        append_to_last_message(rendered, sentence or "")
+-        variants.append(rendered)
++        if placement == "user":
++            rendered = copy.deepcopy(messages)
++            append_to_last_message(rendered, sentence or "")
++            variants.append(EffortVariant(rendered))
++        else:
++            variants.append(
++                EffortVariant(messages, f"{sentence}\n" if sentence else "")
++            )
+     return variants
+ 
+ 
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 8cbef8ac01..cf31015265 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -612,9 +612,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
+     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
+     _dynamic_effort: dict[str, Any] | None = PrivateAttr(default=None)
+     """Validated dynamic-effort overrides; set only by `apply_dynamic_effort`."""
+-    _dynamic_effort_variant_messages: list[Any] | None = PrivateAttr(default=None)
+-    """One message list per level, each carrying that level's tail sentence; set
+-    by `apply_dynamic_effort` when `hidden_effort` is on. The serving layer
++    _dynamic_effort_variants: Any = PrivateAttr(default=None)
++    """`EffortVariants`: one (messages, suffix) rendering per level; set by
++    `apply_dynamic_effort` when `hidden_effort` is on. The serving layer
+     renders each of them to find the shared body (§13.3)."""
+     _effort_request: dict[str, Any] | None = PrivateAttr(default=None)
+     """`{"requested": <as sent, None if omitted>, "effective": <served>}` for
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index d6428c4a5a..3b4183b745 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -27,9 +27,10 @@ from vllm.entrypoints.generate.base.serving import (
+ )
+ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+     DynamicEffortError,
++    EffortRender,
++    EffortVariants,
+     apply_default_effort,
+     apply_dynamic_effort,
+-    off_vote_variant,
+     split_body_and_tails,
+ )
+ from vllm.entrypoints.openai.chat_completion.effort_tails import (
+@@ -251,23 +252,53 @@ class OpenAIServingChat(GenerateBaseServing):
+     async def _render_effort_variants_full(
+         self,
+         default_input: EngineInput,
+-        variant_requests: list[ChatCompletionRequest | None],
++        renders: list[EffortRender],
++        default_suffix: str,
+     ) -> list[list[int] | None] | ErrorResponse | None:
+-        """Token ids of every level, each through the full renderer."""
++        """Token ids of every level, each through the full renderer.
++
++        A render with no request shares the default level's template output;
++        its ids are the default ids minus `default_suffix`, plus its own
++        suffix. `None` when the default suffix cannot be peeled off exactly."""
++        tokenizer = self.renderer.tokenizer
++        if tokenizer is None:
++            return None
+         default_ids = self._extract_prompt_components(default_input).token_ids
++        if default_ids is None:
++            return None
++        default_ids = list(default_ids)
++        base_ids = default_ids
++        if default_suffix:
++            suffix_ids = tokenizer.encode(default_suffix, add_special_tokens=False)
++            if not suffix_ids or default_ids[-len(suffix_ids) :] != list(suffix_ids):
++                return None
++            base_ids = default_ids[: -len(suffix_ids)]
+         rendered: list[list[int] | None] = []
+-        for variant_request in variant_requests:
+-            if variant_request is None:
+-                rendered.append(default_ids)
++        for render in renders:
++            if render.request is None:
++                if render.suffix == default_suffix:
++                    rendered.append(default_ids)
++                else:
++                    rendered.append(
++                        base_ids
++                        + list(
++                            tokenizer.encode(render.suffix, add_special_tokens=False)
++                        )
++                    )
+                 continue
+-            result = await self.render_chat_request(variant_request)
++            result = await self.render_chat_request(render.request)
+             if isinstance(result, ErrorResponse):
+                 return result
+             _, variant_inputs = result
+             if len(variant_inputs) != 1:
+                 return None
++            ids = self._extract_prompt_components(variant_inputs[0]).token_ids
++            if ids is None:
++                rendered.append(None)
++                continue
+             rendered.append(
+-                self._extract_prompt_components(variant_inputs[0]).token_ids
++                list(ids)
++                + list(tokenizer.encode(render.suffix, add_special_tokens=False))
+             )
+         return rendered
+ 
+@@ -275,12 +306,14 @@ class OpenAIServingChat(GenerateBaseServing):
+         self,
+         request: ChatCompletionRequest,
+         default_input: EngineInput,
+-        variant_requests: list[ChatCompletionRequest | None],
++        renders: list[EffortRender],
++        default_suffix: str = "",
+     ) -> list[list[int]] | None:
+         """Token ids of every level from one tokenization of the conversation.
+ 
+         Each non-default level is run through the chat template only (no
+-        tokenization); its ids are the default level's ids up to the last
++        tokenization), or reuses the default level's template output when only
++        its suffix differs; its ids are the default level's ids up to the last
+         special token the rendered texts share, plus the tokenized remainder.
+         Texts that diverge earlier than the last message (e.g.
+         `preserve_thinking=false` with a think-off level) just get a longer
+@@ -305,15 +338,18 @@ class OpenAIServingChat(GenerateBaseServing):
+             or "multi_modal_data" in default_input
+         ):
+             return None
++        if default_suffix and not default_text.endswith(default_suffix):
++            return None
++        base_text = default_text[: len(default_text) - len(default_suffix)]
+         variant_texts: list[str] = []
+-        for variant_request in variant_requests:
+-            if variant_request is None:
+-                variant_texts.append(default_text)
++        for render in renders:
++            if render.request is None:
++                variant_texts.append(base_text + render.suffix)
+                 continue
+-            text = await self._render_effort_variant_text(variant_request)
++            text = await self._render_effort_variant_text(render.request)
+             if text is None:
+                 return None
+-            variant_texts.append(text)
++            variant_texts.append(text + render.suffix)
+         return tokenize_variant_tails(
+             lambda text: tokenizer.encode(text, add_special_tokens=False),
+             default_text,
+@@ -353,6 +389,66 @@ class OpenAIServingChat(GenerateBaseServing):
+         text = prompt.get("prompt")
+         return text if isinstance(text, str) else None
+ 
++    def _append_default_effort_suffix(
++        self, request: ChatCompletionRequest, engine_inputs: list[EngineInput]
++    ) -> None:
++        """Append the default level's suffix to the prompt already rendered."""
++        variants = request._dynamic_effort_variants
++        if variants is None or len(engine_inputs) != 1:
++            return
++        suffix = variants.levels[variants.default_level].suffix
++        engine_input = engine_inputs[0]
++        tokenizer = self.renderer.tokenizer
++        if not suffix or tokenizer is None or not isinstance(engine_input, dict):
++            return
++        text = engine_input.get("prompt")
++        ids = engine_input.get("prompt_token_ids")
++        if isinstance(text, str):
++            engine_input["prompt"] = text + suffix  # type: ignore[typeddict-item]
++        if ids is not None:
++            engine_input["prompt_token_ids"] = list(ids) + list(  # type: ignore[typeddict-item]
++                tokenizer.encode(suffix, add_special_tokens=False)
++            )
++
++    def _effort_renders(
++        self, request: ChatCompletionRequest, variants: EffortVariants
++    ) -> list[EffortRender]:
++        """One render per level (plus the off-vote question last): the request
++        to run through the chat template, or none when the level's template
++        output is the default level's and only the suffix differs."""
++        default_level = variants.default_level
++        default_variant = variants.levels[default_level]
++        default_kwargs = dict(request.chat_template_kwargs or {})
++        renders: list[EffortRender] = []
++        for level, variant in enumerate(variants.levels):
++            if level == default_level:
++                renders.append(EffortRender(None, variant.suffix))
++                continue
++            kwargs = dict(default_kwargs)
++            if level in variants.think_off_levels:
++                kwargs["enable_thinking"] = False
++            elif default_level in variants.think_off_levels:
++                kwargs["enable_thinking"] = True
++            if (
++                variant.messages is default_variant.messages
++                and kwargs == default_kwargs
++            ):
++                renders.append(EffortRender(None, variant.suffix))
++                continue
++            variant_request = copy(request)
++            variant_request.messages = variant.messages
++            variant_request.chat_template_kwargs = kwargs or None
++            renders.append(EffortRender(variant_request, variant.suffix))
++        if variants.meta_messages is not None:
++            meta_request = copy(request)
++            meta_request.messages = variants.meta_messages
++            meta_request.chat_template_kwargs = {
++                **default_kwargs,
++                "enable_thinking": False,
++            }
++            renders.append(EffortRender(meta_request, ""))
++        return renders
++
+     async def _attach_effort_tails(
+         self,
+         request: ChatCompletionRequest,
+@@ -360,44 +456,29 @@ class OpenAIServingChat(GenerateBaseServing):
+     ) -> ErrorResponse | None:
+         """Render the other levels and record the §13.3 body/tail seam.
+ 
+-        The prompt already submitted is the default-level variant. The rest
+-        cost one chat-template pass each and tokenize only their tail; the
+-        engine only ever prefills the body once, because the body is identical
+-        across levels. Anything unexpected (multiple prompts, an empty seam)
+-        silently leaves the request on today's single-level path.
++        The prompt already submitted is the default-level variant, its suffix
++        included. The rest cost at most one chat-template pass each and
++        tokenize only their tail; the engine only ever prefills the body once,
++        because the body is identical across levels. Anything unexpected
++        (multiple prompts, an empty seam) silently leaves the request on
++        today's single-level path.
+         """
+-        variants = request._dynamic_effort_variant_messages
+-        request._dynamic_effort_variant_messages = None
++        variants = request._dynamic_effort_variants
++        request._dynamic_effort_variants = None
+         if variants is None or request._dynamic_effort is None:
+             return None
+-        think_off_levels = set(request._dynamic_effort.get("think_off_levels", ()))
+-        off_votes = request._dynamic_effort.get("off_votes")
+-        if think_off_levels and off_votes:
+-            base = min(i for i in range(len(variants)) if i not in think_off_levels)
+-            variants = list(variants) + [off_vote_variant(variants[base][:-1])]
+         if len(engine_inputs) != 1:
+             return None
+-        default_level = request._dynamic_effort["default_level"]
+-        variant_requests: list[ChatCompletionRequest | None] = []
+-        for level, messages in enumerate(variants):
+-            if level == default_level:
+-                variant_requests.append(None)
+-                continue
+-            variant_request = copy(request)
+-            variant_request.messages = messages
+-            is_meta = bool(off_votes) and level == len(variants) - 1
+-            if level in think_off_levels or is_meta:
+-                variant_request.chat_template_kwargs = {
+-                    **(request.chat_template_kwargs or {}),
+-                    "enable_thinking": False,
+-                }
+-            variant_requests.append(variant_request)
++        think_off_levels = variants.think_off_levels
++        has_meta = variants.meta_messages is not None
++        default_suffix = variants.levels[variants.default_level].suffix
++        renders = self._effort_renders(request, variants)
+         rendered = await self._tokenize_effort_variants(
+-            request, engine_inputs[0], variant_requests
++            request, engine_inputs[0], renders, default_suffix
+         )
+         if rendered is None:
+             rendered = await self._render_effort_variants_full(
+-                engine_inputs[0], variant_requests
++                engine_inputs[0], renders, default_suffix
+             )
+         if isinstance(rendered, ErrorResponse):
+             return rendered
+@@ -407,7 +488,7 @@ class OpenAIServingChat(GenerateBaseServing):
+         if split is None:
+             return None
+         body_len, tails = split
+-        if think_off_levels and off_votes:
++        if has_meta:
+             # tails[-1] is the hidden yes/no question; the engine samples it
+             # `off_votes` times before it lets a think-off verdict stand.
+             request._dynamic_effort["meta_tail"] = tails.pop()
+@@ -441,10 +522,12 @@ class OpenAIServingChat(GenerateBaseServing):
+             request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
+             request._dynamic_effort["yes_ids"] = sorted(yes_ids)
+             request._dynamic_effort["no_ids"] = sorted(no_ids)
+-        if think_off_levels:
++        if think_off_levels and not default_suffix:
+             # Thinking off is the default rendering plus a closed think block:
+             # appended in place, no resubmission (measured identical to the
+-            # template's own `<think>\n\n</think>\n\n` rendering).
++            # template's own `<think>\n\n</think>\n\n` rendering). A default
++            # level with its sentence already inside the think block cannot be
++            # closed that way; the engine resubmits the think-off tail instead.
+             tokenizer = self.renderer.tokenizer
+             if tokenizer is not None:
+                 request._dynamic_effort["off_append"] = list(
+@@ -506,7 +589,8 @@ class OpenAIServingChat(GenerateBaseServing):
+             return result
+ 
+         conversation, engine_inputs = result
+-        if request._dynamic_effort_variant_messages is not None:
++        if request._dynamic_effort_variants is not None:
++            self._append_default_effort_suffix(request, engine_inputs)
+             variant_error = await self._attach_effort_tails(request, engine_inputs)
+             if variant_error is not None:
+                 return variant_error
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 3be4ba9878..f974748854 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3072,7 +3072,6 @@ class Scheduler(SchedulerInterface):
+                 level == 0
+                 and self._effort_cfg is not None
+                 and self._effort_cfg.hidden_effort.think_off_level
+-                and request.effort_off_append
+             ):
+                 if (
+                     request.effort_meta_tail is not None
+@@ -3081,9 +3080,13 @@ class Scheduler(SchedulerInterface):
+                     # Off gate: the model votes yes/no on skipping thinking,
+                     # hidden from the client, before the verdict stands.
+                     return self._start_effort_off_vote(request)
+-                # Thinking off = the default prompt plus a closed think block:
+-                # extend the prefilled request in place, no blocks freed.
+-                return self._extend_effort_prompt(request, request.effort_off_append)
++                if request.effort_off_append:
++                    # Thinking off = the default prompt plus a closed think
++                    # block: extend the prefilled request in place, no blocks
++                    # freed.
++                    return self._extend_effort_prompt(
++                        request, request.effort_off_append
++                    )
+             return self._resubmit_effort_tail(request, tails[level])
+         return self._apply_effort_tail(
+             request=request,
+@@ -3246,8 +3249,12 @@ class Scheduler(SchedulerInterface):
+         if off:
+             level = 0
+             default = request.effort_default_level
+-            tail = list(tails[default] if default < len(tails) else [])
+-            tail += list(request.effort_off_append or [])
++            if request.effort_off_append and default < len(tails):
++                tail = list(tails[default]) + list(request.effort_off_append)
++            else:
++                # The default tail cannot be closed in place (its sentence is
++                # inside the think block): use the rendered think-off tail.
++                tail = list(tails[0]) if tails else []
+         else:
+             assert self._effort_cfg is not None
+             level = self._effort_cfg.hidden_effort.low_level

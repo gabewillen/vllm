@@ -5,13 +5,15 @@
 `dynamic` never reaches the chat template. The request is rewritten in place:
 the template sees `render_effort` (medium: no effort sentence, so block 0 of the
 prompt is identical for every level), and each effort level is rendered as a
-**trailing user message carrying only that level's sentence**, after the last
-message of the conversation. That is the true tail of the prompt, which is where
-the model actually honours it - measured on this box 2026-08-19: with the
-sentence on the last *user* message of an agent turn (the placement patch 0009
-shipped) the `xhigh` wording moves reasoning length 1.14x against no sentence,
-because a tool result sits between it and the generation point; as a trailing
-user message it moves it 1.23x up and 0.78x down.
+**tail after the shared body**: the level's sentence as the first line of the
+model's own think block (`sentence_placement="think"`), appended to the rendered
+prompt right after the template's generation prompt. The messages are not
+touched, so the body is byte-identical across levels and the model cannot
+mistake the sentence for a turn of the conversation - measured 2026-08-24 on an
+agent benchmark: the older trailing-user-message placement
+(`sentence_placement="user"`, kept for A/B) made the model answer the sentence
+("What would you like me to help with?") whenever it landed after a tool result
+and ended the agent loop.
 
 The engine gets the shared body and one tail per level and picks the level from
 the body's own pooled hidden state before the model thinks. No thinking budget
@@ -19,7 +21,8 @@ is set: on this path the model ends its own think block.
 """
 
 import copy
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal
 
 from vllm.config.reasoning import (
     OFF_VOTE_PROMPT,
@@ -36,6 +39,36 @@ _LEVEL_KEY = "dynamic_effort_level"
 
 class DynamicEffortError(ValueError):
     """Client error in a dynamic-effort request (rendered as HTTP 400)."""
+
+
+@dataclass
+class EffortVariant:
+    """One effort level's rendering: the messages the chat template sees and
+    the text appended after the template's output (`""` for none)."""
+
+    messages: list[Any]
+    suffix: str = ""
+
+
+@dataclass
+class EffortRender:
+    """A variant as the serving layer renders it: the request to run through
+    the chat template (`None`: the default level's template output) and the
+    text appended after it."""
+
+    request: Any
+    suffix: str = ""
+
+
+@dataclass
+class EffortVariants:
+    """Every level's variant plus, when the off gate is on, the messages of the
+    hidden off-vote question."""
+
+    levels: list[EffortVariant]
+    meta_messages: list[Any] | None = None
+    default_level: int = 0
+    think_off_levels: set[int] = field(default_factory=set)
 
 
 def build_dynamic_effort_overrides(
@@ -116,24 +149,31 @@ def apply_dynamic_effort(
     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
     forced = overrides.get("forced_level")
     hidden = cfg.hidden_effort
-    if (
-        forced is not None
-        and cfg.level_sentences[forced] is None
-        and hidden.off_vote
-    ):
+    if forced is not None and cfg.level_sentences[forced] is None and hidden.off_vote:
         # A forced think-off still passes through the off-vote gate: run the
         # normal two-phase path and force the verdict in the engine.
         overrides["force_off"] = True
         del overrides["forced_level"]
     default_level = overrides.get("forced_level", hidden.default_level)
-    variants = render_effort_variants(request.messages, cfg.level_sentences)
-    request.messages = variants[default_level]
-    request._dynamic_effort_variant_messages = variants
-    overrides["default_level"] = default_level
-    overrides["think_off_levels"] = [
+    levels = render_effort_variants(
+        request.messages, cfg.level_sentences, hidden.sentence_placement
+    )
+    think_off_levels = [
         i for i, sentence in enumerate(cfg.level_sentences) if sentence is None
     ]
-    if overrides["think_off_levels"] and hidden.off_vote:
+    meta = None
+    if think_off_levels and hidden.off_vote:
+        meta = off_vote_variant(request.messages)
+    request._dynamic_effort_variants = EffortVariants(
+        levels=levels,
+        meta_messages=meta,
+        default_level=default_level,
+        think_off_levels=set(think_off_levels),
+    )
+    request.messages = levels[default_level].messages
+    overrides["default_level"] = default_level
+    overrides["think_off_levels"] = think_off_levels
+    if meta is not None:
         overrides["off_votes"] = hidden.off_votes
         overrides["off_vote_max_tokens"] = hidden.off_vote_max_tokens
     if default_level in overrides["think_off_levels"]:
@@ -143,17 +183,28 @@ def apply_dynamic_effort(
 
 
 def render_effort_variants(
-    messages: list[Any], sentences: list[str | None]
-) -> list[list[Any]]:
-    """One message list per level, each with that level's tail sentence.
+    messages: list[Any],
+    sentences: list[str | None],
+    placement: Literal["think", "user"] = "think",
+) -> list[EffortVariant]:
+    """One variant per level, each carrying that level's sentence.
 
-    A `None` sentence is the think-off level: the messages are untouched and
-    the variant is rendered with `enable_thinking=false` instead."""
-    variants: list[list[Any]] = []
+    With `placement="think"` the messages are shared untouched and the sentence
+    (plus a newline) is the suffix appended after the generation prompt, i.e.
+    the first line of the think block. With `placement="user"` the sentence is
+    a trailing user message and there is no suffix. A `None` sentence is the
+    think-off level: the messages are untouched and the variant is rendered
+    with `enable_thinking=false` instead."""
+    variants: list[EffortVariant] = []
     for sentence in sentences:
-        rendered = copy.deepcopy(messages)
-        append_to_last_message(rendered, sentence or "")
-        variants.append(rendered)
+        if placement == "user":
+            rendered = copy.deepcopy(messages)
+            append_to_last_message(rendered, sentence or "")
+            variants.append(EffortVariant(rendered))
+        else:
+            variants.append(
+                EffortVariant(messages, f"{sentence}\n" if sentence else "")
+            )
     return variants
 
 
