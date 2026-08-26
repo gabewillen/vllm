@@ -221,6 +221,32 @@ vLLM's `/models` carries no output-token field, so `Qwen3.8-27B` keeps the
 per-format default output; set `max-completion-tokens` upstream or an explicit
 config value if that matters.
 
+## Fork sync with upstream (2026-08-26)
+
+Fork branch `feat/compat-responses-compaction` (remote `origin-fork`,
+gabewillen/CLIProxyAPI) is rebased on upstream `origin/main` = `1f53b2eb`
+(v7.2.142, 2026-08-26); previous base `dc3c3b1e` (v7.2.141). Fork HEAD
+`79e181c9`; our four commits (sampling forward, compaction v2, xAI schema
+normalizer, auto model limits) applied cleanly, no file overlap with the
+upstream delta (dc3c3b1e..1f53b2eb: quota-signal observation + fair credential
+rotation in `sdk/cliproxy/auth`, antigravity finish-reason/tool-result fixes,
+plugin quiesce on hot reload, GitHub-token release checks, video duration
+fix).
+
+Sync procedure: `git fetch --all --tags && git rebase origin/main`, then in
+`golang:1.26-bookworm` (`-v /shared/CLIProxyAPI:/src -w /src`, add
+`git config --global --add safe.directory /src` for VCS stamping):
+`gofmt -l .`, `go build ./...`, `go test ./internal/... ./sdk/...` — only the
+three known host-fingerprint failures in `internal/runtime/executor`
+(`TestApplyClaudeHeaders_*`, `TestClaudeExecutor_NonClaudeRequest…`) are
+expected. Then `git push --force-with-lease origin-fork
+feat/compat-responses-compaction`, `docker build -t cli-proxy-api:compaction
+/shared/CLIProxyAPI`, and recreate `cliproxyapi` with the flags/mounts from
+`docker inspect`. Post-deploy checks: `/v1/models?client_version=1`
+(Qwen3.8-27B 262144, ox-alpha-free 1000000), Codex `oneOf`-of-`$ref` schema
+against grok-4.6 -> 200, compaction_trigger on Qwen3.8-27B -> one
+`compaction` item. All passed 2026-08-26.
+
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
 create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at
