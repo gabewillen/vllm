@@ -1,0 +1,89 @@
+diff --git a/tests/entrypoints/openai/chat_completion/test_effort_tails.py b/tests/entrypoints/openai/chat_completion/test_effort_tails.py
+index 8913261986..a07dbfeba0 100644
+--- a/tests/entrypoints/openai/chat_completion/test_effort_tails.py
++++ b/tests/entrypoints/openai/chat_completion/test_effort_tails.py
+@@ -276,6 +276,28 @@ _CASES = {
+ }
+ 
+ 
++@pytest.mark.parametrize("last_role", ["tool", "user"])
++def test_tool_result_gate(last_role: str):
++    """With tail_after_tool_result=False a continuation ending on a tool
++    result is rendered plain at render_effort; a user turn still gets tails."""
++    cfg = _effort_config(default_level=0, tail_after_tool_result=False)
++    messages = agent_conversation(turns=2, words_per_tool_result=5)
++    if last_role == "user":
++        messages.append({"role": "user", "content": "go on"})
++    assert messages[-1]["role"] == last_role
++    request = ChatCompletionRequest(
++        model=BASE_MODEL_PATHS[0].name, messages=messages, reasoning_effort="dynamic"
++    )
++    apply_dynamic_effort(request, cfg)
++    assert request.reasoning_effort == cfg.render_effort
++    if last_role == "tool":
++        assert request._dynamic_effort is None
++        assert len(request.messages) == len(messages)
++    else:
++        assert request._dynamic_effort is not None
++        assert len(request.messages) == len(messages) + 1
++
++
+ @pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
+ @pytest.mark.parametrize("case", sorted(_CASES))
+ def test_tail_tokenization_matches_full_render(case: str):
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index 97e73619c6..dc4ee38253 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -53,6 +53,11 @@ class HiddenEffortConfig:
+     enabled: bool = False
+     """Split the prompt at the effort sentence and choose the level from the
+     body's pooled hidden state."""
++    tail_after_tool_result: bool = True
++    """Also decide and render the level sentence when the conversation ends on
++    a tool result (an agent loop continuation). False renders those requests
++    at `render_effort` with no sentence and no decision: the level is only set
++    on the user's own turns."""
+     shadow: bool = False
+     """Compute and log the decision but always render `default_level` (§13.8
+     step 1). The memory still fills, so a shadow day warms it for free."""
+diff --git a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+index cd988332f0..a69f5168d4 100644
+--- a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
++++ b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+@@ -56,6 +56,15 @@ def build_dynamic_effort_overrides(
+     return overrides
+ 
+ 
++def ends_with_tool_result(messages: list[Any]) -> bool:
++    """True when the last message is a tool result."""
++    if not messages:
++        return False
++    last = messages[-1]
++    role = last.get("role") if isinstance(last, dict) else getattr(last, "role", None)
++    return role == "tool"
++
++
+ def append_to_last_message(messages: list[Any], sentence: str) -> bool:
+     """Append `sentence` as a trailing user message; True if it was added."""
+     if not sentence:
+@@ -113,14 +122,13 @@ def apply_dynamic_effort(
+             "reasoning_effort='dynamic' conflicts with "
+             "chat_template_kwargs.enable_thinking=false"
+         )
++    hidden = cfg.hidden_effort
++    if not hidden.tail_after_tool_result and ends_with_tool_result(request.messages):
++        request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
++        return
+     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
+     forced = overrides.get("forced_level")
+-    hidden = cfg.hidden_effort
+-    if (
+-        forced is not None
+-        and cfg.level_sentences[forced] is None
+-        and hidden.off_vote
+-    ):
++    if forced is not None and cfg.level_sentences[forced] is None and hidden.off_vote:
+         # A forced think-off still passes through the off-vote gate: run the
+         # normal two-phase path and force the verdict in the engine.
+         overrides["force_off"] = True

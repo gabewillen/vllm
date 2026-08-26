@@ -5,18 +5,13 @@
 `dynamic` never reaches the chat template. The request is rewritten in place:
 the template sees `render_effort` (medium: no effort sentence, so block 0 of the
 prompt is identical for every level), and each effort level is rendered as a
-**trailing message carrying only that level's sentence**, after the last
+**trailing user message carrying only that level's sentence**, after the last
 message of the conversation. That is the true tail of the prompt, which is where
 the model actually honours it - measured on this box 2026-08-19: with the
 sentence on the last *user* message of an agent turn (the placement patch 0009
 shipped) the `xhigh` wording moves reasoning length 1.14x against no sentence,
 because a tool result sits between it and the generation point; as a trailing
-user message it moves it 1.23x up and 0.78x down. The role of that message is
-`hidden_effort.sentence_placement`: `user`, `system` (a trailing system turn,
-which the stock Qwen template rejects - serve with
-`serve-configs/qwen3_8_chat_template.jinja`), or `auto` (user after a user
-message, system after a tool result, so an agent loop never sees the sentence
-as the user's next turn).
+user message it moves it 1.23x up and 0.78x down.
 
 The engine gets the shared body and one tail per level and picks the level from
 the body's own pooled hidden state before the model thinks. No thinking budget
@@ -24,7 +19,7 @@ is set: on this path the model ends its own think block.
 """
 
 import copy
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from vllm.config.reasoning import (
     OFF_VOTE_PROMPT,
@@ -61,29 +56,20 @@ def build_dynamic_effort_overrides(
     return overrides
 
 
-Placement = Literal["user", "system", "auto"]
-
-
-def sentence_role(messages: list[Any], placement: Placement) -> str:
-    """Role of the trailing message carrying the level sentence.
-
-    `auto` is `user` when the conversation ends on a user message and
-    `system` otherwise: right after a tool result a trailing user message
-    reads as the user's next turn, a trailing system turn does not."""
-    if placement != "auto":
-        return placement
-    last = messages[-1] if messages else None
+def ends_with_tool_result(messages: list[Any]) -> bool:
+    """True when the last message is a tool result."""
+    if not messages:
+        return False
+    last = messages[-1]
     role = last.get("role") if isinstance(last, dict) else getattr(last, "role", None)
-    return "user" if role == "user" else "system"
+    return role == "tool"
 
 
-def append_to_last_message(
-    messages: list[Any], sentence: str, role: str = "user"
-) -> bool:
-    """Append `sentence` as a trailing `role` message; True if it was added."""
+def append_to_last_message(messages: list[Any], sentence: str) -> bool:
+    """Append `sentence` as a trailing user message; True if it was added."""
     if not sentence:
         return False
-    messages.append({"role": role, "content": sentence})
+    messages.append({"role": "user", "content": sentence})
     return True
 
 
@@ -136,18 +122,19 @@ def apply_dynamic_effort(
             "reasoning_effort='dynamic' conflicts with "
             "chat_template_kwargs.enable_thinking=false"
         )
+    hidden = cfg.hidden_effort
+    if not hidden.tail_after_tool_result and ends_with_tool_result(request.messages):
+        request.reasoning_effort = cfg.render_effort  # type: ignore[assignment]
+        return
     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
     forced = overrides.get("forced_level")
-    hidden = cfg.hidden_effort
     if forced is not None and cfg.level_sentences[forced] is None and hidden.off_vote:
         # A forced think-off still passes through the off-vote gate: run the
         # normal two-phase path and force the verdict in the engine.
         overrides["force_off"] = True
         del overrides["forced_level"]
     default_level = overrides.get("forced_level", hidden.default_level)
-    variants = render_effort_variants(
-        request.messages, cfg.level_sentences, hidden.sentence_placement
-    )
+    variants = render_effort_variants(request.messages, cfg.level_sentences)
     request.messages = variants[default_level]
     request._dynamic_effort_variant_messages = variants
     overrides["default_level"] = default_level
@@ -164,20 +151,16 @@ def apply_dynamic_effort(
 
 
 def render_effort_variants(
-    messages: list[Any],
-    sentences: list[str | None],
-    placement: Placement = "user",
+    messages: list[Any], sentences: list[str | None]
 ) -> list[list[Any]]:
-    """One message list per level, each with that level's tail sentence as a
-    trailing message whose role is `sentence_role(messages, placement)`.
+    """One message list per level, each with that level's tail sentence.
 
     A `None` sentence is the think-off level: the messages are untouched and
     the variant is rendered with `enable_thinking=false` instead."""
-    role = sentence_role(messages, placement)
     variants: list[list[Any]] = []
     for sentence in sentences:
         rendered = copy.deepcopy(messages)
-        append_to_last_message(rendered, sentence or "", role)
+        append_to_last_message(rendered, sentence or "")
         variants.append(rendered)
     return variants
 

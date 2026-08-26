@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from pydantic import Field
 
@@ -53,15 +53,11 @@ class HiddenEffortConfig:
     enabled: bool = False
     """Split the prompt at the effort sentence and choose the level from the
     body's pooled hidden state."""
-    sentence_placement: Literal["user", "system", "auto"] = "user"
-    """Role of the trailing message that carries the level sentence. `user`
-    (measured 2026-08-19, 1.23x up / 0.78x down) reads as the user's turn right
-    after a tool result and can end an agent loop (cattrs 2026-08-25: forced
-    low 0/3, 29 turns). `system` renders a trailing system turn (needs a chat
-    template that accepts one; `serve-configs/qwen3_8_chat_template.jinja`):
-    forced low 1/3 at 108 turns, the same loop shape as a leading system
-    sentence. `auto` uses `user` when the conversation ends on a user message
-    and `system` otherwise (after a tool result or assistant prefix)."""
+    tail_after_tool_result: bool = True
+    """Also decide and render the level sentence when the conversation ends on
+    a tool result (an agent loop continuation). False renders those requests
+    at `render_effort` with no sentence and no decision: the level is only set
+    on the user's own turns."""
     shadow: bool = False
     """Compute and log the decision but always render `default_level` (§13.8
     step 1). The memory still fills, so a shadow day warms it for free."""

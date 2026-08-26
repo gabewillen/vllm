@@ -21,7 +21,6 @@ from vllm.config.reasoning import (
 )
 from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     apply_dynamic_effort,
-    render_effort_variants,
 )
 from vllm.entrypoints.openai.chat_completion.effort_tails import (
     special_token_cut,
@@ -180,29 +179,8 @@ def _effort_config(**hidden) -> DynamicEffortConfig:
     )
 
 
-SYSTEM_TAIL_TEMPLATE = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "..",
-    "..",
-    "..",
-    "serve-configs",
-    "qwen3_8_chat_template.jinja",
-)
-
-
-def _chat_template(cfg: DynamicEffortConfig) -> str | None:
-    """The stock Qwen template rejects a trailing system turn; the placements
-    that render one need the serve-configs copy that accepts it."""
-    if cfg.hidden_effort.sentence_placement == "user":
-        return None
-    with open(SYSTEM_TAIL_TEMPLATE) as f:
-        return f.read()
-
-
 def _build_qwen3_serving_chat(cfg: DynamicEffortConfig) -> OpenAIServingChat:
     model_config = MockModelConfig()
-    chat_template = _chat_template(cfg)
     engine = MockEngine(
         model_config=model_config,
         renderer=HfRenderer(
@@ -220,7 +198,7 @@ def _build_qwen3_serving_chat(cfg: DynamicEffortConfig) -> OpenAIServingChat:
         model_config=model_config,
         renderer=engine.renderer,
         request_logger=None,
-        chat_template=chat_template,
+        chat_template=None,
         chat_template_content_format="auto",
         enable_auto_tools=True,
         tool_parser="qwen3_coder",
@@ -230,7 +208,7 @@ def _build_qwen3_serving_chat(cfg: DynamicEffortConfig) -> OpenAIServingChat:
         models,
         response_role="assistant",
         online_renderer=online_renderer,
-        chat_template=chat_template,
+        chat_template=None,
         chat_template_content_format="auto",
         request_logger=None,
         enable_auto_tools=True,
@@ -295,57 +273,29 @@ _CASES = {
         hidden=dict(think_off_level=True, default_level=2),
         kwargs={"preserve_thinking": False},
     ),
-    "system-tail": dict(
-        hidden=dict(think_off_level=True, default_level=2, sentence_placement="system"),
-        kwargs=None,
-    ),
-    "auto-tail-after-tool": dict(
-        hidden=dict(think_off_level=True, default_level=2, sentence_placement="auto"),
-        kwargs=None,
-    ),
 }
 
 
-@pytest.mark.parametrize(
-    ("placement", "last_role", "expected"),
-    [
-        ("user", "tool", "user"),
-        ("system", "user", "system"),
-        ("auto", "user", "user"),
-        ("auto", "tool", "system"),
-        ("auto", "assistant", "system"),
-    ],
-)
-def test_sentence_role_follows_placement(placement, last_role, expected):
-    """`auto` only speaks as the user when the user spoke last."""
-    messages = [{"role": "user", "content": "hi"}, {"role": last_role, "content": "x"}]
-    variants = render_effort_variants(messages, ["low", "high"], placement)
-    assert all(v[-1]["role"] == expected for v in variants)
-    assert [v[-1]["content"] for v in variants] == ["low", "high"]
-
-
-@pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
-def test_system_tail_renders_trailing_system_turn():
-    """With the serve-configs template a system-placed sentence lands as the
-    last turn before the generation prompt, byte-for-byte."""
-    asyncio.run(_check_system_tail_text())
-
-
-async def _check_system_tail_text():
-    cfg = _effort_config(default_level=1, sentence_placement="auto")
-    serving = _build_qwen3_serving_chat(cfg)
-    messages = agent_conversation(turns=2, words_per_tool_result=20)
-    assert messages[-1]["role"] == "tool"
-    overrides, ids = await _effort_overrides(serving, cfg, messages, full_render=False)
-    tokenizer = serving.engine_client.renderer.tokenizer
-    body = tokenizer.decode(ids[: overrides["body_len"]])
-    low = tokenizer.decode(overrides["tails"][0])
-    assert body.endswith("<|im_end|>\n")
-    assert low.endswith(
-        "<|im_start|>system\n"
-        + cfg.level_sentences[0]
-        + "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+@pytest.mark.parametrize("last_role", ["tool", "user"])
+def test_tool_result_gate(last_role: str):
+    """With tail_after_tool_result=False a continuation ending on a tool
+    result is rendered plain at render_effort; a user turn still gets tails."""
+    cfg = _effort_config(default_level=0, tail_after_tool_result=False)
+    messages = agent_conversation(turns=2, words_per_tool_result=5)
+    if last_role == "user":
+        messages.append({"role": "user", "content": "go on"})
+    assert messages[-1]["role"] == last_role
+    request = ChatCompletionRequest(
+        model=BASE_MODEL_PATHS[0].name, messages=messages, reasoning_effort="dynamic"
     )
+    apply_dynamic_effort(request, cfg)
+    assert request.reasoning_effort == cfg.render_effort
+    if last_role == "tool":
+        assert request._dynamic_effort is None
+        assert len(request.messages) == len(messages)
+    else:
+        assert request._dynamic_effort is not None
+        assert len(request.messages) == len(messages) + 1
 
 
 @pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
