@@ -303,8 +303,7 @@ low..ultra) and `gpt-reserve` (hide); plain `/v1/models` and the Anthropic list
 `gpt-daybreak-blue-latest` stream:false -> 200 completed "pong" (upstream echoes
 `model: gpt-5.6-sol` for this slug -- verified the same directly against
 chatgpt.com, so it is an upstream alias, not a CPA rewrite); `gpt-5.6-sol`
-still 200. Only the openai-compatibility model-limits feature (below/above)
-is unrelated to this path.
+still 200. openai-compatibility providers are untouched by this feature.
 
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
