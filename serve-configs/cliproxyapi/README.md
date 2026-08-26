@@ -247,6 +247,65 @@ feat/compat-responses-compaction`, `docker build -t cli-proxy-api:compaction
 against grok-4.6 -> 200, compaction_trigger on Qwen3.8-27B -> one
 `compaction` item. All passed 2026-08-26.
 
+## Live Codex model catalog per OAuth account (fork, 2026-08-26)
+
+CPA's Codex (ChatGPT OAuth) model list was static (`internal/registry/models/
+models.json`), so account-gated models such as `gpt-daybreak-blue-latest`
+("Daybreak Blue") and the hidden `gpt-reserve` that OpenAI's live catalog
+returns for this account were unknown to CPA and Codex Desktop could not select
+them. Fork commits `55cba9b2` + `e9417066` (branch
+`feat/compat-responses-compaction`, image `cli-proxy-api:compaction`) add
+`internal/codexmodels` wired in `sdk/cliproxy/service_codex_live_models.go`:
+
+- For every Codex OAuth auth, at model registration (startup, auth reload,
+  config reload) CPA fetches
+  `GET https://chatgpt.com/backend-api/codex/models?client_version=0.146.0`
+  with that auth's bearer token, `Chatgpt-Account-Id`, the executor's
+  `codex-tui` User-Agent/Originator and any custom header attrs (8 s timeout,
+  best-effort; an expired access token is refreshed the way the executor does
+  and persisted). A 15 min ticker re-registers auths whose catalog is older
+  than the refresh interval; a failed fetch is not retried for 15 min.
+- Cache: `<auth-dir>/codex-models-cache.json` (`/etc/cliproxyapi/auth/` on the
+  host), keyed by `account_id` with `fetched_at`, so an offline restart keeps
+  the last catalog (log line says `(cache)` instead of `(live)`).
+- Merge, per account: union of static plan models + live slugs. Live entries
+  add unknown slugs (routable to the codex executor, `type: openai`, 128k
+  max output) and refresh display name, `context_window` -> `context_length`,
+  reasoning levels and input modalities on known ones; static-only models are
+  kept. `max_context_window` is deliberately NOT mapped to CPA's
+  `MaxContextLength` (that field is a config override that would force
+  `context_window` to 872000 in the Codex catalog). Hidden live models
+  (`visibility: hide`, e.g. `gpt-reserve`) are registered and routable but
+  stay hidden in the `?client_version=` catalog.
+- Codex catalog (`/v1/models?client_version=...`): live entries overlay the
+  static templates (`registry.SetCodexLiveClientModels`, union across
+  accounts): unknown slugs become full templates (including OpenAI's
+  `model_messages` instructions template), known slugs get `display_name`,
+  `description`, `visibility`, `context_window`, `max_context_window`,
+  `priority`, `supported_reasoning_levels`, `default_reasoning_level` refreshed.
+- One info line per account when the result changes, e.g.
+  `codex live models: account codex-3660ee59-... (live) added
+  gpt-daybreak-blue-latest,gpt-reserve; updated codex-auto-review,...`.
+- Config (config.yaml top level, both optional): `codex-live-models: false`
+  disables everything (static list only); `codex-live-models-refresh: 6h`
+  (Go duration) sets the per-account refresh interval. Precedence for a Codex
+  model's metadata: live catalog > static models.json / codex_client_models.json
+  templates; `excluded_models` and OAuth model aliases still apply after the
+  merge.
+- Static fallback: `gpt-daybreak-blue-latest` was also added to models.json
+  (codex-team/plus/pro, 272000 ctx, sol's shape). Note upstream's 3 h remote
+  models.json refresh can replace the static list; the live merge re-adds it.
+
+Verified 2026-08-26/27: `/v1/models?client_version=0.149.0` lists
+`gpt-daybreak-blue-latest` (Daybreak Blue, list, 272000/872000, priority 3,
+low..ultra) and `gpt-reserve` (hide); plain `/v1/models` and the Anthropic list
+(cloaked id) include both; `POST /v1/responses` model
+`gpt-daybreak-blue-latest` stream:false -> 200 completed "pong" (upstream echoes
+`model: gpt-5.6-sol` for this slug -- verified the same directly against
+chatgpt.com, so it is an upstream alias, not a CPA rewrite); `gpt-5.6-sol`
+still 200. Only the openai-compatibility model-limits feature (below/above)
+is unrelated to this path.
+
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
 create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at
