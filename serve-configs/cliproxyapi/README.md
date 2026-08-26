@@ -161,6 +161,66 @@ Verified: the real Codex schema returns 200 on both endpoints (was 400), a
 forced call on the merged tool yields `{"id":"abc123","mode":"view"}`, and a
 forced call on a wrapped `anyOf[object,string]` tool yields `{"a":"hello"}`.
 
+## Auto model context/output limits (fork, 2026-08-26)
+
+Codex Desktop reads `GET /v1/models?client_version=1`; for models that are not
+in CPA's Codex template list, upstream fell back to the template default and
+reported `context_window` 272000 for everything from an `openai-compatibility`
+provider. Upstream's only source for those models is the per-model config field
+`max-context-length`.
+
+Fork commit `09f9f3d9` (branch `feat/compat-responses-compaction`, image
+`cli-proxy-api:compaction`) adds `internal/modellimits`, a best-effort resolver
+wired into `sdk/cliproxy/service_model_limits.go`. It runs at provider model
+registration and on every config reload (never on the request path), with a 3 s
+timeout per fetch and results cached in-process. Precedence per model:
+
+1. explicit `max-context-length` in config (unchanged upstream behaviour);
+2. the provider's own `GET {base-url}/models`, if the entry for that model id
+   carries `max_model_len` (vLLM), `context_length` (OpenRouter/LiteLLM),
+   `context_window`, `max_context_length`, `max_input_tokens`, or a nested
+   `top_provider`/`limit` object; output from `max_output_tokens`,
+   `max_completion_tokens`, or `max_tokens`;
+3. models.dev (`https://models.dev/api.json`), matched by model id, preferring
+   the provider whose `api` URL matches the config `base-url` (so
+   `opencode.ai/zen/go/v1` -> `opencode-go`), then one whose id/name matches the
+   config provider name, then the first provider listing that id. `limit.context`
+   -> context, `limit.output` -> max output.
+
+The models.dev payload is fetched once at startup, refreshed every 24 h, and
+persisted to `<auth-dir>/models-dev-cache.json` (in the container:
+`/root/.cli-proxy-api/`, i.e. `/etc/cliproxyapi/auth/` on the host), so a
+restart while offline still resolves. Resolution is logged at info, e.g.
+`model limits: provider "vllm-qwen38" resolved Qwen3.8-27B ctx=262144 out=0
+(upstream:vllm-qwen38)`, deduplicated per provider.
+
+Values flow into the Codex catalog (`context_window`/`max_context_window`,
+`max_tokens`) and the Anthropic-format list (`max_input_tokens`/`max_tokens`).
+
+New global config keys (all optional, defaults shown):
+
+- `auto-model-limits: true` — turn the whole resolver off with `false`;
+- `models-dev-url: https://models.dev/api.json`;
+- `models-dev-refresh: 24h`;
+- `openai-models-extended-fields: true` — **diverges from upstream policy.**
+  Upstream deliberately strips the plain `GET /v1/models` response to
+  id/object/created/owned_by and declined to add limits (won't-fix #5119). With
+  this flag on, `context_length`, `max_context_length` and
+  `max_completion_tokens` are passed through when known (for OAuth/static
+  models too). Set it to `false` for upstream's strict four-field behaviour.
+
+Live after deploy (`cli-proxy-api:compaction`, 2026-08-26):
+
+| model | Codex `context_window` / `max_tokens` | `/v1/models` | Anthropic `max_input_tokens` / `max_tokens` |
+| --- | --- | --- | --- |
+| `Qwen3.8-27B` | 262144 / — (was 272000) | context_length 262144 (was absent) | 262144 / 64000 (default output) |
+| `ox-alpha-free` | 1000000 / 131072 (was 272000) | context_length 1000000, max_completion_tokens 131072 | 1000000 / 131072 |
+| `claude-sonnet-4-5-20250929` (OAuth) | 200000 / 64000 (unchanged) | context_length 200000, max_completion_tokens 64000 (was absent) | 200000 / 64000 |
+
+vLLM's `/models` carries no output-token field, so `Qwen3.8-27B` keeps the
+per-format default output; set `max-completion-tokens` upstream or an explicit
+config value if that matters.
+
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
 create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at
