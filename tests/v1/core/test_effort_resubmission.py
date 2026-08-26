@@ -18,6 +18,7 @@ import torch
 
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.config.reasoning import DynamicEffortConfig, HiddenEffortConfig
+from vllm.sampling_params import RequestOutputKind
 from vllm.v1.core.sched.effort_controller import new_effort_state
 from vllm.v1.core.sched.scheduler import (
     Scheduler,
@@ -25,6 +26,8 @@ from vllm.v1.core.sched.scheduler import (
     effort_level_vote_verdict,
 )
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+from vllm.v1.engine import RoutedPromptUpdate
+from vllm.v1.engine.output_processor import RequestState
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -241,6 +244,48 @@ def _vote_request(scheduler: Scheduler, off_votes: int = 3) -> Request:
     return request
 
 
+def _assert_frontend_sees_prompt(update: RoutedPromptUpdate, request: Request):
+    """The rewritten prompt reaches the frontend's request state, so the
+    reasoning parser adjusts to the tail the engine actually ran."""
+    assert update.prompt_token_ids == list(request.prompt_token_ids)
+    state = RequestState(
+        request_id=request.request_id,
+        external_req_id=request.request_id,
+        parent_req=None,
+        request_index=0,
+        lora_request=None,
+        output_kind=RequestOutputKind.FINAL_ONLY,
+        prompt=None,
+        prompt_token_ids=list(request.prompt_token_ids[:70]),
+        prompt_embeds=None,
+        logprobs_processor=None,
+        detokenizer=None,
+        max_tokens_param=None,
+        arrival_time=0.0,
+        queue=None,
+        log_stats=False,
+        stream_interval=1,
+    )
+    state.routed_prompt_revision = update.revision - 1
+    assert state.apply_routed_prompt(update, tokenizer=None)
+    assert state.prompt_token_ids == list(request.prompt_token_ids)
+    assert state.prompt_len == request.num_prompt_tokens
+
+
+def test_extend_effort_prompt_surfaces_off_tail():
+    """Think-off in place: the off tail is appended to the prompt and the
+    routed prompt update carries the full extended prompt."""
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
+    request = _vote_request(scheduler)
+    body = list(request.prompt_token_ids)
+    update = scheduler._extend_effort_prompt(request, request.effort_off_append)
+    assert update.revision == 1
+    assert list(request.prompt_token_ids) == body + [400]
+    assert request.num_prompt_tokens == len(body) + 1
+    assert list(request.all_token_ids) == body + [400]
+    _assert_frontend_sees_prompt(update, request)
+
+
 def _count_resubmissions(scheduler: Scheduler) -> list[list[int]]:
     tails: list[list[int]] = []
     original = scheduler._resubmit_effort_tail
@@ -309,6 +354,7 @@ def test_off_vote_is_one_resubmission(off: bool):
     expected_tail = list(request.effort_tail_variants[2]) + [400] if off else [300, 301]
     assert tails[1] == expected_tail
     assert list(request.prompt_token_ids) == seam_prefix + expected_tail
+    _assert_frontend_sees_prompt(engine_output.routed_prompt_update, request)
     assert request.status == RequestStatus.WAITING
     assert (params.temperature, params.seed, params.logprobs) == client_sampling
     assert not request.effort_meta_phase
@@ -421,6 +467,7 @@ def test_level_vote_is_one_resubmission(case: str):
     assert list(request.prompt_token_ids) == list(request.prompt_token_ids[:70]) + (
         expected
     )
+    _assert_frontend_sees_prompt(engine_output.routed_prompt_update, request)
     assert max(request.effort_level_votes) == expected_level
     assert len(request.effort_level_votes) == 3
     state = scheduler._effort[request.request_id]

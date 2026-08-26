@@ -115,6 +115,10 @@ class ParserEngine(Parser):
             or parser_engine_config.initial_state == ParserState.REASONING
         )
         self._reasoning_ended: bool = not self._has_reasoning
+        # Set from the final prompt (which the engine may have rewritten,
+        # e.g. a think-off tail appended by dynamic effort); overrides the
+        # template-derived config state.
+        self._prompt_initial_state: ParserState | None = None
         self._streaming_initialized: bool = False
         self._prompt_streaming_prepared: bool = False
 
@@ -182,9 +186,31 @@ class ParserEngine(Parser):
             self._streaming_initialized = True
             self._reset(initial_state=initial_state)
 
+    @property
+    def initial_state(self) -> ParserState:
+        if self._prompt_initial_state is not None:
+            return self._prompt_initial_state
+        return self.parser_engine_config.initial_state
+
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
-        """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
-        return
+        """Start in REASONING or CONTENT according to the last think tag in
+        the prompt; a prompt without one keeps the template-derived state."""
+        start_id = self._reasoning_start_token_id
+        end_id = self._reasoning_end_token_id
+        if end_id is None:
+            return
+        state: ParserState | None = None
+        for token_id in reversed(prompt_token_ids):
+            if token_id == end_id:
+                state = ParserState.CONTENT
+                break
+            if token_id == start_id:
+                state = ParserState.REASONING
+                break
+        if state is None or state == self.initial_state:
+            return
+        self._prompt_initial_state = state
+        self._reset()
 
     def finish_streaming(self) -> DeltaMessage | None:
         events = self._engine.finish()
@@ -193,6 +219,8 @@ class ParserEngine(Parser):
         return None
 
     def _reset(self, initial_state: ParserState | None = None) -> None:
+        if initial_state is None:
+            initial_state = self._prompt_initial_state
         self._engine.reset(initial_state=initial_state)
         self._reasoning_ended = not self._has_reasoning
         self._tool_slots.clear()
@@ -600,7 +628,7 @@ class ParserEngine(Parser):
         start_id = self._reasoning_start_token_id
         if end_id is not None:
             if not input_ids:
-                return self.parser_engine_config.initial_state != ParserState.REASONING
+                return self.initial_state != ParserState.REASONING
             for i in range(len(input_ids) - 1, -1, -1):
                 if input_ids[i] == end_id:
                     return True
@@ -633,9 +661,7 @@ class ParserEngine(Parser):
         # Templates that pre-open the think block put THINK_START in the
         # prompt, so the generated ids begin inside reasoning and carry only
         # THINK_END; the parser config's initial state records that.
-        depth = (
-            1 if self.parser_engine_config.initial_state == ParserState.REASONING else 0
-        )
+        depth = 1 if self.initial_state == ParserState.REASONING else 0
         for token_id in token_ids:
             if token_id == start_id:
                 depth += 1
@@ -688,8 +714,11 @@ class ParserEngine(Parser):
         request: ChatCompletionRequest | ResponsesRequest,
         enable_auto_tools: bool = False,
         model_output_token_ids: Sequence[int] = (),
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
         self._initialize_history_tool_call_cnt(request)
+        if prompt_token_ids is not None:
+            self.adjust_initial_state_from_prompt(prompt_token_ids)
         self._check_skip_tool_parsing(request)
         reasoning, content, tool_call_info = self._single_pass_parse(
             model_output,

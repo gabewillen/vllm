@@ -1204,3 +1204,88 @@ class TestCountReasoningTokens:
         )
         assert parser.count_reasoning_tokens([5, 102, 6, 7, 103, 8]) == 2
         assert parser.count_reasoning_tokens([5, 6, 103, 8]) == 0
+
+
+class TestPromptAdjustedInitialState:
+    """The engine may rewrite the prompt tail after the template ran (dynamic
+    effort appends `</think>\n\n` to skip thinking), so the parser must take
+    its initial state from the final prompt, not the template kwargs."""
+
+    @pytest.fixture
+    def think_tokenizer(self):
+        return make_mock_tokenizer(
+            {
+                TOOL_CALL_START: 100,
+                TOOL_CALL_END: 101,
+                "<think>": 102,
+                "</think>": 103,
+            }
+        )
+
+    @pytest.fixture
+    def thinking_parser(self, think_tokenizer):
+        return ParserEngine(
+            think_tokenizer, parser_engine_config=qwen3_config(thinking=True)
+        )
+
+    OPEN_PROMPT = [7, 8, 102, 9]
+    CLOSED_PROMPT = [7, 8, 102, 9, 103, 9, 9]
+
+    def test_closed_prompt_parses_as_content(self, thinking_parser, mock_request):
+        reasoning, content, tool_calls = thinking_parser.parse(
+            "Hello!",
+            mock_request,
+            model_output_token_ids=[5, 6],
+            prompt_token_ids=self.CLOSED_PROMPT,
+        )
+        assert reasoning is None
+        assert content == "Hello!"
+        assert tool_calls is None
+        assert thinking_parser.count_reasoning_tokens([5, 6]) == 0
+        assert thinking_parser.is_reasoning_end([])
+
+    def test_open_prompt_keeps_reasoning(self, thinking_parser, mock_request):
+        reasoning, content, _ = thinking_parser.parse(
+            "Hello!",
+            mock_request,
+            model_output_token_ids=[5, 6],
+            prompt_token_ids=self.OPEN_PROMPT,
+        )
+        assert reasoning == "Hello!"
+        assert content is None
+        assert thinking_parser.count_reasoning_tokens([5, 6]) == 2
+
+    def test_prompt_without_think_tag_keeps_template_state(
+        self, thinking_parser, mock_request
+    ):
+        reasoning, content, _ = thinking_parser.parse(
+            "Hello!", mock_request, prompt_token_ids=[7, 8, 9]
+        )
+        assert reasoning == "Hello!" and content is None
+
+    def test_closed_prompt_streams_as_content(self, thinking_parser, mock_request):
+        deltas = []
+        for i, piece in enumerate(["Hel", "lo!"]):
+            delta = thinking_parser.parse_delta(
+                delta_text=piece,
+                delta_token_ids=[5 + i],
+                request=mock_request,
+                prompt_token_ids=self.CLOSED_PROMPT,
+                finished=i == 1,
+            )
+            if delta is not None:
+                deltas.append(delta)
+        assert "".join(d.content or "" for d in deltas) == "Hello!"
+        assert all(not d.reasoning for d in deltas)
+
+    def test_closed_prompt_after_streaming_init(self, thinking_parser, mock_request):
+        thinking_parser.initialize_streaming()
+        delta = thinking_parser.parse_delta(
+            delta_text="Hello!",
+            delta_token_ids=[5],
+            request=mock_request,
+            prompt_token_ids=self.CLOSED_PROMPT,
+            finished=True,
+        )
+        assert delta is not None and delta.content == "Hello!"
+        assert not delta.reasoning

@@ -340,6 +340,7 @@ class Parser:
         request: ChatCompletionRequest | ResponsesRequest,
         enable_auto_tools: bool = False,
         model_output_token_ids: Sequence[int] = (),
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
         """Parse a complete model output, extracting reasoning and tool calls.
 
@@ -348,6 +349,9 @@ class Parser:
             request: The request object used to generate the output.
             enable_auto_tools: Whether to enable automatic tool call parsing.
             model_output_token_ids: The generated raw output token IDs.
+            prompt_token_ids: The final prompt as the engine ran it, which
+                may differ from the rendered one; used to pick the initial
+                reasoning state.
 
         Returns:
             A tuple of (reasoning, content, tool_calls).
@@ -788,8 +792,11 @@ class DelegatingParser(Parser):
         request: ChatCompletionRequest | ResponsesRequest,
         enable_auto_tools: bool = False,
         model_output_token_ids: Sequence[int] = (),
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
         self._initialize_history_tool_call_cnt(request)
+        if prompt_token_ids is not None and self._reasoning_parser is not None:
+            self._reasoning_parser.adjust_initial_state_from_prompt(prompt_token_ids)
         reasoning, content = self.extract_reasoning(model_output, request)
         tool_calls, content = self._extract_tool_calls(
             content=content,
