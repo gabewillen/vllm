@@ -1,0 +1,876 @@
+diff --git a/tests/entrypoints/openai/chat_completion/test_effort_tails.py b/tests/entrypoints/openai/chat_completion/test_effort_tails.py
+index a07dbfeba0..6d2dc3284d 100644
+--- a/tests/entrypoints/openai/chat_completion/test_effort_tails.py
++++ b/tests/entrypoints/openai/chat_completion/test_effort_tails.py
+@@ -16,11 +16,14 @@ import pytest
+ 
+ from vllm.config import MultiModalConfig
+ from vllm.config.reasoning import (
++    LEVEL_VOTE_PROMPT,
++    OFF_VOTE_PROMPT,
+     DynamicEffortConfig,
+     HiddenEffortConfig,
+ )
+ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+     apply_dynamic_effort,
++    vote_word_token_ids,
+ )
+ from vllm.entrypoints.openai.chat_completion.effort_tails import (
+     special_token_cut,
+@@ -273,9 +276,131 @@ _CASES = {
+         hidden=dict(think_off_level=True, default_level=2),
+         kwargs={"preserve_thinking": False},
+     ),
++    "level-vote": dict(
++        hidden=dict(think_off_level=True, default_level=2, level_vote=True),
++        kwargs=None,
++    ),
++    "level-vote-no-think-off": dict(
++        hidden=dict(default_level=1, level_vote=True), kwargs=None
++    ),
+ }
+ 
+ 
++def test_level_vote_words_align_with_levels():
++    """Words derive from the ladder (dropping `none` without think-off) and
++    an explicit list must match the level count."""
++    assert HiddenEffortConfig(
++        enabled=True, think_off_level=True, default_level=1, level_vote=True
++    ).vote_words() == ["none", "brief", "extended"]
++    assert HiddenEffortConfig(enabled=True, level_vote=True).vote_words() == [
++        "brief",
++        "extended",
++    ]
++    assert HiddenEffortConfig(
++        enabled=True, level_vote=True, level_vote_words=["a", "b"]
++    ).vote_words() == ["a", "b"]
++    with pytest.raises(ValueError, match="one word per level"):
++        HiddenEffortConfig(enabled=True, level_vote=True, level_vote_words=["a"])
++    with pytest.raises(ValueError, match="one word per level"):
++        HiddenEffortConfig(
++            enabled=True,
++            level_vote=True,
++            effort_sentences=["a", "b", "c"],
++            level_vote_words=["x", "y"],
++        )
++    with pytest.raises(ValueError, match="distinct"):
++        HiddenEffortConfig(enabled=True, level_vote=True, level_vote_words=["a", "a"])
++
++
++@pytest.mark.parametrize("level_vote", [False, True])
++def test_level_vote_meta_prompt(level_vote: bool):
++    """The meta question is the level prompt with the vote on and the yes/no
++    prompt off; the level variants are byte-identical either way."""
++    cfg = _effort_config(think_off_level=True, default_level=2, level_vote=level_vote)
++    messages = agent_conversation(turns=1, words_per_tool_result=5)
++    request = ChatCompletionRequest(
++        model=BASE_MODEL_PATHS[0].name, messages=messages, reasoning_effort="dynamic"
++    )
++    apply_dynamic_effort(request, cfg)
++    overrides = request._dynamic_effort
++    assert overrides is not None
++    assert overrides["off_votes"] == 3
++    if level_vote:
++        assert overrides["meta_prompt"] == LEVEL_VOTE_PROMPT
++        assert overrides["level_vote_words"] == ["none", "brief", "extended"]
++        assert overrides["level_vote_rule"] == "max"
++    else:
++        assert overrides["meta_prompt"] == OFF_VOTE_PROMPT
++        assert "level_vote_words" not in overrides
++    plain = _effort_config(think_off_level=True, default_level=2)
++    control = ChatCompletionRequest(
++        model=BASE_MODEL_PATHS[0].name, messages=messages, reasoning_effort="dynamic"
++    )
++    apply_dynamic_effort(control, plain)
++    assert control._dynamic_effort_variant_messages == (
++        request._dynamic_effort_variant_messages
++    )
++
++
++def test_level_vote_forced_level_skips_the_vote():
++    """A forced level (think-off included) is rendered directly: no force_off
++    detour through the gate, and the engine sees `forced_level`."""
++    cfg = _effort_config(think_off_level=True, default_level=2, level_vote=True)
++    request = ChatCompletionRequest(
++        model=BASE_MODEL_PATHS[0].name,
++        messages=agent_conversation(turns=1, words_per_tool_result=5),
++        reasoning_effort="dynamic",
++        vllm_xargs={"dynamic_effort_level": 0},
++    )
++    apply_dynamic_effort(request, cfg)
++    overrides = request._dynamic_effort
++    assert overrides is not None
++    assert overrides["forced_level"] == 0 and "force_off" not in overrides
++    assert overrides["default_level"] == 0
++    assert request.chat_template_kwargs == {"enable_thinking": False}
++
++
++def test_vote_word_token_ids_spellings():
++    """Each level's set is the single-token spellings of its word."""
++    encode = lambda text: [hash(text) & 0xFFFF] if " " not in text[1:] else []  # noqa: E731
++    ids = vote_word_token_ids(encode, ["none", "brief"])
++    assert len(ids) == 2
++    for word, bucket in zip(["none", "brief"], ids):
++        spellings = [word, word.capitalize(), word.upper()]
++        expected = {encode(s)[0] for s in spellings} | {
++            encode(" " + s)[0] for s in spellings
++        }
++        assert set(bucket) == expected
++
++
++@pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
++def test_level_vote_word_ids_rendered():
++    """The meta tail carries the level prompt and one non-empty answer-id set
++    per level is derived from the tokenizer."""
++    asyncio.run(_check_level_vote_word_ids())
++
++
++async def _check_level_vote_word_ids():
++    cfg = _effort_config(think_off_level=True, default_level=2, level_vote=True)
++    serving = _build_qwen3_serving_chat(cfg)
++    overrides, _ = await _effort_overrides(
++        serving,
++        cfg,
++        agent_conversation(turns=2, words_per_tool_result=20),
++        full_render=False,
++    )
++    tokenizer = serving.renderer.tokenizer
++    assert tokenizer is not None
++    assert LEVEL_VOTE_PROMPT in tokenizer.decode(overrides["meta_tail"])
++    word_ids = overrides["level_word_ids"]
++    assert len(word_ids) == 3 and all(word_ids)
++    assert not set(word_ids[0]) & set(word_ids[1]) & set(word_ids[2])
++    assert overrides["yes_ids"] == [] and overrides["level_vote_rule"] == "max"
++    assert "meta_prompt" not in overrides and "level_vote_words" not in overrides
++    for word, ids in zip(["none", "brief", "extended"], word_ids):
++        assert {tokenizer.decode([i]).strip().lower() for i in ids} == {word}
++
++
+ @pytest.mark.parametrize("last_role", ["tool", "user"])
+ def test_tool_result_gate(last_role: str):
+     """With tail_after_tool_result=False a continuation ending on a tool
+diff --git a/tests/v1/core/test_effort_resubmission.py b/tests/v1/core/test_effort_resubmission.py
+index a706d84dbc..5d691ba867 100644
+--- a/tests/v1/core/test_effort_resubmission.py
++++ b/tests/v1/core/test_effort_resubmission.py
+@@ -18,7 +18,12 @@ import torch
+ 
+ from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
+ from vllm.config.reasoning import DynamicEffortConfig, HiddenEffortConfig
+-from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.core.sched.effort_controller import new_effort_state
++from vllm.v1.core.sched.scheduler import (
++    Scheduler,
++    draw_effort_level,
++    effort_level_vote_verdict,
++)
+ from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+@@ -333,6 +338,167 @@ def test_off_vote_without_logprobs_samples_each_vote():
+     ]
+ 
+ 
++def test_level_vote_draws_and_rules():
++    """Draws index the categorical by cumulative mass; `max` raises on one
++    draw and lowers only by consensus, `median` takes the middle draw."""
++    probs = [0.2, 0.5, 0.3]
++    assert [draw_effort_level(u, probs) for u in (0.0, 0.19, 0.2, 0.69, 0.7, 1.0)] == [
++        0,
++        0,
++        1,
++        1,
++        2,
++        2,
++    ]
++    assert effort_level_vote_verdict([0, 0, 2], "max", 1) == 2
++    assert effort_level_vote_verdict([0, 0, 0], "max", 1) == 0
++    assert effort_level_vote_verdict([0, 0, 2], "median", 1) == 0
++    assert effort_level_vote_verdict([0, 2, 2], "median", 1) == 2
++    assert effort_level_vote_verdict([], "max", 1) == 1
++
++
++def _level_vote_request(scheduler: Scheduler, rule: str = "max") -> Request:
++    request = _vote_request(scheduler)
++    request.effort_yes_ids = set()
++    request.effort_no_ids = set()
++    request.effort_level_word_ids = [{1}, {2}, {5}]
++    request.effort_level_vote_rule = rule
++    cfg = scheduler._effort_cfg
++    assert cfg is not None
++    scheduler._effort[request.request_id] = new_effort_state(
++        request.request_id, cfg, [], [], request.prompt_token_ids
++    )
++    scheduler._effort[request.request_id].level = 2
++    return request
++
++
++_LEVEL_VOTE_CASES = {
++    # entries -> (level, rendered tail)
++    "none": ({1: 1.0}, 0, "off"),
++    "brief": ({2: 1.0}, 1, [300, 301]),
++    "extended": ({5: 1.0}, 2, "default"),
++    "unparseable": ({9: 1.0}, 2, "default"),
++    "no-mass-in-top": ({9: 0.1}, 2, "default"),
++}
++
++
++@pytest.mark.parametrize("case", sorted(_LEVEL_VOTE_CASES))
++def test_level_vote_is_one_resubmission(case: str):
++    """All draws come from the first token's logprobs; the memory decision is
++    bypassed and the voted level's tail is rendered in one resubmission."""
++    entries, expected_level, expected_tail = _LEVEL_VOTE_CASES[case]
++    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
++    scheduler._effort_cfg = DynamicEffortConfig(
++        hidden_effort=HiddenEffortConfig(
++            enabled=True, think_off_level=True, default_level=2, level_vote=True
++        )
++    )
++    request = _level_vote_request(scheduler)
++    params = request.sampling_params
++    assert params is not None
++    client_sampling = (params.temperature, params.seed, params.logprobs)
++    tails = _count_resubmissions(scheduler)
++
++    # No memory, no vector: the vote still decides.
++    request.effort_decision_pending = True
++    update = scheduler._resolve_effort_decision(request, None)
++    assert update is not None and request.effort_meta_phase
++    _requeue(scheduler, request)
++    assert tails == [request.effort_meta_tail]
++
++    outputs = _vote_step(scheduler, request, entries)
++    [engine_output] = outputs[0].outputs
++    assert engine_output.new_token_ids == []
++    assert engine_output.routed_prompt_update is not None
++    assert len(tails) == 2
++    if expected_tail == "off":
++        expected = list(request.effort_tail_variants[2]) + [400]
++    elif expected_tail == "default":
++        expected = list(request.effort_tail_variants[2])
++    else:
++        expected = expected_tail
++    assert tails[1] == expected
++    assert list(request.prompt_token_ids) == list(request.prompt_token_ids[:70]) + (
++        expected
++    )
++    assert max(request.effort_level_votes) == expected_level
++    assert len(request.effort_level_votes) == 3
++    state = scheduler._effort[request.request_id]
++    report = state.report
++    assert report["level"] == expected_level and report["decided"] == 1
++    assert report["level_votes"] == request.effort_level_votes
++    assert len(report["vote_probs"]) == 3
++    assert sum(report["vote_probs"]) == pytest.approx(1.0, abs=1e-3)
++    if case == "unparseable":
++        assert report["vote_probs"] == [0.0, 0.0, 1.0]
++    assert (params.temperature, params.seed, params.logprobs) == client_sampling
++    assert not request.effort_meta_phase
++    assert request.status == RequestStatus.WAITING
++
++
++def test_level_vote_median_rule():
++    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
++    scheduler._effort_cfg = DynamicEffortConfig(
++        hidden_effort=HiddenEffortConfig(
++            enabled=True,
++            think_off_level=True,
++            default_level=2,
++            level_vote=True,
++            level_vote_rule="median",
++        )
++    )
++    request = _level_vote_request(scheduler, rule="median")
++    tails = _count_resubmissions(scheduler)
++    request.effort_decision_pending = True
++    scheduler._resolve_effort_decision(request, None)
++    _requeue(scheduler, request)
++    _vote_step(scheduler, request, {1: 0.5, 2: 0.5, 5: 1e-9})
++    votes = request.effort_level_votes
++    assert sorted(votes)[1] == scheduler._effort[request.request_id].level
++    assert tails[1] != [] or votes == [0, 0, 0]
++
++
++def test_level_vote_without_logprobs_samples_each_vote():
++    """Without logprobs each draw is one sampled walk: the first answer token
++    names the level, a stop id is the default level."""
++    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
++    scheduler._effort_cfg = DynamicEffortConfig(
++        hidden_effort=HiddenEffortConfig(
++            enabled=True, think_off_level=True, default_level=2, level_vote=True
++        )
++    )
++    request = _level_vote_request(scheduler)
++    tails = _count_resubmissions(scheduler)
++    request.effort_decision_pending = True
++    scheduler._resolve_effort_decision(request, None)
++    _requeue(scheduler, request)
++    for sampled in ([1], [3], [2]):
++        _run_step(scheduler, request, sampled)
++    assert request.effort_level_votes == [0, 2, 1]
++    assert scheduler._effort[request.request_id].level == 2
++    assert [len(t) for t in tails] == [3, 3, 3, len(request.effort_tail_variants[2])]
++
++
++def test_forced_off_and_shadow_skip_the_level_vote():
++    """`force_off` keeps the off gate's verdict; shadow renders the default."""
++    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
++    scheduler._effort_cfg = DynamicEffortConfig(
++        hidden_effort=HiddenEffortConfig(
++            enabled=True, think_off_level=True, default_level=2, level_vote=True
++        )
++    )
++    request = _level_vote_request(scheduler)
++    request.effort_force_off = True
++    request.effort_decision_pending = True
++    update = scheduler._resolve_effort_decision(request, None)
++    assert update is not None
++    assert request.effort_meta_phase and request.effort_level_votes == []
++    _requeue(scheduler, request)
++    _vote_step(scheduler, request, {1: 1.0})
++    assert request.effort_level_votes == [0, 0, 0]
++    assert scheduler._effort[request.request_id].level == 0
++
++
+ def test_vote_probability_is_tempered_top_logprob_mass():
+     scheduler = create_scheduler(block_size=BLOCK_SIZE)
+     [request] = create_requests(num_requests=1, num_tokens=8, block_size=BLOCK_SIZE)
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index dc4ee38253..eb2858bf12 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from dataclasses import field
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Literal
+ 
+ from pydantic import Field
+ 
+@@ -35,6 +35,17 @@ times at temperature 0.7; only a unanimous yes skips thinking. Measured
+ 2026-08-23: unanimity-of-3 had zero wrong-offs on the grid, a single vote
+ wrongly said yes on arithmetic."""
+ 
++LEVEL_VOTE_PROMPT = (
++    "How much step-by-step working does the request above need to answer "
++    "correctly? Reply with one word: none, brief, or extended."
++)
++"""The hidden question behind `level_vote`: the model names its own level.
++One word per level, lowest first, aligned with the level sentences."""
++
++DEFAULT_LEVEL_VOTE_WORDS = ["none", "brief", "extended"]
++"""Answer words of `LEVEL_VOTE_PROMPT` for the think-off / low / medium
++ladder; a ladder without a think-off level drops `none`."""
++
+ 
+ @config
+ class HiddenEffortConfig:
+@@ -138,6 +149,25 @@ class HiddenEffortConfig:
+     fully cached prompt at a different seed."""
+     off_vote_max_tokens: int = Field(default=8, ge=1)
+     """Cap on one vote's generation; an unclassifiable vote counts as no."""
++    level_vote: bool = False
++    """Let the model choose its own level: the hidden question is
++    `level_vote_prompt` instead of `OFF_VOTE_PROMPT`, its first-token
++    distribution over `level_vote_words` is sampled `off_votes` times at the
++    vote temperature, and `level_vote_rule` picks the level from the draws.
++    The memory still records and reports but no longer decides; a forced
++    level (`vllm_xargs.dynamic_effort_level`) still overrides. Mass on any
++    other token counts as `default_level`, so an unparseable answer never
++    lowers the effort."""
++    level_vote_prompt: str = LEVEL_VOTE_PROMPT
++    """The hidden question `level_vote` asks."""
++    level_vote_words: list[str] | None = None
++    """One answer word per level, lowest first, aligned with `sentences()`.
++    `None` derives them from `DEFAULT_LEVEL_VOTE_WORDS`, dropping `none`
++    when there is no think-off level."""
++    level_vote_rule: Literal["max", "median"] = "max"
++    """`max`: the highest level any draw chose - the level rises on a single
++    draw and only falls by consensus, the same conservatism as the unanimous
++    off gate. `median`: the middle draw."""
+ 
+     def __post_init__(self) -> None:
+         if self.q_high < self.q_mid:
+@@ -154,6 +184,30 @@ class HiddenEffortConfig:
+             )
+         if self.think_off_level and self.q_none > self.q_mid:
+             raise ValueError("hidden_effort.q_none must be <= q_mid")
++        if self.level_vote:
++            self.vote_words()
++
++    def vote_words(self) -> list[str]:
++        """The `level_vote` answer word of each level, lowest first.
++
++        Raises:
++            ValueError: when the words do not align 1:1 with the levels.
++        """
++        num_levels = len(self.sentences())
++        if self.level_vote_words is not None:
++            words = list(self.level_vote_words)
++        else:
++            words = list(DEFAULT_LEVEL_VOTE_WORDS)
++            if not self.think_off_level:
++                words = words[1:]
++        if len(words) != num_levels:
++            raise ValueError(
++                f"hidden_effort.level_vote_words needs one word per level "
++                f"({num_levels}), got {len(words)}"
++            )
++        if any(not w.strip() for w in words) or len(set(words)) != len(words):
++            raise ValueError("hidden_effort.level_vote_words must be distinct words")
++        return words
+ 
+     def sentences(self) -> list[str | None]:
+         """The tail sentence of each effort level, lowest first. `None` is the
+diff --git a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+index a69f5168d4..4ad4f2bc22 100644
+--- a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
++++ b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+@@ -19,6 +19,7 @@ is set: on this path the model ends its own think block.
+ """
+ 
+ import copy
++from collections.abc import Callable
+ from typing import TYPE_CHECKING, Any
+ 
+ from vllm.config.reasoning import (
+@@ -128,7 +129,12 @@ def apply_dynamic_effort(
+         return
+     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
+     forced = overrides.get("forced_level")
+-    if forced is not None and cfg.level_sentences[forced] is None and hidden.off_vote:
++    if (
++        forced is not None
++        and cfg.level_sentences[forced] is None
++        and hidden.off_vote
++        and not hidden.level_vote
++    ):
+         # A forced think-off still passes through the off-vote gate: run the
+         # normal two-phase path and force the verdict in the engine.
+         overrides["force_off"] = True
+@@ -141,7 +147,13 @@ def apply_dynamic_effort(
+     overrides["think_off_levels"] = [
+         i for i, sentence in enumerate(cfg.level_sentences) if sentence is None
+     ]
+-    if overrides["think_off_levels"] and hidden.off_vote:
++    if hidden.level_vote:
++        overrides["meta_prompt"] = hidden.level_vote_prompt
++        overrides["level_vote_words"] = hidden.vote_words()
++        overrides["level_vote_rule"] = hidden.level_vote_rule
++    elif overrides["think_off_levels"] and hidden.off_vote:
++        overrides["meta_prompt"] = OFF_VOTE_PROMPT
++    if "meta_prompt" in overrides:
+         overrides["off_votes"] = hidden.off_votes
+         overrides["off_vote_max_tokens"] = hidden.off_vote_max_tokens
+     if default_level in overrides["think_off_levels"]:
+@@ -165,14 +177,31 @@ def render_effort_variants(
+     return variants
+ 
+ 
+-def off_vote_variant(messages: list[Any]) -> list[Any]:
+-    """The extra rendering the off gate needs: the hidden yes/no question,
+-    rendered thinking-off."""
++def off_vote_variant(messages: list[Any], prompt: str = OFF_VOTE_PROMPT) -> list[Any]:
++    """The extra rendering a hidden vote needs: the question (yes/no for the
++    off gate, the level words for the level vote), rendered thinking-off."""
+     meta = copy.deepcopy(messages)
+-    append_to_last_message(meta, OFF_VOTE_PROMPT)
++    append_to_last_message(meta, prompt)
+     return meta
+ 
+ 
++def vote_word_token_ids(
++    encode: Callable[[str], list[int]], words: list[str]
++) -> list[list[int]]:
++    """Single-token spellings of each answer word: as written, Capitalized,
++    UPPER, and each with a leading space."""
++    out: list[list[int]] = []
++    for word in words:
++        ids: set[int] = set()
++        for text in (word, word.capitalize(), word.upper()):
++            for spelled in (text, " " + text):
++                encoded = encode(spelled)
++                if len(encoded) == 1:
++                    ids.add(int(encoded[0]))
++        out.append(sorted(ids))
++    return out
++
++
+ def split_body_and_tails(
+     variant_token_ids: list[list[int]],
+ ) -> tuple[int, list[list[int]]] | None:
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index d6428c4a5a..caffb0ab3d 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -31,6 +31,7 @@ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+     apply_dynamic_effort,
+     off_vote_variant,
+     split_body_and_tails,
++    vote_word_token_ids,
+ )
+ from vllm.entrypoints.openai.chat_completion.effort_tails import (
+     tokenize_variant_tails,
+@@ -372,9 +373,13 @@ class OpenAIServingChat(GenerateBaseServing):
+             return None
+         think_off_levels = set(request._dynamic_effort.get("think_off_levels", ()))
+         off_votes = request._dynamic_effort.get("off_votes")
+-        if think_off_levels and off_votes:
++        meta_prompt = request._dynamic_effort.get("meta_prompt")
++        has_meta = bool(off_votes) and meta_prompt is not None
++        if has_meta:
+             base = min(i for i in range(len(variants)) if i not in think_off_levels)
+-            variants = list(variants) + [off_vote_variant(variants[base][:-1])]
++            variants = list(variants) + [
++                off_vote_variant(variants[base][:-1], meta_prompt)
++            ]
+         if len(engine_inputs) != 1:
+             return None
+         default_level = request._dynamic_effort["default_level"]
+@@ -385,7 +390,7 @@ class OpenAIServingChat(GenerateBaseServing):
+                 continue
+             variant_request = copy(request)
+             variant_request.messages = messages
+-            is_meta = bool(off_votes) and level == len(variants) - 1
++            is_meta = has_meta and level == len(variants) - 1
+             if level in think_off_levels or is_meta:
+                 variant_request.chat_template_kwargs = {
+                     **(request.chat_template_kwargs or {}),
+@@ -407,40 +412,39 @@ class OpenAIServingChat(GenerateBaseServing):
+         if split is None:
+             return None
+         body_len, tails = split
+-        if think_off_levels and off_votes:
+-            # tails[-1] is the hidden yes/no question; the engine samples it
+-            # `off_votes` times before it lets a think-off verdict stand.
++        if has_meta:
++            # tails[-1] is the hidden question; the engine samples its first
++            # token `off_votes` times before the verdict stands.
+             request._dynamic_effort["meta_tail"] = tails.pop()
+             tokenizer = self.renderer.tokenizer
+             stop_ids: set[int] = set()
+-            yes_ids: set[int] = set()
+-            no_ids: set[int] = set()
++            yes_ids: list[int] = []
++            no_ids: list[int] = []
++            level_word_ids: list[list[int]] = []
+             if tokenizer is not None:
++
++                def encode(text: str) -> list[int]:
++                    return tokenizer.encode(text, add_special_tokens=False)
++
+                 for text in ("\n", "\n\n"):
+-                    ids = tokenizer.encode(text, add_special_tokens=False)
++                    ids = encode(text)
+                     if len(ids) == 1:
+                         stop_ids.add(int(ids[0]))
+                 eos = getattr(tokenizer, "eos_token_id", None)
+                 if eos is not None:
+                     stop_ids.add(int(eos))
+-                for text, bucket in (
+-                    ("yes", yes_ids),
+-                    ("Yes", yes_ids),
+-                    ("YES", yes_ids),
+-                    (" yes", yes_ids),
+-                    (" Yes", yes_ids),
+-                    ("no", no_ids),
+-                    ("No", no_ids),
+-                    ("NO", no_ids),
+-                    (" no", no_ids),
+-                    (" No", no_ids),
+-                ):
+-                    ids = tokenizer.encode(text, add_special_tokens=False)
+-                    if len(ids) == 1:
+-                        bucket.add(int(ids[0]))
++                words = request._dynamic_effort.get("level_vote_words")
++                if words:
++                    level_word_ids = vote_word_token_ids(encode, list(words))
++                else:
++                    yes_ids, no_ids = vote_word_token_ids(encode, ["yes", "no"])
++            request._dynamic_effort.pop("meta_prompt", None)
++            request._dynamic_effort.pop("level_vote_words", None)
+             request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
+-            request._dynamic_effort["yes_ids"] = sorted(yes_ids)
+-            request._dynamic_effort["no_ids"] = sorted(no_ids)
++            request._dynamic_effort["yes_ids"] = yes_ids
++            request._dynamic_effort["no_ids"] = no_ids
++            if level_word_ids:
++                request._dynamic_effort["level_word_ids"] = level_word_ids
+         if think_off_levels:
+             # Thinking off is the default rendering plus a closed think block:
+             # appended in place, no resubmission (measured identical to the
+diff --git a/vllm/v1/core/sched/effort_controller.py b/vllm/v1/core/sched/effort_controller.py
+index 9d93201863..712c991653 100644
+--- a/vllm/v1/core/sched/effort_controller.py
++++ b/vllm/v1/core/sched/effort_controller.py
+@@ -69,6 +69,10 @@ class EffortState:
+     """Yes votes collected by the off gate before its verdict."""
+     off_vetoed: bool = False
+     """True when the off gate demoted a think-off verdict to low."""
++    level_votes: list[int] | None = None
++    """Levels the level vote drew, in draw order."""
++    vote_probs: list[float] | None = None
++    """Per-level first-token probability the level vote drew from."""
+     spread: float | None = None
+     neighbours: int = 0
+     memory_entries: int = 0
+@@ -98,6 +102,8 @@ class EffortState:
+             "novelty_rank": self.novelty_rank,
+             "off_votes": self.off_votes,
+             "off_vetoed": int(self.off_vetoed),
++            "level_votes": self.level_votes,
++            "vote_probs": self.vote_probs,
+         }
+ 
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 3be4ba9878..89c8b66970 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -113,6 +113,29 @@ resubmission instead of one per vote; mass outside the top entries counts as
+ no, like any token that is not a clean yes."""
+ 
+ 
++def draw_effort_level(u: float, probs: list[float]) -> int:
++    """Index the uniform draw `u` lands on in the categorical `probs`."""
++    acc = 0.0
++    for level, p in enumerate(probs):
++        acc += p
++        if u < acc:
++            return level
++    return len(probs) - 1
++
++
++def effort_level_vote_verdict(votes: list[int], rule: str, default: int) -> int:
++    """Level the vote rule picks from the drawn levels.
++
++    `max` takes the highest level any draw named; `median` the middle draw.
++    No draws at all is the default level.
++    """
++    if not votes:
++        return default
++    if rule == "median":
++        return sorted(votes)[len(votes) // 2]
++    return max(votes)
++
++
+ def adaptive_num_spec_tokens(
+     emas: list[float | None],
+     max_tokens: int,
+@@ -2908,6 +2931,13 @@ class Scheduler(SchedulerInterface):
+                             int(i) for i in overrides.get("no_ids") or []
+                         }
+                         request.effort_off_votes = int(overrides.get("off_votes") or 0)
++                        request.effort_level_word_ids = [
++                            {int(i) for i in ids}
++                            for ids in overrides.get("level_word_ids") or []
++                        ]
++                        request.effort_level_vote_rule = str(
++                            overrides.get("level_vote_rule") or "max"
++                        )
+                         request.effort_meta_max_tokens = int(
+                             overrides.get("off_vote_max_tokens") or 8
+                         )
+@@ -3058,6 +3088,17 @@ class Scheduler(SchedulerInterface):
+                     decision.spread_rank,
+                     query.n_entries,
+                 )
++        if (
++            request.effort_level_word_ids
++            and request.effort_seam
++            and request.effort_meta_tail is not None
++            and request.effort_off_votes > 0
++            and not request.effort_force_off
++            and not (memory is not None and memory.cfg.shadow)
++        ):
++            # Level vote: the model names its own level; the memory above
++            # only recorded what it would have said.
++            return self._start_effort_off_vote(request)
+         self._effort_level_total[level] = self._effort_level_total.get(level, 0) + 1
+         if level == default_level:
+             self._effort_default_reason[reason] = (
+@@ -3227,6 +3268,124 @@ class Scheduler(SchedulerInterface):
+         request.effort_meta_phase = True
+         request.effort_meta_tokens = []
+         request.effort_meta_votes = []
++        request.effort_level_votes = []
++        assert request.effort_meta_tail is not None
++        return self._resubmit_effort_tail(request, request.effort_meta_tail)
++
++    def _effort_level_tail(self, request: Request, level: int) -> list[int]:
++        """The prompt tail that renders `level`: its own tail, or for the
++        think-off level the default tail plus a closed think block."""
++        tails = request.effort_tail_variants or []
++        if (
++            level == 0
++            and self._effort_cfg is not None
++            and self._effort_cfg.hidden_effort.think_off_level
++            and request.effort_off_append
++        ):
++            default = request.effort_default_level
++            tail = list(tails[default] if default < len(tails) else [])
++            return tail + list(request.effort_off_append)
++        return list(tails[level]) if level < len(tails) else []
++
++    def _finish_effort_level_vote(
++        self, request: Request, probs: list[float] | None
++    ) -> RoutedPromptUpdate:
++        """Apply the vote rule to the drawn levels and render the winner."""
++        params = request.sampling_params
++        if params is not None and request.effort_saved_sampling is not None:
++            params.temperature, params.seed, params.logprobs = (
++                request.effort_saved_sampling
++            )
++            request.effort_saved_sampling = None
++        request.effort_meta_phase = False
++        level = effort_level_vote_verdict(
++            request.effort_level_votes,
++            request.effort_level_vote_rule,
++            request.effort_default_level,
++        )
++        state = self._effort.get(request.request_id)
++        if state is not None:
++            state.level = level
++            state.decided = True
++            state.level_votes = list(request.effort_level_votes)
++            state.vote_probs = (
++                [round(p, 4) for p in probs] if probs is not None else None
++            )
++        self._effort_level_total[level] = self._effort_level_total.get(level, 0) + 1
++        if self._effort_trace_budget > 0:
++            logger.info(
++                "dynamic_effort %s: level vote %s -> %d (%s), probs %s",
++                request.request_id,
++                request.effort_level_votes,
++                level,
++                request.effort_level_vote_rule,
++                state.vote_probs if state is not None else None,
++            )
++        return self._resubmit_effort_tail(
++            request, self._effort_level_tail(request, level)
++        )
++
++    def _step_effort_level_vote(
++        self,
++        request: Request,
++        new_token_ids: list[int],
++        stopped: bool,
++        logprobs: LogprobsLists | None,
++    ) -> RoutedPromptUpdate | None:
++        """Advance the level vote by one step.
++
++        With the first token's logprobs all `off_votes` draws come from its
++        tempered distribution over the levels' answer words; mass on any other
++        token is the default level. Without logprobs each draw is one sampled
++        walk: its first answer token names the level, anything else (a stop
++        id, the token cap, the request stopping) is the default level.
++        """
++        sets = request.effort_level_word_ids
++        default = request.effort_default_level
++        tokens = request.effort_meta_tokens
++        if (
++            logprobs is not None
++            and not tokens
++            and not request.effort_level_votes
++            and (masses := self._effort_vote_masses(request, logprobs, sets))
++            is not None
++        ):
++            probs = list(masses)
++            probs[default] += max(0.0, 1.0 - sum(masses))
++            rng = np.random.default_rng(zlib.crc32(request.request_id.encode()))
++            request.effort_level_votes = [
++                draw_effort_level(float(u), probs)
++                for u in rng.random(request.effort_off_votes)
++            ]
++            if stopped:
++                request.status = RequestStatus.RUNNING
++            return self._finish_effort_level_vote(request, probs)
++        vote: int | None = None
++        done = stopped
++        for tok in new_token_ids:
++            tok = int(tok)
++            named = [i for i, ids in enumerate(sets) if tok in ids]
++            if named:
++                vote, done = named[0], True
++                break
++            if tok in request.effort_meta_stop_ids:
++                done = True
++                break
++            tokens.append(tok)
++            if len(tokens) >= request.effort_meta_max_tokens:
++                done = True
++                break
++        if not done:
++            return None
++        if stopped:
++            request.status = RequestStatus.RUNNING
++        request.effort_level_votes.append(default if vote is None else vote)
++        tokens.clear()
++        if len(request.effort_level_votes) >= request.effort_off_votes:
++            return self._finish_effort_level_vote(request, None)
++        params = request.sampling_params
++        if params is not None:
++            params.seed = len(request.effort_level_votes) + 1
+         assert request.effort_meta_tail is not None
+         return self._resubmit_effort_tail(request, request.effort_meta_tail)
+ 
+@@ -3283,6 +3442,10 @@ class Scheduler(SchedulerInterface):
+         a clean yes counts as no. Any no ends the gate at the resting low
+         level; `off_votes` unanimous yeses confirm think-off.
+         """
++        if request.effort_level_word_ids:
++            return self._step_effort_level_vote(
++                request, new_token_ids, stopped, logprobs
++            )
+         tokens = request.effort_meta_tokens
+         if (
+             logprobs is not None
+@@ -3342,6 +3505,13 @@ class Scheduler(SchedulerInterface):
+         need the temperature applied here, processed ones already carry it.
+         None when the step returned no usable entries.
+         """
++        masses = self._effort_vote_masses(request, logprobs, [request.effort_yes_ids])
++        return None if masses is None else masses[0]
++
++    def _effort_vote_masses(
++        self, request: Request, logprobs: LogprobsLists, sets: list[set[int]]
++    ) -> list[float] | None:
++        """Tempered first-token probability mass of each token set."""
+         if len(logprobs.logprobs) == 0:
+             return None
+         scores: dict[int, float] = {}
+@@ -3358,13 +3528,14 @@ class Scheduler(SchedulerInterface):
+         )
+         top = max(scores.values())
+         total = 0.0
+-        yes = 0.0
++        masses = [0.0] * len(sets)
+         for token_id, score in scores.items():
+             weight = math.exp((score - top) * inv_temperature)
+             total += weight
+-            if token_id in request.effort_yes_ids:
+-                yes += weight
+-        return yes / total
++            for i, ids in enumerate(sets):
++                if token_id in ids:
++                    masses[i] += weight
++        return [m / total for m in masses]
+ 
+     def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
+         """Record a finished request in the memory (§13.4).
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index fca1735b1e..4eeb557298 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -215,6 +215,10 @@ class Request:
+         self.effort_yes_ids: set[int] = set()
+         self.effort_no_ids: set[int] = set()
+         self.effort_off_votes = 0
++        # Level vote: one answer-token set per level; the drawn levels.
++        self.effort_level_word_ids: list[set[int]] = []
++        self.effort_level_vote_rule = "max"
++        self.effort_level_votes: list[int] = []
+         self.effort_meta_max_tokens = 0
+         self.effort_meta_phase = False
+         self.effort_meta_tokens: list[int] = []

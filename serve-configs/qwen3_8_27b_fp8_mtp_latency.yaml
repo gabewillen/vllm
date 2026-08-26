@@ -204,6 +204,10 @@ reasoning-parser: qwen3
 # default_level 2 = medium (undecided prompts stay byte-identical); the
 # memory restarts cold for the new lane semantics.
 reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "effort_aliases": {"high": "xhigh"}, "hidden_effort": {"enabled": true, "think_off_level": true, "q_none": 0.30, "q_mid": 0.60, "q_high": 0.60, "default_level": 2, "memory_path": "/data/effort-memory/qwen38-latency.npz"}}}'
+# Level-vote ablation (patch 0026, docs §13.12): the model names its own level
+# (none/brief/extended) from the hidden question's first-token distribution,
+# 3 draws at 0.7, rule max; the q_* cuts stop deciding (memory still learns).
+# reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "effort_aliases": {"high": "xhigh"}, "hidden_effort": {"enabled": true, "think_off_level": true, "q_none": 0.30, "q_mid": 0.60, "q_high": 0.60, "default_level": 2, "memory_path": "/data/effort-memory/qwen38-latency.npz", "level_vote": true}}}'
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B

@@ -31,6 +31,7 @@ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     apply_dynamic_effort,
     off_vote_variant,
     split_body_and_tails,
+    vote_word_token_ids,
 )
 from vllm.entrypoints.openai.chat_completion.effort_tails import (
     tokenize_variant_tails,
@@ -372,9 +373,13 @@ class OpenAIServingChat(GenerateBaseServing):
             return None
         think_off_levels = set(request._dynamic_effort.get("think_off_levels", ()))
         off_votes = request._dynamic_effort.get("off_votes")
-        if think_off_levels and off_votes:
+        meta_prompt = request._dynamic_effort.get("meta_prompt")
+        has_meta = bool(off_votes) and meta_prompt is not None
+        if has_meta:
             base = min(i for i in range(len(variants)) if i not in think_off_levels)
-            variants = list(variants) + [off_vote_variant(variants[base][:-1])]
+            variants = list(variants) + [
+                off_vote_variant(variants[base][:-1], meta_prompt)
+            ]
         if len(engine_inputs) != 1:
             return None
         default_level = request._dynamic_effort["default_level"]
@@ -385,7 +390,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 continue
             variant_request = copy(request)
             variant_request.messages = messages
-            is_meta = bool(off_votes) and level == len(variants) - 1
+            is_meta = has_meta and level == len(variants) - 1
             if level in think_off_levels or is_meta:
                 variant_request.chat_template_kwargs = {
                     **(request.chat_template_kwargs or {}),
@@ -407,40 +412,39 @@ class OpenAIServingChat(GenerateBaseServing):
         if split is None:
             return None
         body_len, tails = split
-        if think_off_levels and off_votes:
-            # tails[-1] is the hidden yes/no question; the engine samples it
-            # `off_votes` times before it lets a think-off verdict stand.
+        if has_meta:
+            # tails[-1] is the hidden question; the engine samples its first
+            # token `off_votes` times before the verdict stands.
             request._dynamic_effort["meta_tail"] = tails.pop()
             tokenizer = self.renderer.tokenizer
             stop_ids: set[int] = set()
-            yes_ids: set[int] = set()
-            no_ids: set[int] = set()
+            yes_ids: list[int] = []
+            no_ids: list[int] = []
+            level_word_ids: list[list[int]] = []
             if tokenizer is not None:
+
+                def encode(text: str) -> list[int]:
+                    return tokenizer.encode(text, add_special_tokens=False)
+
                 for text in ("\n", "\n\n"):
-                    ids = tokenizer.encode(text, add_special_tokens=False)
+                    ids = encode(text)
                     if len(ids) == 1:
                         stop_ids.add(int(ids[0]))
                 eos = getattr(tokenizer, "eos_token_id", None)
                 if eos is not None:
                     stop_ids.add(int(eos))
-                for text, bucket in (
-                    ("yes", yes_ids),
-                    ("Yes", yes_ids),
-                    ("YES", yes_ids),
-                    (" yes", yes_ids),
-                    (" Yes", yes_ids),
-                    ("no", no_ids),
-                    ("No", no_ids),
-                    ("NO", no_ids),
-                    (" no", no_ids),
-                    (" No", no_ids),
-                ):
-                    ids = tokenizer.encode(text, add_special_tokens=False)
-                    if len(ids) == 1:
-                        bucket.add(int(ids[0]))
+                words = request._dynamic_effort.get("level_vote_words")
+                if words:
+                    level_word_ids = vote_word_token_ids(encode, list(words))
+                else:
+                    yes_ids, no_ids = vote_word_token_ids(encode, ["yes", "no"])
+            request._dynamic_effort.pop("meta_prompt", None)
+            request._dynamic_effort.pop("level_vote_words", None)
             request._dynamic_effort["meta_stop_ids"] = sorted(stop_ids)
-            request._dynamic_effort["yes_ids"] = sorted(yes_ids)
-            request._dynamic_effort["no_ids"] = sorted(no_ids)
+            request._dynamic_effort["yes_ids"] = yes_ids
+            request._dynamic_effort["no_ids"] = no_ids
+            if level_word_ids:
+                request._dynamic_effort["level_word_ids"] = level_word_ids
         if think_off_levels:
             # Thinking off is the default rendering plus a closed think block:
             # appended in place, no resubmission (measured identical to the

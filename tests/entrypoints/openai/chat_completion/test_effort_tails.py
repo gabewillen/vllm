@@ -16,11 +16,14 @@ import pytest
 
 from vllm.config import MultiModalConfig
 from vllm.config.reasoning import (
+    LEVEL_VOTE_PROMPT,
+    OFF_VOTE_PROMPT,
     DynamicEffortConfig,
     HiddenEffortConfig,
 )
 from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
     apply_dynamic_effort,
+    vote_word_token_ids,
 )
 from vllm.entrypoints.openai.chat_completion.effort_tails import (
     special_token_cut,
@@ -273,7 +276,129 @@ _CASES = {
         hidden=dict(think_off_level=True, default_level=2),
         kwargs={"preserve_thinking": False},
     ),
+    "level-vote": dict(
+        hidden=dict(think_off_level=True, default_level=2, level_vote=True),
+        kwargs=None,
+    ),
+    "level-vote-no-think-off": dict(
+        hidden=dict(default_level=1, level_vote=True), kwargs=None
+    ),
 }
+
+
+def test_level_vote_words_align_with_levels():
+    """Words derive from the ladder (dropping `none` without think-off) and
+    an explicit list must match the level count."""
+    assert HiddenEffortConfig(
+        enabled=True, think_off_level=True, default_level=1, level_vote=True
+    ).vote_words() == ["none", "brief", "extended"]
+    assert HiddenEffortConfig(enabled=True, level_vote=True).vote_words() == [
+        "brief",
+        "extended",
+    ]
+    assert HiddenEffortConfig(
+        enabled=True, level_vote=True, level_vote_words=["a", "b"]
+    ).vote_words() == ["a", "b"]
+    with pytest.raises(ValueError, match="one word per level"):
+        HiddenEffortConfig(enabled=True, level_vote=True, level_vote_words=["a"])
+    with pytest.raises(ValueError, match="one word per level"):
+        HiddenEffortConfig(
+            enabled=True,
+            level_vote=True,
+            effort_sentences=["a", "b", "c"],
+            level_vote_words=["x", "y"],
+        )
+    with pytest.raises(ValueError, match="distinct"):
+        HiddenEffortConfig(enabled=True, level_vote=True, level_vote_words=["a", "a"])
+
+
+@pytest.mark.parametrize("level_vote", [False, True])
+def test_level_vote_meta_prompt(level_vote: bool):
+    """The meta question is the level prompt with the vote on and the yes/no
+    prompt off; the level variants are byte-identical either way."""
+    cfg = _effort_config(think_off_level=True, default_level=2, level_vote=level_vote)
+    messages = agent_conversation(turns=1, words_per_tool_result=5)
+    request = ChatCompletionRequest(
+        model=BASE_MODEL_PATHS[0].name, messages=messages, reasoning_effort="dynamic"
+    )
+    apply_dynamic_effort(request, cfg)
+    overrides = request._dynamic_effort
+    assert overrides is not None
+    assert overrides["off_votes"] == 3
+    if level_vote:
+        assert overrides["meta_prompt"] == LEVEL_VOTE_PROMPT
+        assert overrides["level_vote_words"] == ["none", "brief", "extended"]
+        assert overrides["level_vote_rule"] == "max"
+    else:
+        assert overrides["meta_prompt"] == OFF_VOTE_PROMPT
+        assert "level_vote_words" not in overrides
+    plain = _effort_config(think_off_level=True, default_level=2)
+    control = ChatCompletionRequest(
+        model=BASE_MODEL_PATHS[0].name, messages=messages, reasoning_effort="dynamic"
+    )
+    apply_dynamic_effort(control, plain)
+    assert control._dynamic_effort_variant_messages == (
+        request._dynamic_effort_variant_messages
+    )
+
+
+def test_level_vote_forced_level_skips_the_vote():
+    """A forced level (think-off included) is rendered directly: no force_off
+    detour through the gate, and the engine sees `forced_level`."""
+    cfg = _effort_config(think_off_level=True, default_level=2, level_vote=True)
+    request = ChatCompletionRequest(
+        model=BASE_MODEL_PATHS[0].name,
+        messages=agent_conversation(turns=1, words_per_tool_result=5),
+        reasoning_effort="dynamic",
+        vllm_xargs={"dynamic_effort_level": 0},
+    )
+    apply_dynamic_effort(request, cfg)
+    overrides = request._dynamic_effort
+    assert overrides is not None
+    assert overrides["forced_level"] == 0 and "force_off" not in overrides
+    assert overrides["default_level"] == 0
+    assert request.chat_template_kwargs == {"enable_thinking": False}
+
+
+def test_vote_word_token_ids_spellings():
+    """Each level's set is the single-token spellings of its word."""
+    encode = lambda text: [hash(text) & 0xFFFF] if " " not in text[1:] else []  # noqa: E731
+    ids = vote_word_token_ids(encode, ["none", "brief"])
+    assert len(ids) == 2
+    for word, bucket in zip(["none", "brief"], ids):
+        spellings = [word, word.capitalize(), word.upper()]
+        expected = {encode(s)[0] for s in spellings} | {
+            encode(" " + s)[0] for s in spellings
+        }
+        assert set(bucket) == expected
+
+
+@pytest.mark.skipif(QWEN3_PATH is None, reason="no local Qwen3 tokenizer")
+def test_level_vote_word_ids_rendered():
+    """The meta tail carries the level prompt and one non-empty answer-id set
+    per level is derived from the tokenizer."""
+    asyncio.run(_check_level_vote_word_ids())
+
+
+async def _check_level_vote_word_ids():
+    cfg = _effort_config(think_off_level=True, default_level=2, level_vote=True)
+    serving = _build_qwen3_serving_chat(cfg)
+    overrides, _ = await _effort_overrides(
+        serving,
+        cfg,
+        agent_conversation(turns=2, words_per_tool_result=20),
+        full_render=False,
+    )
+    tokenizer = serving.renderer.tokenizer
+    assert tokenizer is not None
+    assert LEVEL_VOTE_PROMPT in tokenizer.decode(overrides["meta_tail"])
+    word_ids = overrides["level_word_ids"]
+    assert len(word_ids) == 3 and all(word_ids)
+    assert not set(word_ids[0]) & set(word_ids[1]) & set(word_ids[2])
+    assert overrides["yes_ids"] == [] and overrides["level_vote_rule"] == "max"
+    assert "meta_prompt" not in overrides and "level_vote_words" not in overrides
+    for word, ids in zip(["none", "brief", "extended"], word_ids):
+        assert {tokenizer.decode([i]).strip().lower() for i in ids} == {word}
 
 
 @pytest.mark.parametrize("last_role", ["tool", "user"])

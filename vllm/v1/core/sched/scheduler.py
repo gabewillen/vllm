@@ -113,6 +113,29 @@ resubmission instead of one per vote; mass outside the top entries counts as
 no, like any token that is not a clean yes."""
 
 
+def draw_effort_level(u: float, probs: list[float]) -> int:
+    """Index the uniform draw `u` lands on in the categorical `probs`."""
+    acc = 0.0
+    for level, p in enumerate(probs):
+        acc += p
+        if u < acc:
+            return level
+    return len(probs) - 1
+
+
+def effort_level_vote_verdict(votes: list[int], rule: str, default: int) -> int:
+    """Level the vote rule picks from the drawn levels.
+
+    `max` takes the highest level any draw named; `median` the middle draw.
+    No draws at all is the default level.
+    """
+    if not votes:
+        return default
+    if rule == "median":
+        return sorted(votes)[len(votes) // 2]
+    return max(votes)
+
+
 def adaptive_num_spec_tokens(
     emas: list[float | None],
     max_tokens: int,
@@ -2908,6 +2931,13 @@ class Scheduler(SchedulerInterface):
                             int(i) for i in overrides.get("no_ids") or []
                         }
                         request.effort_off_votes = int(overrides.get("off_votes") or 0)
+                        request.effort_level_word_ids = [
+                            {int(i) for i in ids}
+                            for ids in overrides.get("level_word_ids") or []
+                        ]
+                        request.effort_level_vote_rule = str(
+                            overrides.get("level_vote_rule") or "max"
+                        )
                         request.effort_meta_max_tokens = int(
                             overrides.get("off_vote_max_tokens") or 8
                         )
@@ -3058,6 +3088,17 @@ class Scheduler(SchedulerInterface):
                     decision.spread_rank,
                     query.n_entries,
                 )
+        if (
+            request.effort_level_word_ids
+            and request.effort_seam
+            and request.effort_meta_tail is not None
+            and request.effort_off_votes > 0
+            and not request.effort_force_off
+            and not (memory is not None and memory.cfg.shadow)
+        ):
+            # Level vote: the model names its own level; the memory above
+            # only recorded what it would have said.
+            return self._start_effort_off_vote(request)
         self._effort_level_total[level] = self._effort_level_total.get(level, 0) + 1
         if level == default_level:
             self._effort_default_reason[reason] = (
@@ -3227,6 +3268,124 @@ class Scheduler(SchedulerInterface):
         request.effort_meta_phase = True
         request.effort_meta_tokens = []
         request.effort_meta_votes = []
+        request.effort_level_votes = []
+        assert request.effort_meta_tail is not None
+        return self._resubmit_effort_tail(request, request.effort_meta_tail)
+
+    def _effort_level_tail(self, request: Request, level: int) -> list[int]:
+        """The prompt tail that renders `level`: its own tail, or for the
+        think-off level the default tail plus a closed think block."""
+        tails = request.effort_tail_variants or []
+        if (
+            level == 0
+            and self._effort_cfg is not None
+            and self._effort_cfg.hidden_effort.think_off_level
+            and request.effort_off_append
+        ):
+            default = request.effort_default_level
+            tail = list(tails[default] if default < len(tails) else [])
+            return tail + list(request.effort_off_append)
+        return list(tails[level]) if level < len(tails) else []
+
+    def _finish_effort_level_vote(
+        self, request: Request, probs: list[float] | None
+    ) -> RoutedPromptUpdate:
+        """Apply the vote rule to the drawn levels and render the winner."""
+        params = request.sampling_params
+        if params is not None and request.effort_saved_sampling is not None:
+            params.temperature, params.seed, params.logprobs = (
+                request.effort_saved_sampling
+            )
+            request.effort_saved_sampling = None
+        request.effort_meta_phase = False
+        level = effort_level_vote_verdict(
+            request.effort_level_votes,
+            request.effort_level_vote_rule,
+            request.effort_default_level,
+        )
+        state = self._effort.get(request.request_id)
+        if state is not None:
+            state.level = level
+            state.decided = True
+            state.level_votes = list(request.effort_level_votes)
+            state.vote_probs = (
+                [round(p, 4) for p in probs] if probs is not None else None
+            )
+        self._effort_level_total[level] = self._effort_level_total.get(level, 0) + 1
+        if self._effort_trace_budget > 0:
+            logger.info(
+                "dynamic_effort %s: level vote %s -> %d (%s), probs %s",
+                request.request_id,
+                request.effort_level_votes,
+                level,
+                request.effort_level_vote_rule,
+                state.vote_probs if state is not None else None,
+            )
+        return self._resubmit_effort_tail(
+            request, self._effort_level_tail(request, level)
+        )
+
+    def _step_effort_level_vote(
+        self,
+        request: Request,
+        new_token_ids: list[int],
+        stopped: bool,
+        logprobs: LogprobsLists | None,
+    ) -> RoutedPromptUpdate | None:
+        """Advance the level vote by one step.
+
+        With the first token's logprobs all `off_votes` draws come from its
+        tempered distribution over the levels' answer words; mass on any other
+        token is the default level. Without logprobs each draw is one sampled
+        walk: its first answer token names the level, anything else (a stop
+        id, the token cap, the request stopping) is the default level.
+        """
+        sets = request.effort_level_word_ids
+        default = request.effort_default_level
+        tokens = request.effort_meta_tokens
+        if (
+            logprobs is not None
+            and not tokens
+            and not request.effort_level_votes
+            and (masses := self._effort_vote_masses(request, logprobs, sets))
+            is not None
+        ):
+            probs = list(masses)
+            probs[default] += max(0.0, 1.0 - sum(masses))
+            rng = np.random.default_rng(zlib.crc32(request.request_id.encode()))
+            request.effort_level_votes = [
+                draw_effort_level(float(u), probs)
+                for u in rng.random(request.effort_off_votes)
+            ]
+            if stopped:
+                request.status = RequestStatus.RUNNING
+            return self._finish_effort_level_vote(request, probs)
+        vote: int | None = None
+        done = stopped
+        for tok in new_token_ids:
+            tok = int(tok)
+            named = [i for i, ids in enumerate(sets) if tok in ids]
+            if named:
+                vote, done = named[0], True
+                break
+            if tok in request.effort_meta_stop_ids:
+                done = True
+                break
+            tokens.append(tok)
+            if len(tokens) >= request.effort_meta_max_tokens:
+                done = True
+                break
+        if not done:
+            return None
+        if stopped:
+            request.status = RequestStatus.RUNNING
+        request.effort_level_votes.append(default if vote is None else vote)
+        tokens.clear()
+        if len(request.effort_level_votes) >= request.effort_off_votes:
+            return self._finish_effort_level_vote(request, None)
+        params = request.sampling_params
+        if params is not None:
+            params.seed = len(request.effort_level_votes) + 1
         assert request.effort_meta_tail is not None
         return self._resubmit_effort_tail(request, request.effort_meta_tail)
 
@@ -3283,6 +3442,10 @@ class Scheduler(SchedulerInterface):
         a clean yes counts as no. Any no ends the gate at the resting low
         level; `off_votes` unanimous yeses confirm think-off.
         """
+        if request.effort_level_word_ids:
+            return self._step_effort_level_vote(
+                request, new_token_ids, stopped, logprobs
+            )
         tokens = request.effort_meta_tokens
         if (
             logprobs is not None
@@ -3342,6 +3505,13 @@ class Scheduler(SchedulerInterface):
         need the temperature applied here, processed ones already carry it.
         None when the step returned no usable entries.
         """
+        masses = self._effort_vote_masses(request, logprobs, [request.effort_yes_ids])
+        return None if masses is None else masses[0]
+
+    def _effort_vote_masses(
+        self, request: Request, logprobs: LogprobsLists, sets: list[set[int]]
+    ) -> list[float] | None:
+        """Tempered first-token probability mass of each token set."""
         if len(logprobs.logprobs) == 0:
             return None
         scores: dict[int, float] = {}
@@ -3358,13 +3528,14 @@ class Scheduler(SchedulerInterface):
         )
         top = max(scores.values())
         total = 0.0
-        yes = 0.0
+        masses = [0.0] * len(sets)
         for token_id, score in scores.items():
             weight = math.exp((score - top) * inv_temperature)
             total += weight
-            if token_id in request.effort_yes_ids:
-                yes += weight
-        return yes / total
+            for i, ids in enumerate(sets):
+                if token_id in ids:
+                    masses[i] += weight
+        return [m / total for m in masses]
 
     def _insert_effort_memory(self, request: Request, state: EffortState) -> None:
         """Record a finished request in the memory (§13.4).

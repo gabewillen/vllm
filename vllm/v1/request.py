@@ -215,6 +215,10 @@ class Request:
         self.effort_yes_ids: set[int] = set()
         self.effort_no_ids: set[int] = set()
         self.effort_off_votes = 0
+        # Level vote: one answer-token set per level; the drawn levels.
+        self.effort_level_word_ids: list[set[int]] = []
+        self.effort_level_vote_rule = "max"
+        self.effort_level_votes: list[int] = []
         self.effort_meta_max_tokens = 0
         self.effort_meta_phase = False
         self.effort_meta_tokens: list[int] = []

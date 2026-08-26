@@ -18,7 +18,12 @@ import torch
 
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.config.reasoning import DynamicEffortConfig, HiddenEffortConfig
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.effort_controller import new_effort_state
+from vllm.v1.core.sched.scheduler import (
+    Scheduler,
+    draw_effort_level,
+    effort_level_vote_verdict,
+)
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -331,6 +336,167 @@ def test_off_vote_without_logprobs_samples_each_vote():
         3,
         len(request.effort_tail_variants[2]) + 1,
     ]
+
+
+def test_level_vote_draws_and_rules():
+    """Draws index the categorical by cumulative mass; `max` raises on one
+    draw and lowers only by consensus, `median` takes the middle draw."""
+    probs = [0.2, 0.5, 0.3]
+    assert [draw_effort_level(u, probs) for u in (0.0, 0.19, 0.2, 0.69, 0.7, 1.0)] == [
+        0,
+        0,
+        1,
+        1,
+        2,
+        2,
+    ]
+    assert effort_level_vote_verdict([0, 0, 2], "max", 1) == 2
+    assert effort_level_vote_verdict([0, 0, 0], "max", 1) == 0
+    assert effort_level_vote_verdict([0, 0, 2], "median", 1) == 0
+    assert effort_level_vote_verdict([0, 2, 2], "median", 1) == 2
+    assert effort_level_vote_verdict([], "max", 1) == 1
+
+
+def _level_vote_request(scheduler: Scheduler, rule: str = "max") -> Request:
+    request = _vote_request(scheduler)
+    request.effort_yes_ids = set()
+    request.effort_no_ids = set()
+    request.effort_level_word_ids = [{1}, {2}, {5}]
+    request.effort_level_vote_rule = rule
+    cfg = scheduler._effort_cfg
+    assert cfg is not None
+    scheduler._effort[request.request_id] = new_effort_state(
+        request.request_id, cfg, [], [], request.prompt_token_ids
+    )
+    scheduler._effort[request.request_id].level = 2
+    return request
+
+
+_LEVEL_VOTE_CASES = {
+    # entries -> (level, rendered tail)
+    "none": ({1: 1.0}, 0, "off"),
+    "brief": ({2: 1.0}, 1, [300, 301]),
+    "extended": ({5: 1.0}, 2, "default"),
+    "unparseable": ({9: 1.0}, 2, "default"),
+    "no-mass-in-top": ({9: 0.1}, 2, "default"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_LEVEL_VOTE_CASES))
+def test_level_vote_is_one_resubmission(case: str):
+    """All draws come from the first token's logprobs; the memory decision is
+    bypassed and the voted level's tail is rendered in one resubmission."""
+    entries, expected_level, expected_tail = _LEVEL_VOTE_CASES[case]
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
+    scheduler._effort_cfg = DynamicEffortConfig(
+        hidden_effort=HiddenEffortConfig(
+            enabled=True, think_off_level=True, default_level=2, level_vote=True
+        )
+    )
+    request = _level_vote_request(scheduler)
+    params = request.sampling_params
+    assert params is not None
+    client_sampling = (params.temperature, params.seed, params.logprobs)
+    tails = _count_resubmissions(scheduler)
+
+    # No memory, no vector: the vote still decides.
+    request.effort_decision_pending = True
+    update = scheduler._resolve_effort_decision(request, None)
+    assert update is not None and request.effort_meta_phase
+    _requeue(scheduler, request)
+    assert tails == [request.effort_meta_tail]
+
+    outputs = _vote_step(scheduler, request, entries)
+    [engine_output] = outputs[0].outputs
+    assert engine_output.new_token_ids == []
+    assert engine_output.routed_prompt_update is not None
+    assert len(tails) == 2
+    if expected_tail == "off":
+        expected = list(request.effort_tail_variants[2]) + [400]
+    elif expected_tail == "default":
+        expected = list(request.effort_tail_variants[2])
+    else:
+        expected = expected_tail
+    assert tails[1] == expected
+    assert list(request.prompt_token_ids) == list(request.prompt_token_ids[:70]) + (
+        expected
+    )
+    assert max(request.effort_level_votes) == expected_level
+    assert len(request.effort_level_votes) == 3
+    state = scheduler._effort[request.request_id]
+    report = state.report
+    assert report["level"] == expected_level and report["decided"] == 1
+    assert report["level_votes"] == request.effort_level_votes
+    assert len(report["vote_probs"]) == 3
+    assert sum(report["vote_probs"]) == pytest.approx(1.0, abs=1e-3)
+    if case == "unparseable":
+        assert report["vote_probs"] == [0.0, 0.0, 1.0]
+    assert (params.temperature, params.seed, params.logprobs) == client_sampling
+    assert not request.effort_meta_phase
+    assert request.status == RequestStatus.WAITING
+
+
+def test_level_vote_median_rule():
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
+    scheduler._effort_cfg = DynamicEffortConfig(
+        hidden_effort=HiddenEffortConfig(
+            enabled=True,
+            think_off_level=True,
+            default_level=2,
+            level_vote=True,
+            level_vote_rule="median",
+        )
+    )
+    request = _level_vote_request(scheduler, rule="median")
+    tails = _count_resubmissions(scheduler)
+    request.effort_decision_pending = True
+    scheduler._resolve_effort_decision(request, None)
+    _requeue(scheduler, request)
+    _vote_step(scheduler, request, {1: 0.5, 2: 0.5, 5: 1e-9})
+    votes = request.effort_level_votes
+    assert sorted(votes)[1] == scheduler._effort[request.request_id].level
+    assert tails[1] != [] or votes == [0, 0, 0]
+
+
+def test_level_vote_without_logprobs_samples_each_vote():
+    """Without logprobs each draw is one sampled walk: the first answer token
+    names the level, a stop id is the default level."""
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
+    scheduler._effort_cfg = DynamicEffortConfig(
+        hidden_effort=HiddenEffortConfig(
+            enabled=True, think_off_level=True, default_level=2, level_vote=True
+        )
+    )
+    request = _level_vote_request(scheduler)
+    tails = _count_resubmissions(scheduler)
+    request.effort_decision_pending = True
+    scheduler._resolve_effort_decision(request, None)
+    _requeue(scheduler, request)
+    for sampled in ([1], [3], [2]):
+        _run_step(scheduler, request, sampled)
+    assert request.effort_level_votes == [0, 2, 1]
+    assert scheduler._effort[request.request_id].level == 2
+    assert [len(t) for t in tails] == [3, 3, 3, len(request.effort_tail_variants[2])]
+
+
+def test_forced_off_and_shadow_skip_the_level_vote():
+    """`force_off` keeps the off gate's verdict; shadow renders the default."""
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
+    scheduler._effort_cfg = DynamicEffortConfig(
+        hidden_effort=HiddenEffortConfig(
+            enabled=True, think_off_level=True, default_level=2, level_vote=True
+        )
+    )
+    request = _level_vote_request(scheduler)
+    request.effort_force_off = True
+    request.effort_decision_pending = True
+    update = scheduler._resolve_effort_decision(request, None)
+    assert update is not None
+    assert request.effort_meta_phase and request.effort_level_votes == []
+    _requeue(scheduler, request)
+    _vote_step(scheduler, request, {1: 1.0})
+    assert request.effort_level_votes == [0, 0, 0]
+    assert scheduler._effort[request.request_id].level == 0
 
 
 def test_vote_probability_is_tempered_top_logprob_mass():

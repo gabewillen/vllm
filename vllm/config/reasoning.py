@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field
 
@@ -34,6 +34,17 @@ OFF_VOTE_PROMPT = (
 times at temperature 0.7; only a unanimous yes skips thinking. Measured
 2026-08-23: unanimity-of-3 had zero wrong-offs on the grid, a single vote
 wrongly said yes on arithmetic."""
+
+LEVEL_VOTE_PROMPT = (
+    "How much step-by-step working does the request above need to answer "
+    "correctly? Reply with one word: none, brief, or extended."
+)
+"""The hidden question behind `level_vote`: the model names its own level.
+One word per level, lowest first, aligned with the level sentences."""
+
+DEFAULT_LEVEL_VOTE_WORDS = ["none", "brief", "extended"]
+"""Answer words of `LEVEL_VOTE_PROMPT` for the think-off / low / medium
+ladder; a ladder without a think-off level drops `none`."""
 
 
 @config
@@ -138,6 +149,25 @@ class HiddenEffortConfig:
     fully cached prompt at a different seed."""
     off_vote_max_tokens: int = Field(default=8, ge=1)
     """Cap on one vote's generation; an unclassifiable vote counts as no."""
+    level_vote: bool = False
+    """Let the model choose its own level: the hidden question is
+    `level_vote_prompt` instead of `OFF_VOTE_PROMPT`, its first-token
+    distribution over `level_vote_words` is sampled `off_votes` times at the
+    vote temperature, and `level_vote_rule` picks the level from the draws.
+    The memory still records and reports but no longer decides; a forced
+    level (`vllm_xargs.dynamic_effort_level`) still overrides. Mass on any
+    other token counts as `default_level`, so an unparseable answer never
+    lowers the effort."""
+    level_vote_prompt: str = LEVEL_VOTE_PROMPT
+    """The hidden question `level_vote` asks."""
+    level_vote_words: list[str] | None = None
+    """One answer word per level, lowest first, aligned with `sentences()`.
+    `None` derives them from `DEFAULT_LEVEL_VOTE_WORDS`, dropping `none`
+    when there is no think-off level."""
+    level_vote_rule: Literal["max", "median"] = "max"
+    """`max`: the highest level any draw chose - the level rises on a single
+    draw and only falls by consensus, the same conservatism as the unanimous
+    off gate. `median`: the middle draw."""
 
     def __post_init__(self) -> None:
         if self.q_high < self.q_mid:
@@ -154,6 +184,30 @@ class HiddenEffortConfig:
             )
         if self.think_off_level and self.q_none > self.q_mid:
             raise ValueError("hidden_effort.q_none must be <= q_mid")
+        if self.level_vote:
+            self.vote_words()
+
+    def vote_words(self) -> list[str]:
+        """The `level_vote` answer word of each level, lowest first.
+
+        Raises:
+            ValueError: when the words do not align 1:1 with the levels.
+        """
+        num_levels = len(self.sentences())
+        if self.level_vote_words is not None:
+            words = list(self.level_vote_words)
+        else:
+            words = list(DEFAULT_LEVEL_VOTE_WORDS)
+            if not self.think_off_level:
+                words = words[1:]
+        if len(words) != num_levels:
+            raise ValueError(
+                f"hidden_effort.level_vote_words needs one word per level "
+                f"({num_levels}), got {len(words)}"
+            )
+        if any(not w.strip() for w in words) or len(set(words)) != len(words):
+            raise ValueError("hidden_effort.level_vote_words must be distinct words")
+        return words
 
     def sentences(self) -> list[str | None]:
         """The tail sentence of each effort level, lowest first. `None` is the

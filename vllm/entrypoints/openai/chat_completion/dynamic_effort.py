@@ -19,6 +19,7 @@ is set: on this path the model ends its own think block.
 """
 
 import copy
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from vllm.config.reasoning import (
@@ -128,7 +129,12 @@ def apply_dynamic_effort(
         return
     overrides = build_dynamic_effort_overrides(cfg, request.vllm_xargs)
     forced = overrides.get("forced_level")
-    if forced is not None and cfg.level_sentences[forced] is None and hidden.off_vote:
+    if (
+        forced is not None
+        and cfg.level_sentences[forced] is None
+        and hidden.off_vote
+        and not hidden.level_vote
+    ):
         # A forced think-off still passes through the off-vote gate: run the
         # normal two-phase path and force the verdict in the engine.
         overrides["force_off"] = True
@@ -141,7 +147,13 @@ def apply_dynamic_effort(
     overrides["think_off_levels"] = [
         i for i, sentence in enumerate(cfg.level_sentences) if sentence is None
     ]
-    if overrides["think_off_levels"] and hidden.off_vote:
+    if hidden.level_vote:
+        overrides["meta_prompt"] = hidden.level_vote_prompt
+        overrides["level_vote_words"] = hidden.vote_words()
+        overrides["level_vote_rule"] = hidden.level_vote_rule
+    elif overrides["think_off_levels"] and hidden.off_vote:
+        overrides["meta_prompt"] = OFF_VOTE_PROMPT
+    if "meta_prompt" in overrides:
         overrides["off_votes"] = hidden.off_votes
         overrides["off_vote_max_tokens"] = hidden.off_vote_max_tokens
     if default_level in overrides["think_off_levels"]:
@@ -165,12 +177,29 @@ def render_effort_variants(
     return variants
 
 
-def off_vote_variant(messages: list[Any]) -> list[Any]:
-    """The extra rendering the off gate needs: the hidden yes/no question,
-    rendered thinking-off."""
+def off_vote_variant(messages: list[Any], prompt: str = OFF_VOTE_PROMPT) -> list[Any]:
+    """The extra rendering a hidden vote needs: the question (yes/no for the
+    off gate, the level words for the level vote), rendered thinking-off."""
     meta = copy.deepcopy(messages)
-    append_to_last_message(meta, OFF_VOTE_PROMPT)
+    append_to_last_message(meta, prompt)
     return meta
+
+
+def vote_word_token_ids(
+    encode: Callable[[str], list[int]], words: list[str]
+) -> list[list[int]]:
+    """Single-token spellings of each answer word: as written, Capitalized,
+    UPPER, and each with a leading space."""
+    out: list[list[int]] = []
+    for word in words:
+        ids: set[int] = set()
+        for text in (word, word.capitalize(), word.upper()):
+            for spelled in (text, " " + text):
+                encoded = encode(spelled)
+                if len(encoded) == 1:
+                    ids.add(int(encoded[0]))
+        out.append(sorted(ids))
+    return out
 
 
 def split_body_and_tails(

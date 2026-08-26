@@ -291,6 +291,8 @@ def test_the_report_is_the_level_and_how_it_closed():
         "novelty_rank": None,
         "off_votes": 0,
         "off_vetoed": 0,
+        "level_votes": None,
+        "vote_probs": None,
     }
     info = EffortInfo.from_report(report)
     assert info.level == 1 and info.decided and info.close_kind == CLOSE_NATURAL

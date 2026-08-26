@@ -1223,3 +1223,48 @@ What ships: §13 as described in §13.10, the per-step telemetry of §3, and one
 `decided`, `reasoning_tokens`, `close_kind`, `memory_entries`, `neighbours`).
 `work/effort-finish-report.py` summarises it. §§2c, 11 and 12 above are history
 and describe code that no longer exists; the numbers they record stand.
+
+### 13.12 Level vote — the model names its own level (patch 0026, 2026-08-26)
+
+The memory's level decision maps neighbour difficulty to a level through
+`q_none` / `q_mid` / `q_high`: percentile cuts tuned to one model. The only
+model-calibrated piece of the decision was the off gate - a hidden one-word
+self-assessment (`OFF_VOTE_PROMPT`) with a unanimity rule. `level_vote`
+generalises that gate so the model picks the level itself and the cuts fall
+out of the decision.
+
+- **Config** (`HiddenEffortConfig`): `level_vote: false` (off = today's
+  behaviour, byte-identical prompts). `level_vote_prompt` defaults to
+  `LEVEL_VOTE_PROMPT` ("How much step-by-step working does the request above
+  need to answer correctly? Reply with one word: none, brief, or extended.").
+  `level_vote_words` defaults to `null`: derived from the ladder as
+  `["none", "brief", "extended"]` for the think-off / low / medium ladder,
+  dropping `none` when there is no think-off level, so the words align 1:1
+  with `sentences()` (a mismatch is a config error). `level_vote_rule` is
+  `max` (the highest level any draw chose: raise freely, lower only by
+  consensus - the same conservatism as the unanimous off gate) or `median`
+  (the middle draw). The draw count is `off_votes` (3).
+- **Rendering**: the meta variant carries `level_vote_prompt` instead of
+  `OFF_VOTE_PROMPT` through the same mechanism (trailing user message,
+  thinking off). The frontend derives one answer-token set per level the
+  way `yes_ids` / `no_ids` are built (word, Capitalized, UPPER, each with a
+  leading space; single-token spellings only) and passes them as
+  `level_word_ids`, with the rule and count, in `request._dynamic_effort`.
+- **Engine**: after the body prefill the memory is still queried (it records
+  and learns and its estimate is still reported), but its level is not used.
+  The meta question is resubmitted once; the first token's top logprobs are
+  tempered at 0.7 and the categorical over levels is each set's summed mass,
+  with everything outside every set - and the mass past the top-20 - counted
+  as `default_level`, so an unparseable answer never lowers effort. `off_votes`
+  draws are taken from a per-request seeded RNG, the rule is applied, and the
+  chosen level's tail is spliced at the seam (`none` = default tail plus a
+  closed think block, exactly as the off gate renders it). Without logprobs
+  each draw is one sampled walk, as before. `vllm_xargs.dynamic_effort_level`
+  renders the forced level directly (no `force_off` detour); `force_off` and
+  `shadow` skip the vote.
+- **Telemetry** (`dynamic` block): `level_votes` (the drawn levels, in draw
+  order), `vote_probs` (per-level probability, 4 dp), `decided` = 1.
+  Cardinality: both are fixed-length lists of at most `num_levels`.
+- **Ablation**: the prod yaml keeps its committed reasoning-config; the line
+  next to it shows the same config with `"level_vote": true`. Not measured at
+  the time of writing.

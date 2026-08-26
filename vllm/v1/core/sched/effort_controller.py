@@ -69,6 +69,10 @@ class EffortState:
     """Yes votes collected by the off gate before its verdict."""
     off_vetoed: bool = False
     """True when the off gate demoted a think-off verdict to low."""
+    level_votes: list[int] | None = None
+    """Levels the level vote drew, in draw order."""
+    vote_probs: list[float] | None = None
+    """Per-level first-token probability the level vote drew from."""
     spread: float | None = None
     neighbours: int = 0
     memory_entries: int = 0
@@ -98,6 +102,8 @@ class EffortState:
             "novelty_rank": self.novelty_rank,
             "off_votes": self.off_votes,
             "off_vetoed": int(self.off_vetoed),
+            "level_votes": self.level_votes,
+            "vote_probs": self.vote_probs,
         }
 
 
