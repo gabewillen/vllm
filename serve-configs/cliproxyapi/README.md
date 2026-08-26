@@ -130,6 +130,37 @@ instruction, returns the text as one `compaction` item (`encrypted_content` =
 later turns. Verified against vLLM Qwen: summary produced, replay answered
 from it. Only the openai-compatibility path is affected.
 
+## xAI tool schema normalization (fork, 2026-08-26)
+
+Codex Desktop on `grok-4.6` got `400 invalid_client_tool_schema
+mcp__codex_app__automation_update: tool parameter root must be an object
+type` from xAI's cli-chat-proxy on every turn. That tool's `parameters` is
+`{"type":"object","oneOf":[{"$ref":"#/$defs/..."},...],"$defs":{...}}`;
+upstream CPA only special-cased the `codex_app` namespace by name (Codex now
+sends `mcp__codex_app`) and stamped `"type":"object"` onto the `$ref`
+branches, which xAI still rejects. Fork commit `960be823` (same branch
+`feat/compat-responses-compaction`, image `cli-proxy-api:compaction`)
+replaces that with a general normalizer in
+`internal/runtime/executor/xai_tool_schema.go`, applied to every function
+tool on the xAI path (`/v1/responses`, the responses websocket, and
+`/v1/chat/completions`):
+
+- root `type: object` with inline object union branches: add missing
+  `type: object` to the branches, keep constraints (upstream behaviour);
+- root union whose branches all resolve (following local `$ref`) to objects:
+  merge into one object with the union of their properties, no `required`,
+  `$defs` kept (this is the Codex automation_update case);
+- anything else (missing/scalar/array root type, a non-object branch): wrap
+  the original schema as `{"type":"object","properties":{"input":<schema>},
+  "required":["input"]}`; wrapped tool names are tracked per request and the
+  `{"input":...}` in returned `function_call.arguments` is unwrapped in
+  `response.output_item.done` and terminal `response.*` payloads (the
+  `function_call_arguments.delta/done` events stay wrapped).
+
+Verified: the real Codex schema returns 200 on both endpoints (was 400), a
+forced call on the merged tool yields `{"id":"abc123","mode":"view"}`, and a
+forced call on a wrapped `anyOf[object,string]` tool yields `{"a":"hello"}`.
+
 ## Egress isolation
 Container runs on its own bridge `cliproxy-net` (172.30.0.0/24, `docker network
 create --subnet 172.30.0.0/24 cliproxy-net`). `firewall.sh` (installed at
