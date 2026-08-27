@@ -36,8 +36,8 @@ times at temperature 0.7; only a unanimous yes skips thinking. Measured
 wrongly said yes on arithmetic."""
 
 LEVEL_VOTE_PROMPT = (
-    "How much step-by-step working does the request above need to answer "
-    "correctly? Reply with one word: none, brief, or extended."
+    "How much step-by-step working does your next response need to be "
+    "correct? Reply with one word: none, brief, or extended."
 )
 """The hidden question behind `level_vote`: the model names its own level.
 One word per level, lowest first, aligned with the level sentences."""

@@ -1235,8 +1235,13 @@ out of the decision.
 
 - **Config** (`HiddenEffortConfig`): `level_vote: false` (off = today's
   behaviour, byte-identical prompts). `level_vote_prompt` defaults to
-  `LEVEL_VOTE_PROMPT` ("How much step-by-step working does the request above
-  need to answer correctly? Reply with one word: none, brief, or extended.").
+  `LEVEL_VOTE_PROMPT` ("How much step-by-step working does your next response
+  need to be correct? Reply with one word: none, brief, or extended." - the
+  winner of a 63-wording screen on 2026-08-27: 10-11/11 on the grid's
+  ground-truth minimum level with no over-efforts, and the only framing whose
+  estimate moves through an agent loop; "the request above" framings rate every
+  tool-loop turn extended, difficulty/steps/percent framings are flat or
+  inverted, and any "minimum"/"lowest" qualifier pushes answers up).
   `level_vote_words` defaults to `null`: derived from the ladder as
   `["none", "brief", "extended"]` for the think-off / low / medium ladder,
   dropping `none` when there is no think-off level, so the words align 1:1
