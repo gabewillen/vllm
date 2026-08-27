@@ -52,6 +52,8 @@ openai-compatibility:
         alias: ""
       - name: glm-5.3
         alias: ""
+        thinking:
+          levels: [ "low", "high", "max" ]
       - name: glm-5.3-flash
         alias: ""
         max-context-length: 1000000
