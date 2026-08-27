@@ -50,6 +50,8 @@ openai-compatibility:
         alias: ""
       - name: glm-5.3
         alias: ""
+      - name: glm-5.3-flash
+        alias: ""
       - name: ox-alpha-free
         alias: ""
       - name: glm-5.1
