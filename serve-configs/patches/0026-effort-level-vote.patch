@@ -491,7 +491,7 @@ index a706d84dbc..08e467f64d 100644
      scheduler = create_scheduler(block_size=BLOCK_SIZE)
      [request] = create_requests(num_requests=1, num_tokens=8, block_size=BLOCK_SIZE)
 diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
-index dc4ee38253..eb2858bf12 100644
+index dc4ee38253..f19c3d6774 100644
 --- a/vllm/config/reasoning.py
 +++ b/vllm/config/reasoning.py
 @@ -2,7 +2,7 @@
@@ -508,8 +508,8 @@ index dc4ee38253..eb2858bf12 100644
  wrongly said yes on arithmetic."""
  
 +LEVEL_VOTE_PROMPT = (
-+    "How much step-by-step working does the request above need to answer "
-+    "correctly? Reply with one word: none, brief, or extended."
++    "How much step-by-step working does your next response need to be "
++    "correct? Reply with one word: none, brief, or extended."
 +)
 +"""The hidden question behind `level_vote`: the model names its own level.
 +One word per level, lowest first, aligned with the level sentences."""
