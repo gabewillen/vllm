@@ -104,6 +104,11 @@ class HiddenEffortConfig:
     memory, so a restart starts cold."""
     flush_every: int = Field(default=256, ge=0)
     """Inserts between two writes of `memory_path`; 0 disables."""
+    dataset_path: str | None = None
+    """Directory the training-data collector (§13.13) writes one example per
+    decided request to, as `shard-*.npz`. `None` (default) collects nothing."""
+    dataset_shard_size: int = Field(default=4096, ge=1)
+    """Examples per dataset shard; the open shard is written at shutdown."""
     split_min_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
     """Safety net: the fraction of the prompt the body must cover before the
     split is made at all. The effort sentence sits at the very tail of the

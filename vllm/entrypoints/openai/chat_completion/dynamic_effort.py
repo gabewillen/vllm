@@ -26,6 +26,7 @@ from vllm.config.reasoning import (
     OFF_VOTE_PROMPT,
     DynamicEffortConfig,
 )
+from vllm.v1.core.sched.effort_dataset import TAG_MAX_LEN
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     )
 
 _LEVEL_KEY = "dynamic_effort_level"
+_TAG_KEY = "effort_tag"
 
 
 class DynamicEffortError(ValueError):
@@ -54,6 +56,15 @@ def build_dynamic_effort_overrides(
                 f"vllm_xargs.{_LEVEL_KEY} must be in [0, {cfg.num_levels - 1}]"
             )
         overrides["forced_level"] = raw
+    if _TAG_KEY in xargs and xargs[_TAG_KEY] is not None:
+        tag = xargs[_TAG_KEY]
+        if not isinstance(tag, str):
+            raise DynamicEffortError(f"vllm_xargs.{_TAG_KEY} must be a string")
+        if len(tag) > TAG_MAX_LEN:
+            raise DynamicEffortError(
+                f"vllm_xargs.{_TAG_KEY} must be at most {TAG_MAX_LEN} characters"
+            )
+        overrides["tag"] = tag
     return overrides
 
 

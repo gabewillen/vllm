@@ -1,0 +1,821 @@
+diff --git a/tests/entrypoints/openai/chat_completion/test_effort_tails.py b/tests/entrypoints/openai/chat_completion/test_effort_tails.py
+index 6d2dc3284d..eecd46ade4 100644
+--- a/tests/entrypoints/openai/chat_completion/test_effort_tails.py
++++ b/tests/entrypoints/openai/chat_completion/test_effort_tails.py
+@@ -22,6 +22,7 @@ from vllm.config.reasoning import (
+     HiddenEffortConfig,
+ )
+ from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
++    DynamicEffortError,
+     apply_dynamic_effort,
+     vote_word_token_ids,
+ )
+@@ -342,6 +343,29 @@ def test_level_vote_meta_prompt(level_vote: bool):
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    "tag, ok",
++    [("cattrs/task-3", True), ("x" * 128, True), ("x" * 129, False), (7, False)],
++)
++def test_effort_tag_validation(tag, ok):
++    """`vllm_xargs.effort_tag` labels the dataset example: a string of at
++    most 128 characters, passed to the engine as `tag`."""
++    cfg = _effort_config()
++    request = ChatCompletionRequest(
++        model=BASE_MODEL_PATHS[0].name,
++        messages=agent_conversation(turns=1, words_per_tool_result=5),
++        reasoning_effort="dynamic",
++        vllm_xargs={"effort_tag": tag},
++    )
++    if not ok:
++        with pytest.raises(DynamicEffortError, match="effort_tag"):
++            apply_dynamic_effort(request, cfg)
++        return
++    apply_dynamic_effort(request, cfg)
++    assert request._dynamic_effort is not None
++    assert request._dynamic_effort["tag"] == tag
++
++
+ def test_level_vote_forced_level_skips_the_vote():
+     """A forced level (think-off included) is rendered directly: no force_off
+     detour through the gate, and the engine sees `forced_level`."""
+diff --git a/tests/v1/core/test_effort_dataset.py b/tests/v1/core/test_effort_dataset.py
+new file mode 100644
+index 0000000000..df4576f61f
+--- /dev/null
++++ b/tests/v1/core/test_effort_dataset.py
+@@ -0,0 +1,122 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The dynamic-effort training-data collector (docs §13.13)."""
++
++import math
++
++import numpy as np
++import pytest
++
++from vllm.v1.core.sched.effort_dataset import (
++    ABORTED,
++    EffortDatasetWriter,
++    load_dataset,
++    main,
++    shard_paths,
++)
++
++pytestmark = pytest.mark.cpu_test
++
++HIDDEN = 8
++
++
++def _finish_kwargs(**over):
++    base = dict(
++        level=1,
++        decided_by="vote",
++        vote_probs=[0.1, 0.7, 0.2],
++        level_votes=[1, 1, 2],
++        estimate=0.4,
++        calibrated=0.5,
++        novelty_rank=0.3,
++        neighbours=16,
++        reasoning_tokens=120,
++        num_output_tokens=200,
++        close_kind="natural",
++        finish_reason="stop",
++    )
++    base.update(over)
++    return base
++
++
++def _vector(seed: int) -> np.ndarray:
++    return np.random.default_rng(seed).standard_normal(HIDDEN).astype(np.float32)
++
++
++def test_shards_rotate_and_round_trip(tmp_path):
++    """`shard_size` finished examples make one shard; every field survives
++    the trip through npz, including NaN-padded vote columns."""
++    writer = EffortDatasetWriter(str(tmp_path), HIDDEN, shard_size=2)
++    for i in range(5):
++        assert writer.begin(f"r{i}", _vector(i), 100 + i, 70, tag="job-a")
++        kwargs = _finish_kwargs()
++        if i == 4:
++            kwargs.update(vote_probs=None, level_votes=None, decided_by="memory")
++        assert writer.finish(f"r{i}", **kwargs)
++    writer.close()
++    assert writer.num_written == 5 and writer.num_dropped == 0
++    assert len(shard_paths(str(tmp_path))) == 3
++
++    data = load_dataset(str(tmp_path))
++    assert data["req_id"].tolist() == [f"r{i}" for i in range(5)]
++    assert data["vector"].dtype == np.float16 and data["vector"].shape == (5, HIDDEN)
++    np.testing.assert_allclose(data["vector"][3], _vector(3), rtol=1e-2)
++    assert data["level"].tolist() == [1] * 5
++    assert data["decided_by"].tolist() == ["vote"] * 4 + ["memory"]
++    assert data["vote_probs"].shape == (5, 3)
++    assert data["vote_probs"][0].tolist() == pytest.approx([0.1, 0.7, 0.2])
++    assert all(math.isnan(p) for p in data["vote_probs"][4])
++    assert data["level_votes"][4].tolist() == [-1, -1, -1]
++    assert data["tag"].tolist() == ["job-a"] * 5
++    assert data["num_prompt_tokens"].tolist() == [100, 101, 102, 103, 104]
++    assert data["reasoning_tokens"].tolist() == [120] * 5
++    assert data["finish_reason"].tolist() == ["stop"] * 5
++
++
++def test_abort_and_pending_at_close(tmp_path):
++    """An aborted request is written as `aborted`; a request still pending at
++    close is flushed the same way; `forget` drops it silently."""
++    writer = EffortDatasetWriter(str(tmp_path), HIDDEN, shard_size=100)
++    writer.begin("done", _vector(1), 50, 30)
++    writer.begin("aborted", _vector(2), 50, 30)
++    writer.begin("forgotten", _vector(3), 50, 30)
++    writer.begin("pending", _vector(4), 50, 30)
++    writer.finish("done", **_finish_kwargs())
++    writer.finish(
++        "aborted",
++        **_finish_kwargs(finish_reason=None, close_kind="client-limit"),
++    )
++    writer.forget("forgotten")
++    assert not writer.finish("never-begun", **_finish_kwargs())
++    assert writer.num_pending == 1
++    writer.close()
++    data = load_dataset(str(tmp_path))
++    assert data["req_id"].tolist() == ["done", "aborted", "pending"]
++    assert data["finish_reason"].tolist() == ["stop", ABORTED, ABORTED]
++    assert data["level"].tolist() == [1, 1, -1]
++
++
++def test_wrong_width_and_full_buffer_drop(tmp_path):
++    writer = EffortDatasetWriter(str(tmp_path), HIDDEN, shard_size=1000, max_buffered=2)
++    assert not writer.begin("bad", np.zeros(HIDDEN + 1), 10, 5)
++    for i in range(3):
++        writer.begin(f"r{i}", _vector(i), 10, 5)
++    assert writer.finish("r0", **_finish_kwargs())
++    assert writer.finish("r1", **_finish_kwargs())
++    assert not writer.finish("r2", **_finish_kwargs())
++    assert writer.num_dropped == 1
++    writer.close()
++    assert len(load_dataset(str(tmp_path))["req_id"]) == 2
++
++
++def test_empty_directory_and_cli(tmp_path, capsys):
++    assert len(load_dataset(str(tmp_path))["req_id"]) == 0
++    writer = EffortDatasetWriter(str(tmp_path), HIDDEN)
++    writer.begin("r", _vector(0), 10, 5, tag="t1")
++    writer.finish("r", **_finish_kwargs())
++    writer.close()
++    assert main([str(tmp_path)]) == 0
++    out = capsys.readouterr().out
++    assert "1 examples in 1 shards" in out
++    assert "level: 1=1" in out and "t1=1" in out
++    assert main([]) == 2
+diff --git a/tests/v1/core/test_effort_resubmission.py b/tests/v1/core/test_effort_resubmission.py
+index 08e467f64d..d665efa09d 100644
+--- a/tests/v1/core/test_effort_resubmission.py
++++ b/tests/v1/core/test_effort_resubmission.py
+@@ -20,6 +20,7 @@ from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
+ from vllm.config.reasoning import DynamicEffortConfig, HiddenEffortConfig
+ from vllm.sampling_params import RequestOutputKind
+ from vllm.v1.core.sched.effort_controller import new_effort_state
++from vllm.v1.core.sched.effort_dataset import EffortDatasetWriter, load_dataset
+ from vllm.v1.core.sched.scheduler import (
+     Scheduler,
+     draw_effort_level,
+@@ -563,3 +564,47 @@ def test_vote_probability_is_tempered_top_logprob_mass():
+     weights = {t: p ** (1 / 0.7) for t, p in {1: 0.5, 2: 0.3, 5: 0.1}.items()}
+     expected = (weights[1] + weights[5]) / sum(weights.values())
+     assert p_yes == pytest.approx(expected, rel=1e-5)
++
++
++def test_dataset_example_per_decided_request(tmp_path):
++    """A request that reached the seam, voted and finished leaves exactly one
++    example: the vector the decision saw, the voted level and the tag."""
++    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
++    scheduler._effort_cfg = DynamicEffortConfig(
++        hidden_effort=HiddenEffortConfig(
++            enabled=True, think_off_level=True, default_level=2, level_vote=True
++        )
++    )
++    hidden = 6
++    scheduler._effort_dataset = EffortDatasetWriter(str(tmp_path), hidden, shard_size=1)
++    request = _level_vote_request(scheduler)
++    assert request.sampling_params is not None
++    request.sampling_params.extra_args = {"dynamic_effort": {"tag": "bench/7"}}
++    vector = np.arange(hidden, dtype=np.float32) / 4
++
++    request.effort_decision_pending = True
++    assert scheduler._resolve_effort_decision(request, vector) is not None
++    _requeue(scheduler, request)
++    assert scheduler._effort_dataset.num_pending == 1
++    _vote_step(scheduler, request, {2: 1.0})
++    state = scheduler._effort[request.request_id]
++    assert state.level == 1 and state.level_votes is not None
++
++    state.reasoning_tokens = 33
++    request.status = RequestStatus.FINISHED_STOPPED
++    scheduler._free_request(request)
++    assert scheduler._effort_dataset.num_pending == 0
++    scheduler._effort_dataset.close()
++
++    data = load_dataset(str(tmp_path))
++    assert data["req_id"].tolist() == [request.request_id]
++    np.testing.assert_array_equal(data["vector"][0].astype(np.float32), vector)
++    assert data["level"].tolist() == [1]
++    assert data["decided_by"].tolist() == ["vote"]
++    assert data["level_votes"][0].tolist() == [1, 1, 1]
++    assert data["vote_probs"][0].tolist() == pytest.approx([0.0, 1.0, 0.0])
++    assert data["tag"].tolist() == ["bench/7"]
++    assert data["reasoning_tokens"].tolist() == [33]
++    assert data["finish_reason"].tolist() == ["stop"]
++    assert data["body_len"].tolist() == [request.effort_body_len]
++    assert np.isnan(data["estimate"][0]) and data["neighbours"][0] == -1
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index f19c3d6774..1ef11b3852 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -104,6 +104,11 @@ class HiddenEffortConfig:
+     memory, so a restart starts cold."""
+     flush_every: int = Field(default=256, ge=0)
+     """Inserts between two writes of `memory_path`; 0 disables."""
++    dataset_path: str | None = None
++    """Directory the training-data collector (§13.13) writes one example per
++    decided request to, as `shard-*.npz`. `None` (default) collects nothing."""
++    dataset_shard_size: int = Field(default=4096, ge=1)
++    """Examples per dataset shard; the open shard is written at shutdown."""
+     split_min_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
+     """Safety net: the fraction of the prompt the body must cover before the
+     split is made at all. The effort sentence sits at the very tail of the
+diff --git a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+index 4ad4f2bc22..187817216a 100644
+--- a/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
++++ b/vllm/entrypoints/openai/chat_completion/dynamic_effort.py
+@@ -26,6 +26,7 @@ from vllm.config.reasoning import (
+     OFF_VOTE_PROMPT,
+     DynamicEffortConfig,
+ )
++from vllm.v1.core.sched.effort_dataset import TAG_MAX_LEN
+ 
+ if TYPE_CHECKING:
+     from vllm.entrypoints.openai.chat_completion.protocol import (
+@@ -33,6 +34,7 @@ if TYPE_CHECKING:
+     )
+ 
+ _LEVEL_KEY = "dynamic_effort_level"
++_TAG_KEY = "effort_tag"
+ 
+ 
+ class DynamicEffortError(ValueError):
+@@ -54,6 +56,15 @@ def build_dynamic_effort_overrides(
+                 f"vllm_xargs.{_LEVEL_KEY} must be in [0, {cfg.num_levels - 1}]"
+             )
+         overrides["forced_level"] = raw
++    if _TAG_KEY in xargs and xargs[_TAG_KEY] is not None:
++        tag = xargs[_TAG_KEY]
++        if not isinstance(tag, str):
++            raise DynamicEffortError(f"vllm_xargs.{_TAG_KEY} must be a string")
++        if len(tag) > TAG_MAX_LEN:
++            raise DynamicEffortError(
++                f"vllm_xargs.{_TAG_KEY} must be at most {TAG_MAX_LEN} characters"
++            )
++        overrides["tag"] = tag
+     return overrides
+ 
+ 
+diff --git a/vllm/v1/core/sched/effort_dataset.py b/vllm/v1/core/sched/effort_dataset.py
+new file mode 100644
+index 0000000000..910a8ca345
+--- /dev/null
++++ b/vllm/v1/core/sched/effort_dataset.py
+@@ -0,0 +1,388 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""On-disk examples for a future hidden-state effort classifier (§13.13).
++
++Every dynamic-effort request that reached the §13.3 seam contributes one
++example: the pooled last-prompt-token hidden state the memory keys on, the
++level that was chosen and who chose it, and what the request then spent.
++Examples are buffered by the scheduler and written by a background thread as
++`shard-<pid>-<start_ts>-<seq>.npz` files, so the scheduler loop never waits on
++the disk; a stalled or full disk drops examples with a warning.
++"""
++
++import contextlib
++import glob
++import math
++import os
++import sys
++import tempfile
++import threading
++import time
++from collections import deque
++from typing import Any
++
++import numpy as np
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++DECIDED_BY = ("default", "memory", "vote", "forced")
++"""Who chose the level: the server default, the kNN memory, the level vote,
++or the client (`dynamic_effort_level` / `force_off`)."""
++
++ABORTED = "aborted"
++"""`finish_reason` of an example whose request never finished: an abort, or a
++request still pending at shutdown."""
++
++TAG_MAX_LEN = 128
++"""Longest `vllm_xargs.effort_tag` accepted."""
++
++_SCALAR_FIELDS: dict[str, Any] = {
++    "req_id": str,
++    "ts": np.float64,
++    "num_prompt_tokens": np.int32,
++    "body_len": np.int32,
++    "level": np.int16,
++    "decided_by": str,
++    "estimate": np.float32,
++    "calibrated": np.float32,
++    "novelty_rank": np.float32,
++    "neighbours": np.int32,
++    "reasoning_tokens": np.int32,
++    "num_output_tokens": np.int32,
++    "close_kind": str,
++    "finish_reason": str,
++    "tag": str,
++}
++_MATRIX_FIELDS = ("vector", "vote_probs", "level_votes")
++FIELDS = tuple(_SCALAR_FIELDS) + _MATRIX_FIELDS
++
++
++def _float(value: float | None) -> float:
++    return math.nan if value is None else float(value)
++
++
++def _pad_rows(rows: list[list[float]], width: int, fill: float, dtype) -> np.ndarray:
++    out = np.full((len(rows), width), fill, dtype=dtype)
++    for i, row in enumerate(rows):
++        out[i, : len(row)] = row[:width]
++    return out
++
++
++def example_nbytes(hidden_size: int, num_levels: int = 3) -> int:
++    """Approximate on-disk bytes of one example (the vector dominates)."""
++    return hidden_size * 2 + num_levels * 6 + 128
++
++
++class EffortDatasetWriter:
++    """Buffers examples per request and writes shards from a background thread.
++
++    Args:
++        directory: where the shards go; created on first use.
++        hidden_size: width of the pooled vector; other widths are rejected.
++        shard_size: examples per shard; the pending shard is also written at
++            `close()`.
++        max_buffered: examples held for the writer thread before new ones
++            are dropped (the disk is slow or full).
++    """
++
++    def __init__(
++        self,
++        directory: str,
++        hidden_size: int,
++        shard_size: int = 4096,
++        max_buffered: int | None = None,
++    ) -> None:
++        self.directory = directory
++        self.hidden_size = int(hidden_size)
++        self.shard_size = max(int(shard_size), 1)
++        self.max_buffered = (
++            4 * self.shard_size if max_buffered is None else int(max_buffered)
++        )
++        self._pending: dict[str, dict[str, Any]] = {}
++        self._queue: deque[dict[str, Any]] = deque()
++        self._lock = threading.Lock()
++        self._wake = threading.Event()
++        self._stop = False
++        self._seq = 0
++        self._start_ts = int(time.time())
++        self.num_written = 0
++        self.num_dropped = 0
++        self.num_shards = 0
++        self._thread = threading.Thread(
++            target=self._run, name="effort-dataset", daemon=True
++        )
++        self._thread.start()
++
++    @property
++    def num_pending(self) -> int:
++        return len(self._pending)
++
++    def begin(
++        self,
++        req_id: str,
++        vector: np.ndarray,
++        num_prompt_tokens: int,
++        body_len: int,
++        tag: str | None = None,
++    ) -> bool:
++        """Open the example at the seam, with the vector the decision saw."""
++        vec = np.asarray(vector).reshape(-1)
++        if vec.shape[0] != self.hidden_size:
++            logger.warning_once(
++                "effort dataset: vector width %d != hidden_size %d; not recorded",
++                vec.shape[0],
++                self.hidden_size,
++            )
++            return False
++        self._pending[req_id] = {
++            "req_id": req_id,
++            "ts": time.time(),
++            "vector": vec.astype(np.float16),
++            "num_prompt_tokens": int(num_prompt_tokens),
++            "body_len": int(body_len),
++            "tag": tag or "",
++        }
++        return True
++
++    def finish(
++        self,
++        req_id: str,
++        *,
++        level: int,
++        decided_by: str,
++        vote_probs: list[float] | None,
++        level_votes: list[int] | None,
++        estimate: float | None,
++        calibrated: float | None,
++        novelty_rank: float | None,
++        neighbours: int | None,
++        reasoning_tokens: int,
++        num_output_tokens: int,
++        close_kind: str,
++        finish_reason: str | None,
++    ) -> bool:
++        """Complete the example and hand it to the writer thread.
++
++        Returns False when the request never reached `begin` or the buffer
++        is full (the example is dropped and counted).
++        """
++        example = self._pending.pop(req_id, None)
++        if example is None:
++            return False
++        assert decided_by in DECIDED_BY, decided_by
++        example.update(
++            level=int(level),
++            decided_by=decided_by,
++            vote_probs=[_float(p) for p in vote_probs] if vote_probs else [],
++            level_votes=[int(v) for v in level_votes] if level_votes else [],
++            estimate=_float(estimate),
++            calibrated=_float(calibrated),
++            novelty_rank=_float(novelty_rank),
++            neighbours=-1 if neighbours is None else int(neighbours),
++            reasoning_tokens=int(reasoning_tokens),
++            num_output_tokens=int(num_output_tokens),
++            close_kind=close_kind,
++            finish_reason=finish_reason or ABORTED,
++        )
++        with self._lock:
++            if len(self._queue) >= self.max_buffered:
++                self.num_dropped += 1
++                logger.warning_once(
++                    "effort dataset: %d examples buffered and the writer has not "
++                    "caught up; dropping (is %s slow or full?)",
++                    len(self._queue),
++                    self.directory,
++                )
++                return False
++            self._queue.append(example)
++            ready = len(self._queue) >= self.shard_size
++        if ready:
++            self._wake.set()
++        return True
++
++    def forget(self, req_id: str) -> None:
++        """Drop a pending example without writing it."""
++        self._pending.pop(req_id, None)
++
++    def close(self, timeout: float = 30.0) -> None:
++        """Write pending requests as aborted, flush, and stop the thread."""
++        for req_id in list(self._pending):
++            self.finish(
++                req_id,
++                level=-1,
++                decided_by="default",
++                vote_probs=None,
++                level_votes=None,
++                estimate=None,
++                calibrated=None,
++                novelty_rank=None,
++                neighbours=None,
++                reasoning_tokens=0,
++                num_output_tokens=0,
++                close_kind="",
++                finish_reason=ABORTED,
++            )
++        self._stop = True
++        self._wake.set()
++        self._thread.join(timeout)
++        if self._thread.is_alive():
++            logger.warning("effort dataset: writer thread did not finish in time")
++
++    def flush(self) -> None:
++        """Write everything buffered now (test / shutdown helper)."""
++        while True:
++            with self._lock:
++                if not self._queue:
++                    return
++                batch = [self._queue.popleft() for _ in range(len(self._queue))]
++            self._write_shard(batch)
++
++    def _run(self) -> None:
++        while not self._stop:
++            self._wake.wait(timeout=1.0)
++            self._wake.clear()
++            self._drain(final=False)
++        self._drain(final=True)
++
++    def _drain(self, final: bool) -> None:
++        while True:
++            with self._lock:
++                n = len(self._queue)
++                if n == 0 or (n < self.shard_size and not final):
++                    return
++                batch = [self._queue.popleft() for _ in range(min(n, self.shard_size))]
++            self._write_shard(batch)
++
++    def _write_shard(self, batch: list[dict[str, Any]]) -> None:
++        try:
++            arrays = self._pack(batch)
++            os.makedirs(self.directory, exist_ok=True)
++            name = f"shard-{os.getpid()}-{self._start_ts}-{self._seq:05d}.npz"
++            self._seq += 1
++            fd, tmp = tempfile.mkstemp(dir=self.directory, suffix=".npz")
++            try:
++                with os.fdopen(fd, "wb") as f:
++                    np.savez(f, **arrays)
++                os.replace(tmp, os.path.join(self.directory, name))
++            except BaseException:
++                with contextlib.suppress(OSError):
++                    os.unlink(tmp)
++                raise
++            self.num_written += len(batch)
++            self.num_shards += 1
++        except Exception as exc:  # noqa: BLE001
++            self.num_dropped += len(batch)
++            logger.warning(
++                "effort dataset: dropped %d examples, write to %s failed: %s",
++                len(batch),
++                self.directory,
++                exc,
++            )
++
++    def _pack(self, batch: list[dict[str, Any]]) -> dict[str, np.ndarray]:
++        arrays: dict[str, np.ndarray] = {}
++        for name, dtype in _SCALAR_FIELDS.items():
++            values = [ex[name] for ex in batch]
++            arrays[name] = (
++                np.asarray(values) if dtype is str else np.asarray(values, dtype=dtype)
++            )
++        arrays["vector"] = np.stack([ex["vector"] for ex in batch]).astype(np.float16)
++        probs = [ex["vote_probs"] for ex in batch]
++        votes = [ex["level_votes"] for ex in batch]
++        arrays["vote_probs"] = _pad_rows(
++            probs, max((len(p) for p in probs), default=0), math.nan, np.float32
++        )
++        arrays["level_votes"] = _pad_rows(
++            votes, max((len(v) for v in votes), default=0), -1, np.int16
++        )
++        return arrays
++
++
++def shard_paths(directory: str) -> list[str]:
++    return sorted(glob.glob(os.path.join(directory, "shard-*.npz")))
++
++
++def load_dataset(directory: str) -> dict[str, np.ndarray]:
++    """Concatenate every shard under `directory` into one dict of arrays.
++
++    Ragged `vote_probs` / `level_votes` widths are padded (NaN / -1) to the
++    widest shard. An empty directory yields empty arrays.
++    """
++    parts: dict[str, list[np.ndarray]] = {name: [] for name in FIELDS}
++    for path in shard_paths(directory):
++        with np.load(path, allow_pickle=False) as npz:
++            for name in FIELDS:
++                parts[name].append(npz[name])
++    out: dict[str, np.ndarray] = {}
++    for name, chunks in parts.items():
++        if not chunks:
++            out[name] = np.zeros((0,), dtype=np.float32)
++            continue
++        if name in ("vote_probs", "level_votes"):
++            width = max(c.shape[1] for c in chunks)
++            fill = math.nan if name == "vote_probs" else -1
++            chunks = [
++                np.pad(c, ((0, 0), (0, width - c.shape[1])), constant_values=fill)
++                for c in chunks
++            ]
++        out[name] = np.concatenate(chunks)
++    return out
++
++
++def _summary(directory: str) -> str:
++    paths = shard_paths(directory)
++    data = load_dataset(directory)
++    n = len(data["req_id"])
++    lines = [f"{directory}: {n} examples in {len(paths)} shards"]
++    if paths:
++        sizes = [os.path.getsize(p) for p in paths]
++        lines.append(
++            f"  shard bytes: min {min(sizes)} max {max(sizes)} total {sum(sizes)}"
++            f"  ({sum(sizes) // max(n, 1)} per example)"
++        )
++    if n == 0:
++        return "\n".join(lines)
++    vec = data["vector"]
++    lines.append(f"  vector: {vec.shape[1]} x {vec.dtype}")
++
++    def counts(key: str) -> str:
++        values, freq = np.unique(data[key], return_counts=True)
++        return ", ".join(f"{v}={c}" for v, c in zip(values.tolist(), freq.tolist()))
++
++    for key in ("level", "decided_by", "finish_reason", "close_kind"):
++        lines.append(f"  {key}: {counts(key)}")
++    tags = data["tag"]
++    tagged = tags != ""
++    lines.append(f"  tag: {int(tagged.sum())} tagged, {counts('tag')}")
++    finished = data["finish_reason"] != ABORTED
++    if finished.any():
++        rt = data["reasoning_tokens"][finished]
++        lines.append(
++            "  reasoning_tokens (finished): "
++            f"median {int(np.median(rt))} p90 {int(np.percentile(rt, 90))}"
++        )
++        for level in np.unique(data["level"][finished]).tolist():
++            sel = finished & (data["level"] == level)
++            lines.append(
++                f"    level {level}: n={int(sel.sum())} median "
++                f"{int(np.median(data['reasoning_tokens'][sel]))}"
++            )
++    return "\n".join(lines)
++
++
++def main(argv: list[str] | None = None) -> int:
++    args = sys.argv[1:] if argv is None else argv
++    if len(args) != 1:
++        print(
++            "usage: python -m vllm.v1.core.sched.effort_dataset <dir>",
++            file=sys.stderr,
++        )
++        return 2
++    print(_summary(args[0]))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 89c8b66970..5c3ce29ba2 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -52,6 +52,7 @@ from vllm.v1.core.sched.effort_controller import (
+     new_effort_state,
+     step_effort,
+ )
++from vllm.v1.core.sched.effort_dataset import EffortDatasetWriter
+ from vllm.v1.core.sched.effort_memory import (
+     EffortMemory,
+     decide_effort_level,
+@@ -389,6 +390,7 @@ class Scheduler(SchedulerInterface):
+         # per-step capture list (docs/dynamic-reasoning.claude.md §13).
+         self._effort_memory: EffortMemory | None = None
+         self._effort_vectors: dict[str, np.ndarray] = {}
++        self._effort_dataset: EffortDatasetWriter | None = None
+         self._effort_level_total: dict[int, int] = {}
+         self._effort_held_timeouts = 0
+         self._effort_default_reason: dict[str, int] = {}
+@@ -2831,6 +2833,7 @@ class Scheduler(SchedulerInterface):
+             cfg.num_levels,
+         )
+         self._init_effort_memory(cfg)
++        self._init_effort_dataset(cfg)
+ 
+     def _init_effort_memory(self, cfg: DynamicEffortConfig) -> None:
+         """Build the v3 hidden-state memory (§13.4) and warm it from disk."""
+@@ -2873,6 +2876,28 @@ class Scheduler(SchedulerInterface):
+             hidden.probe_every,
+         )
+ 
++    def _init_effort_dataset(self, cfg: DynamicEffortConfig) -> None:
++        """Open the training-data collector (§13.13) when configured."""
++        hidden = cfg.hidden_effort
++        if not hidden.dataset_path:
++            return
++        self._effort_dataset = EffortDatasetWriter(
++            hidden.dataset_path,
++            self.vllm_config.model_config.get_hidden_size(),
++            shard_size=hidden.dataset_shard_size,
++        )
++        logger.info(
++            "dynamic_effort: dataset collection ON - %s, %d examples per shard",
++            hidden.dataset_path,
++            hidden.dataset_shard_size,
++        )
++
++    @staticmethod
++    def _effort_overrides(request: Request) -> dict[str, Any]:
++        params = request.sampling_params
++        overrides = (params.extra_args or {}).get("dynamic_effort") if params else None
++        return overrides if isinstance(overrides, dict) else {}
++
+     def _maybe_add_effort_state(self, request: Request) -> None:
+         params = request.sampling_params
+         if params is None or not params.extra_args:
+@@ -2989,6 +3014,7 @@ class Scheduler(SchedulerInterface):
+         payload: dict[str, Any] = {
+             "requested_effort": (asked or {}).get("requested"),
+             "effective_effort": (asked or {}).get("effective"),
++            "tag": self._effort_overrides(request).get("tag"),
+             "num_output_tokens": len(request.output_token_ids),
+             "num_prompt_tokens": request.num_prompt_tokens,
+             "finish_reason": str(finish_reason) if finish_reason is not None else None,
+@@ -3036,6 +3062,14 @@ class Scheduler(SchedulerInterface):
+                 "present" if vector is not None else "MISSING",
+                 memory.n_entries if memory is not None else -1,
+             )
++        if self._effort_dataset is not None and vector is not None:
++            self._effort_dataset.begin(
++                request.request_id,
++                vector,
++                request.num_prompt_tokens,
++                request.effort_body_len,
++                self._effort_overrides(request).get("tag"),
++            )
+         if request.effort_force_off:
+             level, reason = 0, "forced-off"
+             if memory is not None and vector is not None:
+@@ -3576,6 +3610,37 @@ class Scheduler(SchedulerInterface):
+                 self._effort_held_timeouts,
+             )
+ 
++    def _record_effort_example(self, request: Request, state: EffortState) -> None:
++        """Complete the request's dataset example (§13.13) at free."""
++        assert self._effort_dataset is not None
++        overrides = self._effort_overrides(request)
++        if request.effort_force_off or "forced_level" in overrides:
++            decided_by = "forced"
++        elif state.level_votes is not None:
++            decided_by = "vote"
++        elif state.decided:
++            decided_by = "memory"
++        else:
++            decided_by = "default"
++        finish_reason = request.get_finished_reason()
++        self._effort_dataset.finish(
++            request.request_id,
++            level=state.level,
++            decided_by=decided_by,
++            vote_probs=state.vote_probs,
++            level_votes=state.level_votes,
++            estimate=state.estimate,
++            calibrated=state.decided_difficulty,
++            novelty_rank=state.novelty_rank,
++            neighbours=state.neighbours if state.memory_entries else None,
++            reasoning_tokens=state.reasoning_tokens,
++            num_output_tokens=len(request.output_token_ids),
++            close_kind=state.close_kind,
++            finish_reason=None
++            if request.status == RequestStatus.FINISHED_ABORTED
++            else str(finish_reason),
++        )
++
+     def _effort_split_worth_it(self, request: Request, boundary: int) -> int:
+         """Whether choosing the prompt tail beats reading the whole prompt.
+ 
+@@ -3626,7 +3691,11 @@ class Scheduler(SchedulerInterface):
+                 if not state.finished:
+                     finish_effort(state)
+                 self._insert_effort_memory(request, state)
++                if self._effort_dataset is not None:
++                    self._record_effort_example(request, state)
+         self._effort_vectors.pop(request.request_id, None)
++        if self._effort_dataset is not None:
++            self._effort_dataset.forget(request.request_id)
+         if self._effort:
+             self._effort.pop(request.request_id, None)
+         if self.effort_sink is not None:
+@@ -3890,6 +3959,14 @@ class Scheduler(SchedulerInterface):
+                 )
+             except OSError:
+                 logger.exception("dynamic_effort: memory save on shutdown failed")
++        if self._effort_dataset is not None:
++            self._effort_dataset.close()
++            logger.info(
++                "dynamic_effort: dataset closed (%d examples in %d shards, %d dropped)",
++                self._effort_dataset.num_written,
++                self._effort_dataset.num_shards,
++                self._effort_dataset.num_dropped,
++            )
+         if self.kv_event_publisher:
+             self.kv_event_publisher.shutdown()
+         if self.connector is not None:

@@ -52,6 +52,7 @@ from vllm.v1.core.sched.effort_controller import (
     new_effort_state,
     step_effort,
 )
+from vllm.v1.core.sched.effort_dataset import EffortDatasetWriter
 from vllm.v1.core.sched.effort_memory import (
     EffortMemory,
     decide_effort_level,
@@ -389,6 +390,7 @@ class Scheduler(SchedulerInterface):
         # per-step capture list (docs/dynamic-reasoning.claude.md §13).
         self._effort_memory: EffortMemory | None = None
         self._effort_vectors: dict[str, np.ndarray] = {}
+        self._effort_dataset: EffortDatasetWriter | None = None
         self._effort_level_total: dict[int, int] = {}
         self._effort_held_timeouts = 0
         self._effort_default_reason: dict[str, int] = {}
@@ -2831,6 +2833,7 @@ class Scheduler(SchedulerInterface):
             cfg.num_levels,
         )
         self._init_effort_memory(cfg)
+        self._init_effort_dataset(cfg)
 
     def _init_effort_memory(self, cfg: DynamicEffortConfig) -> None:
         """Build the v3 hidden-state memory (§13.4) and warm it from disk."""
@@ -2872,6 +2875,28 @@ class Scheduler(SchedulerInterface):
             hidden.q_high,
             hidden.probe_every,
         )
+
+    def _init_effort_dataset(self, cfg: DynamicEffortConfig) -> None:
+        """Open the training-data collector (§13.13) when configured."""
+        hidden = cfg.hidden_effort
+        if not hidden.dataset_path:
+            return
+        self._effort_dataset = EffortDatasetWriter(
+            hidden.dataset_path,
+            self.vllm_config.model_config.get_hidden_size(),
+            shard_size=hidden.dataset_shard_size,
+        )
+        logger.info(
+            "dynamic_effort: dataset collection ON - %s, %d examples per shard",
+            hidden.dataset_path,
+            hidden.dataset_shard_size,
+        )
+
+    @staticmethod
+    def _effort_overrides(request: Request) -> dict[str, Any]:
+        params = request.sampling_params
+        overrides = (params.extra_args or {}).get("dynamic_effort") if params else None
+        return overrides if isinstance(overrides, dict) else {}
 
     def _maybe_add_effort_state(self, request: Request) -> None:
         params = request.sampling_params
@@ -2989,6 +3014,7 @@ class Scheduler(SchedulerInterface):
         payload: dict[str, Any] = {
             "requested_effort": (asked or {}).get("requested"),
             "effective_effort": (asked or {}).get("effective"),
+            "tag": self._effort_overrides(request).get("tag"),
             "num_output_tokens": len(request.output_token_ids),
             "num_prompt_tokens": request.num_prompt_tokens,
             "finish_reason": str(finish_reason) if finish_reason is not None else None,
@@ -3035,6 +3061,14 @@ class Scheduler(SchedulerInterface):
                 request.effort_body_len,
                 "present" if vector is not None else "MISSING",
                 memory.n_entries if memory is not None else -1,
+            )
+        if self._effort_dataset is not None and vector is not None:
+            self._effort_dataset.begin(
+                request.request_id,
+                vector,
+                request.num_prompt_tokens,
+                request.effort_body_len,
+                self._effort_overrides(request).get("tag"),
             )
         if request.effort_force_off:
             level, reason = 0, "forced-off"
@@ -3576,6 +3610,37 @@ class Scheduler(SchedulerInterface):
                 self._effort_held_timeouts,
             )
 
+    def _record_effort_example(self, request: Request, state: EffortState) -> None:
+        """Complete the request's dataset example (§13.13) at free."""
+        assert self._effort_dataset is not None
+        overrides = self._effort_overrides(request)
+        if request.effort_force_off or "forced_level" in overrides:
+            decided_by = "forced"
+        elif state.level_votes is not None:
+            decided_by = "vote"
+        elif state.decided:
+            decided_by = "memory"
+        else:
+            decided_by = "default"
+        finish_reason = request.get_finished_reason()
+        self._effort_dataset.finish(
+            request.request_id,
+            level=state.level,
+            decided_by=decided_by,
+            vote_probs=state.vote_probs,
+            level_votes=state.level_votes,
+            estimate=state.estimate,
+            calibrated=state.decided_difficulty,
+            novelty_rank=state.novelty_rank,
+            neighbours=state.neighbours if state.memory_entries else None,
+            reasoning_tokens=state.reasoning_tokens,
+            num_output_tokens=len(request.output_token_ids),
+            close_kind=state.close_kind,
+            finish_reason=None
+            if request.status == RequestStatus.FINISHED_ABORTED
+            else str(finish_reason),
+        )
+
     def _effort_split_worth_it(self, request: Request, boundary: int) -> int:
         """Whether choosing the prompt tail beats reading the whole prompt.
 
@@ -3626,7 +3691,11 @@ class Scheduler(SchedulerInterface):
                 if not state.finished:
                     finish_effort(state)
                 self._insert_effort_memory(request, state)
+                if self._effort_dataset is not None:
+                    self._record_effort_example(request, state)
         self._effort_vectors.pop(request.request_id, None)
+        if self._effort_dataset is not None:
+            self._effort_dataset.forget(request.request_id)
         if self._effort:
             self._effort.pop(request.request_id, None)
         if self.effort_sink is not None:
@@ -3890,6 +3959,14 @@ class Scheduler(SchedulerInterface):
                 )
             except OSError:
                 logger.exception("dynamic_effort: memory save on shutdown failed")
+        if self._effort_dataset is not None:
+            self._effort_dataset.close()
+            logger.info(
+                "dynamic_effort: dataset closed (%d examples in %d shards, %d dropped)",
+                self._effort_dataset.num_written,
+                self._effort_dataset.num_shards,
+                self._effort_dataset.num_dropped,
+            )
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

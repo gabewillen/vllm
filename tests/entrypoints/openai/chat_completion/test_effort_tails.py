@@ -22,6 +22,7 @@ from vllm.config.reasoning import (
     HiddenEffortConfig,
 )
 from vllm.entrypoints.openai.chat_completion.dynamic_effort import (
+    DynamicEffortError,
     apply_dynamic_effort,
     vote_word_token_ids,
 )
@@ -340,6 +341,29 @@ def test_level_vote_meta_prompt(level_vote: bool):
     assert control._dynamic_effort_variant_messages == (
         request._dynamic_effort_variant_messages
     )
+
+
+@pytest.mark.parametrize(
+    "tag, ok",
+    [("cattrs/task-3", True), ("x" * 128, True), ("x" * 129, False), (7, False)],
+)
+def test_effort_tag_validation(tag, ok):
+    """`vllm_xargs.effort_tag` labels the dataset example: a string of at
+    most 128 characters, passed to the engine as `tag`."""
+    cfg = _effort_config()
+    request = ChatCompletionRequest(
+        model=BASE_MODEL_PATHS[0].name,
+        messages=agent_conversation(turns=1, words_per_tool_result=5),
+        reasoning_effort="dynamic",
+        vllm_xargs={"effort_tag": tag},
+    )
+    if not ok:
+        with pytest.raises(DynamicEffortError, match="effort_tag"):
+            apply_dynamic_effort(request, cfg)
+        return
+    apply_dynamic_effort(request, cfg)
+    assert request._dynamic_effort is not None
+    assert request._dynamic_effort["tag"] == tag
 
 
 def test_level_vote_forced_level_skips_the_vote():

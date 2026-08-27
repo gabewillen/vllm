@@ -20,6 +20,7 @@ from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.config.reasoning import DynamicEffortConfig, HiddenEffortConfig
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.core.sched.effort_controller import new_effort_state
+from vllm.v1.core.sched.effort_dataset import EffortDatasetWriter, load_dataset
 from vllm.v1.core.sched.scheduler import (
     Scheduler,
     draw_effort_level,
@@ -563,3 +564,47 @@ def test_vote_probability_is_tempered_top_logprob_mass():
     weights = {t: p ** (1 / 0.7) for t, p in {1: 0.5, 2: 0.3, 5: 0.1}.items()}
     expected = (weights[1] + weights[5]) / sum(weights.values())
     assert p_yes == pytest.approx(expected, rel=1e-5)
+
+
+def test_dataset_example_per_decided_request(tmp_path):
+    """A request that reached the seam, voted and finished leaves exactly one
+    example: the vector the decision saw, the voted level and the tag."""
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK_SIZE)
+    scheduler._effort_cfg = DynamicEffortConfig(
+        hidden_effort=HiddenEffortConfig(
+            enabled=True, think_off_level=True, default_level=2, level_vote=True
+        )
+    )
+    hidden = 6
+    scheduler._effort_dataset = EffortDatasetWriter(str(tmp_path), hidden, shard_size=1)
+    request = _level_vote_request(scheduler)
+    assert request.sampling_params is not None
+    request.sampling_params.extra_args = {"dynamic_effort": {"tag": "bench/7"}}
+    vector = np.arange(hidden, dtype=np.float32) / 4
+
+    request.effort_decision_pending = True
+    assert scheduler._resolve_effort_decision(request, vector) is not None
+    _requeue(scheduler, request)
+    assert scheduler._effort_dataset.num_pending == 1
+    _vote_step(scheduler, request, {2: 1.0})
+    state = scheduler._effort[request.request_id]
+    assert state.level == 1 and state.level_votes is not None
+
+    state.reasoning_tokens = 33
+    request.status = RequestStatus.FINISHED_STOPPED
+    scheduler._free_request(request)
+    assert scheduler._effort_dataset.num_pending == 0
+    scheduler._effort_dataset.close()
+
+    data = load_dataset(str(tmp_path))
+    assert data["req_id"].tolist() == [request.request_id]
+    np.testing.assert_array_equal(data["vector"][0].astype(np.float32), vector)
+    assert data["level"].tolist() == [1]
+    assert data["decided_by"].tolist() == ["vote"]
+    assert data["level_votes"][0].tolist() == [1, 1, 1]
+    assert data["vote_probs"][0].tolist() == pytest.approx([0.0, 1.0, 0.0])
+    assert data["tag"].tolist() == ["bench/7"]
+    assert data["reasoning_tokens"].tolist() == [33]
+    assert data["finish_reason"].tolist() == ["stop"]
+    assert data["body_len"].tolist() == [request.effort_body_len]
+    assert np.isnan(data["estimate"][0]) and data["neighbours"][0] == -1

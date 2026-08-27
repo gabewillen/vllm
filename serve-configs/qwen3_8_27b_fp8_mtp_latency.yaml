@@ -203,10 +203,13 @@ reasoning-parser: qwen3
 # implementation (VulcanBench itertools) - the model's voice is effort-only.
 # default_level 2 = medium (undecided prompts stay byte-identical); the
 # memory restarts cold for the new lane semantics.
-reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "effort_aliases": {"high": "xhigh"}, "hidden_effort": {"enabled": true, "think_off_level": true, "q_none": 0.3, "q_mid": 0.6, "q_high": 0.6, "default_level": 2, "memory_path": "/data/effort-memory/qwen38-latency.npz", "level_vote": true}}}'
+reasoning-config: '{"dynamic_effort": {"default_effort": "dynamic", "effort_aliases": {"high": "xhigh"}, "hidden_effort": {"enabled": true, "think_off_level": true, "q_none": 0.3, "q_mid": 0.6, "q_high": 0.6, "default_level": 2, "memory_path": "/data/effort-memory/qwen38-latency.npz", "level_vote": true, "dataset_path": "/data/effort-dataset/qwen38-latency"}}}'
 # Level-vote ablation (patch 0026, docs §13.12): the model names its own level
 # (none/brief/extended) from the hidden question's first-token distribution,
 # 3 draws at 0.7, rule max; the q_* cuts stop deciding (memory still learns).
+# dataset_path (patch 0027, docs §13.13): one example per decided request
+# (seam vector + level + outcome) as npz shards, ~10 KB each, for a future
+# hidden-state classifier; `python -m vllm.v1.core.sched.effort_dataset <dir>`.
 enable-auto-tool-choice: true
 tool-call-parser: qwen3_coder
 served-model-name: Qwen3.8-27B

@@ -1273,3 +1273,46 @@ out of the decision.
 - **Ablation**: the prod yaml keeps its committed reasoning-config; the line
   next to it shows the same config with `"level_vote": true`. Not measured at
   the time of writing.
+
+### 13.13 Dataset collection - training data for a hidden-state classifier (patch 0027, 2026-08-27)
+
+The memory (§13.4) and the level vote (§13.12) both decide from the pooled
+last-body-token hidden state, but neither leaves a record a classifier could
+be fitted from. `hidden_effort.dataset_path` turns the server into a
+collector: every dynamic request that reached the seam writes one example.
+
+- **Config** (`HiddenEffortConfig`): `dataset_path: null` (off) or a
+  directory; `dataset_shard_size` (4096) examples per shard. Prod:
+  `/data/effort-dataset/qwen38-latency`.
+- **Example** (`vllm/v1/core/sched/effort_dataset.py`, one row per request):
+  `req_id`, `ts`, `vector` (float16, `hidden_size` wide - exactly the vector
+  `_resolve_effort_decision` received at the seam, before the memory query or
+  the vote), `num_prompt_tokens`, `body_len`, `level`, `decided_by`
+  (`default` / `memory` / `vote` / `forced`), `vote_probs` and `level_votes`
+  (NaN / -1 padded when there was no vote), the memory's `estimate`,
+  `calibrated`, `novelty_rank`, `neighbours` (NaN / -1 when absent), and at
+  finish `reasoning_tokens`, `num_output_tokens`, `close_kind`,
+  `finish_reason` (`aborted` for a request that never finished, including
+  those still pending at shutdown), and `tag`.
+- **Tag**: `vllm_xargs.effort_tag` (string, at most 128 characters; anything
+  else is a 400) rides along in `dynamic_effort.tag`, lands in the example
+  and is echoed in the telemetry `finish` record, so a bench harness can join
+  each trajectory to its task and pass/fail afterwards.
+- **Writing**: decision-time fields are captured at the seam and the example
+  is completed in `_free_request` (finish or abort), then queued for a
+  daemon thread that writes `shard-<pid>-<start_ts>-<seq>.npz` every
+  `dataset_shard_size` examples and the remainder at shutdown (tmp file +
+  rename, never partial). The scheduler loop never touches the disk: with
+  four shards' worth queued and the writer stalled, new examples are dropped
+  with a warning and counted. Cost: `2 * hidden_size` bytes plus ~150 bytes
+  of scalars per example - 10.4 KB for the 27B (`hidden_size` 5120), so 1
+  GB per ~100k requests.
+- **Reading**: `load_dataset(dir)` concatenates the shards into a dict of
+  numpy arrays (ragged vote widths padded); `python -m
+  vllm.v1.core.sched.effort_dataset <dir>` prints counts per level /
+  `decided_by` / `finish_reason` / tag, shard sizes and reasoning-token
+  medians per level. numpy only.
+- **What this does not do**: nothing reads the dataset online. The
+  classifier it is for is future work; §11.0's constraint (no learned probe
+  before the label-free signals are exhausted) still stands for the
+  decision path.
