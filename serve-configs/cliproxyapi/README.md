@@ -331,3 +331,56 @@ needs:
   also stashed in `serve-configs/cliproxyapi.env` as `CPAMP_ADMIN_KEY`.
 - CPA URL: `http://cliproxyapi:8317` (container DNS name on `cliproxy-net`).
 - CPA management key: `CLIPROXY_MGMT_KEY` in `serve-configs/cliproxyapi.env`.
+
+## Auto-discovered compat models (fork, 2026-08-27)
+
+`openai-compatibility` providers only served the static `models:` list, so
+when opencode added `glm-5.3-flash` to `opencode.ai/zen/go/v1/models` it had
+to be added to config.yaml by hand. Fork commit `ff293819` (branch
+`feat/compat-responses-compaction`, image `cli-proxy-api:compaction`) adds
+per-provider auto-discovery on top of the model-limits resolver
+(`sdk/cliproxy/service_auto_models.go`, `internal/modellimits`
+`UpstreamCatalog`/`UpstreamModels`):
+
+- `auto-models: true` (per provider, default `false` = upstream behaviour)
+  unions the ids from the provider's `GET {base-url}/models` into the
+  registered models. It reuses the resolver's cached fetch (one request per
+  base-url/key per 10 min, 3 s timeout), so limits and discovery never fetch
+  twice. Configured entries keep their alias/limits/thinking settings; a
+  discovered id is skipped when it equals a configured `name` or `alias`
+  (case-insensitive), otherwise registered with alias `""` (served under its
+  upstream id) and gets context/output limits through the existing resolver
+  (upstream fields, then models.dev). It works even with
+  `auto-model-limits: false` (then only discovery, no limits).
+- `auto-models-exclude: [glob, ...]` (per provider) drops ids matching any
+  `path.Match` glob, case-insensitive (an invalid pattern matches only
+  itself).
+- Refresh: the discovered set is recomputed on every registration (startup,
+  config reload, auth change) and by a 10 min ticker
+  (`modellimits.UpstreamRefresh`) that re-registers the provider's auths when
+  the cached catalog is stale; `RegisterClient` replaces the auth's model set,
+  so ids the upstream dropped disappear. While the upstream is unreachable the
+  last successful list is kept. Changes are logged once per registration:
+  `compat models: provider "opencode" discovered +longcat-2.0` (`-id` for
+  removals; first run lists everything as added).
+- Hot reload: `auto-models`/`auto-models-exclude` are stamped into the config
+  auth's attributes (`internal/watcher/synthesizer`), so toggling them in
+  config.yaml re-registers the provider without a restart.
+
+Enabled for the `opencode` provider with
+`auto-models-exclude: ["gpt-*", "claude-*", "grok-*"]` (direct subscriptions
+cover those). Upstream-vs-config diff at enable time: upstream had 31 ids;
+config lacked `gpt-5.6-luna`, `grok-4.5`, `grok-4.6` (excluded) and
+`longcat-2.0` (now auto-registered, 1000000/131072 from models.dev); every
+other id was already configured. Verified after reload: 29 `owned_by:
+opencode` ids in `/v1/models` = all non-excluded upstream ids incl.
+`glm-5.3-flash`; no gpt/claude/grok from opencode; `Qwen3.8-27B`
+(`vllm-qwen38`, auto-models off) unchanged at 262144; chat completions on
+`glm-5.3-flash` and `longcat-2.0` through CPA -> 200. `glm-5.3-flash` has no
+limit fields upstream and is not yet on models.dev, so it carries no
+context_length until one of them adds it (or `max-context-length` is set in
+config).
+
+The static `models:` entries for opencode remain in config.yaml as
+documentation/alias anchors; they could be trimmed to only the entries needing
+overrides now that discovery is on.

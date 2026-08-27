@@ -29,6 +29,8 @@ openai-compatibility:
   - name: opencode
     base-url: https://opencode.ai/zen/go/v1
     disable-cooling: true
+    auto-models: true
+    auto-models-exclude: ["gpt-*", "claude-*", "grok-*"]
     api-key-entries:
       - api-key: <redacted>
     models:
