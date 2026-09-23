@@ -63,11 +63,13 @@
   - `pkill -f <pattern>` kills your own shell if the pattern appears in its command line. Use a script file.
   - This machine has no GitHub credentials; pushing needs a forwarded ssh agent.
 
-## Root cause found: dense MoE path is lossy (top priority)
+## Root cause found: MoE path inconsistency between verify and decode
 
 **Symptom:** DFlash2 output departed from greedy at generated token 8 (`279` instead of the reference's `330`, a 1.5-nat margin). It did so even with random drafts, so it wasn't draft-dependent.
 
-**Cause:** the MoE **dense** path (`moe_hpu.py:moe_dense`) quantizes activations and intermediates to FP8 with one scale per row (`_dyn_quant_rows`). GLM's outlier activation channels make that lossy enough to flip greedy tokens.
+**Cause:** the 8-token verify took the MoE **dense** path, which quantizes activations and intermediates to FP8 with one scale per row (`moe_hpu.py:moe_dense`, `_dyn_quant_rows`). The bs1 decode it must reproduce took the bf16 **gather** path. The two paths round differently, so spec output couldn't equal non-spec output.
+- The FP8 rounding itself is ordinary W8A8 behaviour: ~2.5% relative error on the MoE input per token (e4m3 mantissa; outliers are modest, row max ≈ 15-24x RMS, measured on the L5 reference). That is what GPU FP8 serving of this checkpoint does too.
+- Finer activation scales (1x128 blocks) would not reduce the rounding error.
 - The path is chosen when T*K > `GLM53_MOE_GATHER_MAX_SLOTS`, which was 16.
 - The bf16 **gather** path is exact. With `GLM53_MOE_GATHER_MAX_SLOTS=64` and random drafts, the output equals MTP and the reference (`logs/full_dflash_rand_g.txt`).
 
@@ -79,15 +81,10 @@
 - Every earlier number (MTP 27.3 ms/tok, non-spec 28.0, serving) should be re-measured with threshold 64.
 - DFlash2 bs1 speed: 30.4 ms/tok on the raw-completion prompt, where acceptance is low (~2.3 tokens/step in the CPU simulation). It still needs a chat-style prompt measurement and verify-step and drafter optimization.
 
-**Still affected:**
-- Decode at bs>8.
-- Prefill with 8 < T ≤ 192 (`GLM53_MOE_DENSE_MAX_T`).
-- So serving at c64/c128 still uses the lossy path. The earlier serving numbers were measured on it.
-
-**Fix options:**
-1. Outlier-channel split: find the massive-activation channels by calibration. Compute those few columns in bf16 against dequantized weight columns, and the rest in per-row FP8.
-2. SmoothQuant-style per-channel smoothing folded into W13 offline.
-3. A grouped/gather FP8 GEMM that keeps activations bf16.
+**Remaining caveat:** numerics depend on batch size. bs≤8 decode uses bf16 activations and bs>8 uses FP8 W8A8, like batch-variant kernels on GPU.
+- Spec decode stays self-consistent while the verify's T*K ≤ 64. At bs>1 with K=7 the verify exceeds that and falls back to dense, while plain decode at the same batch is also dense unless bs≤8.
+- **To do:** make the path choice depend on the batch size *without* the spec tokens, so verify and non-spec decode always agree.
+- To remove FP8 activation rounding everywhere, the options are a grouped/gather FP8 GEMM with bf16 activations, or dequantized-bf16 dense weights (2x bandwidth).
 
 `fp8_gemm_v2` does **not** accept a bf16 A with an fp8 B on this stack (tested: "not yet supported"). Afterwards, check the gather path's speed at 17-64 slots against dense.
 
@@ -126,7 +123,14 @@ Ruled out along the way: KDA rollback/math (`test_kda_spec8.py` exact), prefix c
 
 ## Next steps (in order)
 
-1. Fix the dense MoE FP8 precision for bs>8 and prefill (see the root cause above). Check DFlash2 losslessness and speed with the threshold at 64 (`logs/full_dflash_g64.txt`).
-2. Fix the block-boundary bug in the verify attention metadata.
-3. Measure DFlash2 acceptance and ms/token on a chat-style prompt. Then optimize the small-batch MoE for the verify step, and the drafter step.
-4. Restart the production server when done: `/mnt/glm-models/serve-glm53-opt.sh`.
+Work stopped 2026-09-23. Nothing is running and the devices are free.
+
+1. **Re-measure baselines** with the new MoE gather threshold of 64:
+   - `SLOTS=64 tools/bench_gather.sh; SLOTS=16 tools/bench_gather.sh` benchmarks non-spec decode at bs1/4/8 under both thresholds, to check whether gather at 17-64 slots is slower than dense. It was started and cancelled before any result.
+   - If gather is slower at bs4-8, pick the threshold per batch size.
+2. **Chat-prompt comparison:** `tools/chat_ab.sh` runs non-spec vs MTP vs DFlash2 on `ref/chat_ids.json` (35-token chat template with thinking on). It prints ms/tok and the first divergence from non-spec for each. Not run yet.
+   - DFlash2's acceptance on chat text should be far above the ~2.3 seen on raw completion.
+3. **Speed up DFlash2** (30.4 ms/tok at bs1 on raw completion): profile the 8-token verify step (MoE gather at 64 slots, host serialization) and the drafter step (`GLM53_TIMING=1`, `tools/mtp_prof.sh` pattern).
+4. **Batch-dependent MoE numerics** (optional): see "Remaining caveat" above.
+5. **Verify block-boundary bug:** fix the paged-attention metadata when an 8-token block crosses a 384-token boundary (see "Known latent bug").
+6. **Restart the production server:** `/mnt/glm-models/serve-glm53-opt.sh`. It is currently down. Its serving numbers were measured with the old threshold of 16.
