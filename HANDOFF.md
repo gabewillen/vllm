@@ -11,7 +11,7 @@
 | Decode, bs64 / bs128 | ~1,000 / 1,582 tok/s |
 | Serving (512 in/256 out) | c1 33 tok/s, c64 508, c128 587 |
 | MTP spec decode (k=1) | Works. 27.3 ms/tok steady state vs 28.0 non-spec, with 1.88 tokens accepted per step. The verify step is serialized with the host, so the gain is small. |
-| DFlash2 spec decode (K=7) | Runs end to end. Was not lossless because of the dense MoE FP8 path (see below); fixed for bs1 by the gather threshold of 64. |
+| DFlash2 spec decode (K=7) | Runs end to end and follows the fp32 reference at bs1 after the MoE fix (see below). 30.4 ms/tok on raw-completion text (low acceptance); not yet faster than non-spec. |
 | Production server | **Down** (dev container `glmdev` holds the devices). Restart: `/mnt/glm-models/serve-glm53-opt.sh` |
 
 ## Environment
@@ -71,7 +71,13 @@
 - The path is chosen when T*K > `GLM53_MOE_GATHER_MAX_SLOTS`, which was 16.
 - The bf16 **gather** path is exact. With `GLM53_MOE_GATHER_MAX_SLOTS=64` and random drafts, the output equals MTP and the reference (`logs/full_dflash_rand_g.txt`).
 
-**Mitigation applied:** the default threshold is now 64 (`model.py`, `Glm5NextMoE._GATHER_MAX_SLOTS`). That covers decode up to bs8 and the 8-token verify at bs1.
+**Mitigation applied:** the default threshold is now 64 (`model.py`, `Glm5NextMoE._GATHER_MAX_SLOTS`). That covers decode up to bs8, the 8-token verify at bs1, and short prompt prefills.
+
+**Result** (`logs/full_dflash_g64.txt`): DFlash2 with real drafts now follows the fp32 reference. It first departs from the old MTP output at generated token 22, and there the fp32 reference agrees with DFlash2 (`1`, logprob -0.61) rather than MTP (`3263`, -1.32).
+- The old MTP and non-spec runs were themselves slightly off, because under the old threshold of 16 the 5-token prompt prefill (40 slots) used the lossy dense path.
+- That likely explains the 6 MTP-vs-reference mismatches on `ref/dflash_ids.json`.
+- Every earlier number (MTP 27.3 ms/tok, non-spec 28.0, serving) should be re-measured with threshold 64.
+- DFlash2 bs1 speed: 30.4 ms/tok on the raw-completion prompt, where acceptance is low (~2.3 tokens/step in the CPU simulation). It still needs a chat-style prompt measurement and verify-step and drafter optimization.
 
 **Still affected:**
 - Decode at bs>8.
