@@ -1,0 +1,550 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import os
+from typing import TYPE_CHECKING, Optional, Union
+
+import torch
+import habana_frameworks.torch as htorch
+
+from vllm import envs
+
+from vllm.platforms import Platform, PlatformEnum
+from vllm_gaudi.extension.runtime import get_config
+from vllm_gaudi.extension.logger import logger as init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm.config import ModelConfig, VllmConfig
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+else:
+    ModelConfig = None
+    VllmConfig = None
+
+logger = init_logger()
+
+
+# Monkey-patch torch.accelerator.get_memory_info for HPU compatibility.
+# torch.accelerator.get_memory_info() is not implemented for HPU and raises
+# RuntimeError. We patch it to use torch.hpu.mem_get_info() instead.
+def _hpu_get_memory_info(device=None) -> tuple[int, int]:
+    """Get (free, total) memory in bytes for HPU."""
+    return torch.hpu.mem_get_info()
+
+
+torch.accelerator.get_memory_info = _hpu_get_memory_info
+
+QWEN3_5_HYBRID_ARCHS = frozenset({
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+})
+
+
+def retain_envs(var_name):
+    retain_var_list = ['GLOO_SOCKET_IFNAME', 'HCCL_SOCKET_IFNAME', 'NCCL_SOCKET_IFNAME']
+    return ('HPU' in var_name or 'RAY' in var_name or 'VLLM' in var_name or var_name in retain_var_list)
+
+
+def is_qwen3_5_hybrid_model(model_config: Optional[ModelConfig]) -> bool:
+    if model_config is None or not model_config.is_hybrid:
+        return False
+
+    architectures = set(getattr(getattr(model_config, "hf_config", None), "architectures", []) or [])
+    architecture = getattr(model_config, "architecture", None)
+    if architecture is not None:
+        architectures.add(architecture)
+
+    return any(arch in QWEN3_5_HYBRID_ARCHS for arch in architectures)
+
+
+class HpuPlatform(Platform):
+    _enum = PlatformEnum.OOT
+    device_name: str = "hpu"
+    device_type: str = "hpu"
+    dispatch_key: str = "HPU"
+    ray_device_key: str = "HPU"
+    device_control_env_var: str = "HABANA_VISIBLE_MODULES"
+    supported_quantization: list[str] = [
+        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt", "gpt_oss_mxfp4"
+    ]
+    simple_compile_backend = "hpu_backend"
+    additional_env_vars = [k for k, v in os.environ.items() if retain_envs(k)]
+
+    @classmethod
+    def get_attn_backend_cls(
+        cls,
+        selected_backend: "AttentionBackendEnum",
+        attn_selector_config: "AttentionSelectorConfig",
+        num_heads: Optional[int] = None,
+    ) -> str:
+        from vllm.config import get_current_vllm_config
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        current_vllm_config = get_current_vllm_config()
+        if current_vllm_config.device_config.device_type == "cpu":
+            logger.info("Using CPU_ATTN backend for CPU-targeted config.")
+            return AttentionBackendEnum.CPU_ATTN.get_path()
+
+        if attn_selector_config.use_sparse:
+            if not attn_selector_config.use_mla:
+                raise NotImplementedError("Sparse Attention is not supported on HPU.")
+            logger.warning("Sparse attention (DSA) is not implemented on HPU; running DSA layers as dense MLA "
+                           "(exact for sequences up to index_topk tokens, approximate beyond).")
+
+        if attn_selector_config.use_mla:
+            logger.info("Using HPUAttentionMLA backend.")
+            return ("vllm_gaudi.attention.backends.hpu_attn."
+                    "HPUMLAAttentionBackend")
+
+        logger.info("Using HPUAttentionV1 backend.")
+        return ("vllm_gaudi.v1.attention.backends."
+                "hpu_attn.HPUAttentionBackendV1")
+
+    @classmethod
+    def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
+        return True
+
+    @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        """
+        Set the device for the current platform.
+        """
+        return
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        torch.hpu.random.manual_seed_all(seed)
+
+    @classmethod
+    def get_device_name(cls, device_id: int = 0) -> str:
+        return cls.device_name
+
+    @classmethod
+    def get_device_total_memory(cls, device_id: int = 0) -> int:
+        """Get the total memory of a device in bytes."""
+        # NOTE: This is a workaround.
+        # The correct implementation of the method in this place should look as follows:
+        # total_hpu_memory = torch.hpu.mem_get_info()[1]
+        # A value of 0 is returned to preserve the current logic in
+        # vllm/vllm/engine/arg_utils.py → get_batch_defaults() →
+        # default_max_num_batched_tokens, in order to avoid the
+        # error in hpu_perf_test, while also preventing a
+        # NotImplementedError in test_defaults_with_usage_context.
+        logger.warning("This is a workaround! Please check the NOTE "
+                       "in the get_device_total_memory definition.")
+
+        total_hpu_memory = 0
+
+        return total_hpu_memory
+
+    @classmethod
+    def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        # Apply torch.compile/eager-only env defaults here (engine construction
+        # time) instead of at plugin registration time, so they cannot leak into
+        # a lazy-mode subprocess (GAUDISW-248809) and always respect values the
+        # user set explicitly (GAUDISW-249135).
+        cls.set_compile_env_defaults()
+        parallel_config = vllm_config.parallel_config
+
+        if parallel_config.worker_cls == "auto":
+            parallel_config.worker_cls = \
+                    "vllm_gaudi.v1.worker.hpu_worker.HPUWorker"
+
+        # NOTE(kzawora): default block size for Gaudi should be 128
+        # smaller sizes still work, but very inefficiently
+        cache_config = vllm_config.cache_config
+        if not cache_config.user_specified_block_size:
+            cache_config.block_size = 128
+        elif is_qwen3_5_hybrid_model(vllm_config.model_config) and cache_config.block_size != 128:
+            # Narrow the reset to Qwen3.5 hybrids. Other hybrid models may
+            # legitimately use a larger KV-manager block size and rely on
+            # virtual block splitting down to 128-token HPU kernels.
+            logger.info(
+                "Resetting Qwen3.5 hybrid block_size from %d to 128 "
+                "before Gaudi hybrid page-size realignment.",
+                cache_config.block_size,
+            )
+            cache_config.block_size = 128
+            if cache_config.mamba_cache_mode == "align":
+                cache_config.mamba_block_size = 128
+        # Hybrid GDN/Mamba models: upstream HybridAttentionMambaModelConfig
+        # already ran and computed block_size / mamba_page_size_padded for
+        # GPU.  HPU overrode block_size to 128 above, so we must re-align
+        # mamba_page_size_padded to be a multiple of the HPU attention page
+        # size (block_size * per-token KV bytes).  Without this the upstream
+        # unify_kv_cache_spec_page_size() fails because the two page sizes
+        # are not divisible.
+        #
+        # Exception: granitemoehybrid models skip this rescaling here because
+        # update_block_size_for_backend() computes the correct block_size
+        # (528 or 768 tokens) and re-aligns mamba_page_size_padded to that
+        # larger attention page.  If we rescaled here with block_size=128 we
+        # would corrupt the value already set by update_block_size_for_backend
+        # (e.g. 2162688 → 2621440) on every subsequent check_and_update_config
+        # call (config deserialization, reconfigure path, etc.).
+        _is_granitemoehybrid = (vllm_config.model_config is not None and getattr(
+            getattr(vllm_config.model_config, "hf_config", None), "model_type", None) == "granitemoehybrid")
+        if (not _is_granitemoehybrid and cache_config and cache_config.block_size is not None
+                and vllm_config.model_config is not None and vllm_config.model_config.is_hybrid
+                and cache_config.mamba_page_size_padded is not None):
+            # Recompute mamba_page_size_padded so it is a multiple of
+            # the HPU attention page size.
+            from vllm.utils.torch_utils import get_dtype_size
+            from math import ceil
+            model_config = vllm_config.model_config
+            if cache_config.cache_dtype == "auto":
+                kv_dtype = model_config.dtype
+            else:
+                from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+                kv_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+            num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+            head_size = model_config.get_head_size()
+            attn_page = (2 * cache_config.block_size * num_kv_heads * head_size * get_dtype_size(kv_dtype))
+            if attn_page > 0 and cache_config.mamba_page_size_padded % attn_page != 0:
+                old_padded = cache_config.mamba_page_size_padded
+                cache_config.mamba_page_size_padded = (ceil(old_padded / attn_page) * attn_page)
+                logger.info(
+                    "Rescaled mamba_page_size_padded from %d to %d "
+                    "to align with HPU attention page size %d "
+                    "(block_size=%d).",
+                    old_padded,
+                    cache_config.mamba_page_size_padded,
+                    attn_page,
+                    cache_config.block_size,
+                )
+        if (parallel_config.distributed_executor_backend in ['mp', 'uni']
+                and envs.VLLM_WORKER_MULTIPROC_METHOD == 'fork'):
+            if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD", None) is not None:
+                logger.warning("On HPU, VLLM_WORKER_MULTIPROC_METHOD=fork "
+                               "might cause application hangs on exit. Using "
+                               "VLLM_WORKER_MULTIPROC_METHOD=fork anyway, "
+                               "as it was explicitly requested.")
+            else:
+                logger.warning("On HPU, VLLM_WORKER_MULTIPROC_METHOD=fork "
+                               "might cause application hangs on exit. Setting "
+                               "VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. "
+                               "To override that behavior, please set "
+                               "VLLM_WORKER_MULTIPROC_METHOD=fork explicitly.")
+                os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+        if (vllm_config.model_config is not None and vllm_config.model_config.dtype in (torch.float16, torch.float32)):
+            logger.warning("The HPU backend currently does not support %s. "
+                           "Using bfloat16 instead.", vllm_config.model_config.dtype)
+            vllm_config.model_config.dtype = torch.bfloat16
+
+        from vllm.config import CompilationMode, CUDAGraphMode
+        compilation_config = vllm_config.compilation_config
+        # Activate custom ops for v1.
+        compilation_config.custom_ops = ["all"]
+        compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        compilation_config.cudagraph_capture_sizes = []
+
+        if get_config().VLLM_CONTIGUOUS_PA:
+            logger.warning("Using Contiguous PA, disabling prefix caching")
+            vllm_config.cache_config.enable_prefix_caching = False
+
+        if (vllm_config.cache_config.enable_prefix_caching and vllm_config.cache_config.mamba_cache_mode == "all"):
+            vllm_config.cache_config.mamba_cache_mode = "align"
+            logger.info("[HPU] Overriding mamba_cache_mode from 'all' to 'align' "
+                        "to ensure block-aligned chunked prefill splits.")
+
+        if (vllm_config.model_config is not None and vllm_config.model_config.is_hybrid):
+            logger.debug(
+                "[HPU] Hybrid model cache config: block_size=%s, "
+                "mamba_block_size=%s, mamba_cache_mode=%s, "
+                "enable_prefix_caching=%s", cache_config.block_size, getattr(cache_config, "mamba_block_size", None),
+                getattr(cache_config, "mamba_cache_mode", None), cache_config.enable_prefix_caching)
+
+        if compilation_config.mode != CompilationMode.NONE:
+            logger.info("[HPU] Forcing CompilationMode.NONE "
+                        "compilation mode")
+            compilation_config.mode = CompilationMode.NONE
+
+        # Force CPU loading for INC quantization to prevent OOM during weight loading.
+        # INC FP8 quantization requires weights to be loaded to CPU first, then
+        # quantized and moved to device. Without this, weights are loaded directly
+        # to HPU in BF16 which causes OOM for large models.
+        model_config = vllm_config.model_config
+        is_inc_quant = (model_config is not None and model_config.quantization == "inc") or os.getenv("QUANT_CONFIG")
+        if is_inc_quant and vllm_config.load_config is not None and vllm_config.load_config.device is None:
+            logger.info("[HPU] INC quantization detected, loading weights to CPU first")
+            vllm_config.load_config.device = "cpu"
+
+        # Disable multi-stream for shared experts as no Stream on CPU
+        os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
+
+        # NOTE: vLLM has default enabled async scheduling with speculative decoding is on.
+        # However, for HPU, speculative decoding is not supported with async scheduling.
+        vllm_config.scheduler_config.async_scheduling = \
+            vllm_config.scheduler_config.async_scheduling and vllm_config.speculative_config is None
+
+    @classmethod
+    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+
+        cache_config = vllm_config.cache_config
+        model_config = vllm_config.model_config
+
+        # For Granite 4.0-H (granitemoehybrid), we compute the correct
+        # block_size in this method using the PC-aware alignment formula
+        # (528 without prefix caching, 768 with prefix caching).
+        # We set block_size before calling super and mark it as
+        # user-specified so Phase 1 preserves it; Phase 2
+        # (_align_hybrid_block_size) then validates and sets
+        # mamba_page_size_padded.
+        is_granite_hybrid = (model_config is not None
+                             and getattr(model_config.hf_config, "model_type", None) == "granitemoehybrid")
+        if is_granite_hybrid:
+            # Compute the correct block_size using the PC-aware formula.
+            from vllm.utils.math_utils import cdiv
+            from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+            from vllm.model_executor.models import ModelRegistry
+            if cache_config.cache_dtype == "auto":
+                kv_dtype = model_config.dtype
+            else:
+                from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+                kv_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+            attn_1tok = FullAttentionSpec(
+                block_size=1,
+                num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+                head_size=model_config.get_head_size(),
+                dtype=kv_dtype,
+            ).page_size_bytes
+            model_cls, _ = ModelRegistry.resolve_model_cls(
+                model_config.architecture,
+                model_config=model_config,
+            )
+            mamba_page_size = MambaSpec(
+                shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
+                dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+                block_size=-1,
+            ).page_size_bytes
+            if mamba_page_size > 0:
+                if cache_config.enable_prefix_caching:
+                    mamba_chunk_size = getattr(model_config.hf_config, 'mamba_d_chunk', 256)
+                    alignment = mamba_chunk_size
+                else:
+                    alignment = 16
+                attn_block_size = alignment * cdiv(mamba_page_size, alignment * attn_1tok)
+                cache_config.block_size = attn_block_size
+                if cache_config.mamba_cache_mode == "align":
+                    cache_config.mamba_block_size = attn_block_size
+                logger.info(
+                    "Setting granitemoehybrid block_size to %d tokens "
+                    "(alignment=%d, mamba_page_size=%d bytes, "
+                    "prefix_caching=%s).",
+                    attn_block_size,
+                    alignment,
+                    mamba_page_size,
+                    cache_config.enable_prefix_caching,
+                )
+                # Re-align mamba_page_size_padded to the final HPU block size.
+                # check_and_update_config aligns mamba_page_size_padded to
+                # the HPU default block_size=128, but update_block_size_for_backend
+                # then changes block_size to attn_block_size (e.g. 528).
+                new_attn_page = attn_1tok * attn_block_size
+                if new_attn_page > 0:
+                    old_padded = getattr(cache_config, "mamba_page_size_padded", None)
+                    new_padded = cdiv(mamba_page_size, new_attn_page) * new_attn_page
+                    if old_padded != new_padded:
+                        cache_config.mamba_page_size_padded = new_padded
+                        logger.info(
+                            "Re-aligned mamba_page_size_padded from %s to %d "
+                            "to match granitemoehybrid block_size=%d "
+                            "(new_attn_page=%d).",
+                            old_padded,
+                            new_padded,
+                            attn_block_size,
+                            new_attn_page,
+                        )
+            # Set user_specified_block_size=True permanently so that
+            # check_and_update_config (which runs again on every
+            # VllmConfig.__post_init__, including pickle deserialization in
+            # MultiprocExecutor IPC) will not reset block_size.
+            cache_config.user_specified_block_size = True
+            super().update_block_size_for_backend(vllm_config)
+        else:
+            super().update_block_size_for_backend(vllm_config)
+
+    @classmethod
+    def is_pin_memory_available(cls):
+        logger.warning("Pin memory is not supported on HPU.")
+        return False
+
+    @classmethod
+    def get_punica_wrapper(cls) -> str:
+        return "vllm_gaudi.lora.punica_wrapper.punica_hpu.PunicaWrapperHPU"
+
+    @classmethod
+    def support_hybrid_kv_cache(cls) -> bool:
+        return True
+
+    @classmethod
+    def get_device_communicator_cls(cls) -> str:
+        return "vllm_gaudi.distributed.device_communicators.hpu_communicator.HpuCommunicator"  # noqa
+
+    @classmethod
+    def supports_structured_output(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_v1(cls, model_config: ModelConfig) -> bool:
+        # V1 support on HPU is experimental
+        return True
+
+    @classmethod
+    def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
+        return {"hpu": ("cpu", "hpu")}
+
+    @classmethod
+    def get_nixl_memory_type(cls) -> str:
+        if os.environ.get("VLLM_NIXL_DEVICE_TO_DEVICE", "0").lower() in ["1", "true"]:
+            return "VRAM"
+        else:
+            return "DRAM"
+
+    def is_sleep_mode_available(cls) -> bool:
+        return True
+
+    @classmethod
+    def set_torch_compile(cls) -> None:
+        # NOTE: PT HPU lazy backend (PT_HPU_LAZY_MODE = 1)
+        # does not support torch.compile
+        # Eager backend (PT_HPU_LAZY_MODE = 0) must be selected for
+        # torch.compile support
+        #
+        # This runs at plugin-registration / import time (e.g. when vllm_gaudi
+        # is loaded as a pytest plugin), which may be a different process and a
+        # different execution mode than the engine that ultimately runs. Only
+        # set env vars here that are safe to inherit in ANY mode, so they never
+        # leak harmful values into a child process running a different mode
+        # (see GAUDISW-248809). Compile/eager-only defaults are applied later in
+        # check_and_update_config(), which only runs when a real engine is built.
+        #
+        # Never overwrite a value the user set explicitly (respect user input,
+        # see GAUDISW-249135).
+        if os.environ.get('PT_HPU_WEIGHT_SHARING') is None:
+            os.environ['PT_HPU_WEIGHT_SHARING'] = '0'
+        is_lazy = htorch.utils.internal.is_lazy()
+        if is_lazy:
+            torch._dynamo.config.disable = True
+            # NOTE multi-HPU inference with HPUGraphs (lazy-only)
+            # requires enabling lazy collectives
+            # see https://docs.habana.ai/en/latest/PyTorch/Inference_on_PyTorch/Inference_Using_HPU_Graphs.html  # noqa: E501
+            if os.environ.get('PT_HPU_ENABLE_LAZY_COLLECTIVES') is None:
+                os.environ['PT_HPU_ENABLE_LAZY_COLLECTIVES'] = 'true'
+
+    @classmethod
+    def set_compile_env_defaults(cls) -> None:
+        # Apply torch.compile / eager-only env defaults. Called from
+        # check_and_update_config() (engine construction time) rather than from
+        # set_torch_compile() (import/registration time) so these eager-only
+        # values can never leak into a lazy-mode subprocess spawned by a parent
+        # that merely imported vllm_gaudi (e.g. a pytest collection process).
+        # See GAUDISW-248809.
+        #
+        # No-op in lazy mode, and never overwrites a user-provided value
+        # (respect user input, see GAUDISW-249135).
+        if htorch.utils.internal.is_lazy():
+            return
+        # Enable Runtime Scale Patching by default for torch.compile/FP8.
+        if os.environ.get('RUNTIME_SCALE_PATCHING') is None:
+            os.environ['RUNTIME_SCALE_PATCHING'] = '1'
+        # Allow utilization of the Parallel Compilation feature.
+        if os.environ.get('FUSER_ENABLE_MULTI_THREADED_INVOCATIONS') is None:
+            os.environ['FUSER_ENABLE_MULTI_THREADED_INVOCATIONS'] = '1'
+
+    @classmethod
+    def adjust_cuda_hooks(cls) -> None:
+        torch.cuda.is_available = lambda: False
+        # hpu.get_device_properties implementation is weird
+        # cuda.get_device_properties implementation is correct
+        # replace hpu.get_device_properties with cuda.get_device_properties
+        torch.hpu.get_device_properties = torch.cuda.get_device_properties
+
+    @classmethod
+    def is_kv_cache_dtype_supported(cls, kv_cache_dtype: str, model_config: ModelConfig) -> bool:
+        return kv_cache_dtype == "fp8_inc"
+
+    @classmethod
+    def use_sync_weight_loader(cls) -> bool:
+        """
+        Returns if the current platform needs to sync weight loader.
+        """
+        force_sync = os.getenv("VLLM_WEIGHT_LOAD_FORCE_SYNC", "true").lower() in ("true", "1")
+        return force_sync
+
+    @classmethod
+    def make_synced_weight_loader(cls, original_weight_loader):
+        """
+        Wrap the original weight loader to make it synced.
+        """
+
+        def _synced_weight_loader(param, *args, **kwargs):
+            out = original_weight_loader(param, *args, **kwargs)
+            torch.hpu.synchronize()
+            return out
+
+        return _synced_weight_loader
+
+    @classmethod
+    def insert_blocks_to_device(
+        cls,
+        src_cache: torch.Tensor,
+        dst_cache: Union[tuple[torch.Tensor], torch.Tensor],
+        src_block_indices: torch.Tensor,
+        dst_block_indices: torch.Tensor,
+    ) -> None:
+        """Copy blocks from src_cache to dst_cache on HPU."""
+        # WA: https://github.com/pytorch/pytorch/issues/169656
+        original_src_dtype = src_cache.dtype
+        view_as_uint = original_src_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+        if view_as_uint:
+            src_cache = src_cache.view(torch.uint8)
+        if isinstance(dst_cache, tuple):
+            _src_cache = src_cache[:, src_block_indices]
+            _src_cache = _src_cache.to(dst_cache[0].device)
+            dst_cache[0].index_copy_(0, dst_block_indices,
+                                     _src_cache[0].view(original_src_dtype) if view_as_uint else _src_cache[0])
+            dst_cache[1].index_copy_(0, dst_block_indices,
+                                     _src_cache[1].view(original_src_dtype) if view_as_uint else _src_cache[1])
+        else:
+            indexed_cache = src_cache[src_block_indices]
+            if view_as_uint:
+                indexed_cache = indexed_cache.view(original_src_dtype)
+            dst_cache.index_copy_(0, dst_block_indices, indexed_cache.to(dst_cache.device))
+        torch.hpu.synchronize()
+
+    @classmethod
+    def swap_out_blocks_to_host(
+        cls,
+        src_cache: Union[tuple[torch.Tensor], torch.Tensor],
+        dst_cache: torch.Tensor,
+        src_block_indices: torch.Tensor,
+        dst_block_indices: torch.Tensor,
+    ) -> None:
+        """Copy blocks from HPU to host (CPU)."""
+        if isinstance(src_cache, tuple):
+            _src_cache = torch.stack([c[src_block_indices] for c in src_cache], dim=0)
+            dst_cache[:, dst_block_indices] = _src_cache.cpu()
+        else:
+            dst_cache[dst_block_indices] = src_cache[src_block_indices].cpu()
+
+    @classmethod
+    def patch_for_pt27(cls) -> None:
+
+        from vllm.utils.torch_utils import is_torch_equal_or_newer
+        if is_torch_equal_or_newer("2.8.0"):
+            return
+
+        from vllm.model_executor import BasevLLMParameter
+        parent_class = BasevLLMParameter.__mro__[1]
+        parent_torch_function = getattr(parent_class, "__torch_function__", None)
+
+        def torch_function(origin_cls, func, types, args=(), kwargs=None):
+            if kwargs is None:
+                kwargs = {}
+            if parent_torch_function is None:
+                return NotImplemented
+            return parent_torch_function(func, types, args, kwargs)
+
+        BasevLLMParameter.__torch_function__ = staticmethod(torch_function)  # type: ignore[assignment]
+        return
