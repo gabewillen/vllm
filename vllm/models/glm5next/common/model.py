@@ -410,7 +410,10 @@ class Glm5NextMoE(nn.Module):
         self._hpu_experts = True
 
     # tokens * top_k at or below which only the selected experts are gathered
-    _GATHER_MAX_SLOTS = int(_os.environ.get("GLM53_MOE_GATHER_MAX_SLOTS", "16"))
+    # The dense path quantizes activations to FP8 per row, which GLM's outlier
+    # channels make lossy (flips greedy tokens); the bf16 gather path is exact.
+    # 64 slots covers decode up to bs8 and the 8-token spec verify at bs1.
+    _GATHER_MAX_SLOTS = int(_os.environ.get("GLM53_MOE_GATHER_MAX_SLOTS", "64"))
     # token count above which the fused (sparse) HPU MoE op is used
     _DENSE_MAX_T = int(_os.environ.get("GLM53_MOE_DENSE_MAX_T", "192"))
 
